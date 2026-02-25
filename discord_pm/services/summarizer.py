@@ -1,7 +1,8 @@
-"""Standup summarization using an LLM."""
+"""Standup summarization using the Anthropic API."""
 
-from openai import AsyncOpenAI
-from ..models.standup import ParticipantUpdate, StandupSummary
+import json
+from anthropic import AsyncAnthropic
+from ..models.standup import ParticipantUpdate
 
 _SYSTEM_PROMPT = """\
 You are a helpful project management assistant. You will receive a raw transcript of a team standup meeting.
@@ -13,7 +14,7 @@ Your job is to:
    - Any blockers or impediments
 3. Produce a concise overall summary paragraph.
 
-Respond in this exact JSON format:
+Respond in this exact JSON format with no other text:
 {
   "participants": [
     {
@@ -24,33 +25,29 @@ Respond in this exact JSON format:
     }
   ],
   "summary_text": "The team made good progress on..."
-}
-"""
+}"""
 
 
 class Summarizer:
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-6"):
-        self._client = AsyncOpenAI(api_key=api_key)
+        self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
 
     async def summarize(self, transcript: str) -> tuple[list[ParticipantUpdate], str]:
-        """
-        Returns (participants, summary_text) parsed from the LLM response.
-        Falls back to raw summary text if JSON parsing fails.
-        """
-        import json
-
-        response = await self._client.chat.completions.create(
+        """Returns (participants, summary_text) parsed from the LLM response."""
+        response = await self._client.messages.create(
             model=self._model,
-            response_format={"type": "json_object"},
+            max_tokens=2048,
+            system=_SYSTEM_PROMPT,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": f"Transcript:\n\n{transcript}"},
+                # Prefill assistant turn to steer output directly into JSON
+                {"role": "assistant", "content": "{"},
             ],
         )
 
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
+        raw = "{" + (response.content[0].text if response.content else "")
+        data = json.loads(raw)
 
         participants = [ParticipantUpdate(**p) for p in data.get("participants", [])]
         summary_text = data.get("summary_text", "")

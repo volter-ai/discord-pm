@@ -1,21 +1,31 @@
-"""Audio transcription using OpenAI Whisper."""
+"""Audio transcription using Replicate's Whisper model."""
 
-import io
-from openai import AsyncOpenAI
+import base64
+import replicate
+
+
+# vaibhavs10/incredibly-fast-whisper is faster-whisper based and much quicker
+# than openai/whisper for long recordings. Swap to "openai/whisper" if needed.
+_WHISPER_MODEL = "vaibhavs10/incredibly-fast-whisper"
 
 
 class Transcriber:
-    def __init__(self, api_key: str):
-        self._client = AsyncOpenAI(api_key=api_key)
+    def __init__(self, api_token: str):
+        self._client = replicate.Client(api_token=api_token)
 
     async def transcribe(self, audio_bytes: bytes, filename: str = "recording.wav") -> str:
-        """Transcribe audio bytes using Whisper. Returns the transcript text."""
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = filename
+        """Transcribe audio bytes via Replicate Whisper. Returns the transcript text."""
+        # Replicate accepts a base64 data URI for binary inputs
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        data_uri = f"data:audio/wav;base64,{b64}"
 
-        response = await self._client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="text",
+        output = await self._client.async_run(
+            _WHISPER_MODEL,
+            input={"audio": data_uri, "language": "en"},
         )
-        return response
+
+        # incredibly-fast-whisper returns {"text": "...", "segments": [...]}
+        # openai/whisper returns {"transcription": "..."}
+        if isinstance(output, dict):
+            return output.get("text") or output.get("transcription") or ""
+        return str(output)

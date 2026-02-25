@@ -15,8 +15,8 @@ class StandupCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.recorder = Recorder()
-        self.transcriber = Transcriber(api_key=settings.openai_api_key)
-        self.summarizer = Summarizer(api_key=settings.openai_api_key)
+        self.transcriber = Transcriber(api_token=settings.replicate_api_token)
+        self.summarizer = Summarizer(api_key=settings.anthropic_api_key)
 
     standup = app_commands.Group(name="standup", description="Standup meeting commands")
 
