@@ -1,5 +1,6 @@
 """Standup slash commands cog."""
 
+import logging
 from datetime import datetime, UTC
 
 import discord
@@ -9,7 +10,10 @@ from discord.ext import commands
 from ..config import settings
 from ..models.standup import StandupSummary
 from ..services import Recorder, Transcriber, Summarizer
+from ..services.recorder import Recorder as RecorderService
 from ..services.store import StandupStore
+
+log = logging.getLogger(__name__)
 
 
 class StandupCog(commands.Cog):
@@ -32,7 +36,9 @@ class StandupCog(commands.Cog):
             return
 
         voice_channel = interaction.user.voice.channel
-        assert voice_channel is not None
+        if voice_channel is None:
+            await interaction.followup.send("Could not determine your voice channel.")
+            return
 
         try:
             await self.recorder.start(
@@ -62,23 +68,42 @@ class StandupCog(commands.Cog):
             await interaction.followup.send(f"Could not stop recording: {e}")
             return
 
-        await interaction.followup.send("Recording stopped. Transcribing...")
+        await interaction.followup.send("Recording stopped. Preparing audio for transcription...")
 
         if session.sink is None or not session.sink.audio_data:
             await interaction.followup.send("No audio was captured.")
             return
 
-        from ..services.recorder import Recorder as R
-        audio_bytes = R.merge_audio(session.sink)
-
+        audio_bytes = RecorderService.merge_audio(session.sink)
         if not audio_bytes:
             await interaction.followup.send("No audio was captured.")
             return
 
-        transcript = await self.transcriber.transcribe(audio_bytes)
-        await interaction.followup.send("Transcription complete. Summarizing...")
+        await interaction.followup.send(
+            "Transcribing with Whisper — this may take a minute for longer recordings..."
+        )
 
-        participants, summary_text = await self.summarizer.summarize(transcript)
+        try:
+            transcript = await self.transcriber.transcribe(audio_bytes)
+        except Exception as e:
+            log.exception("Transcription failed")
+            await interaction.followup.send(f"Transcription failed: {e}")
+            return
+
+        if not transcript.strip():
+            await interaction.followup.send("Transcription returned empty — no speech detected.")
+            return
+
+        await interaction.followup.send("Transcription complete. Summarizing with Claude...")
+
+        try:
+            participants, summary_text = await self.summarizer.summarize(transcript)
+        except Exception as e:
+            log.exception("Summarization failed")
+            await interaction.followup.send(
+                f"Summarization failed: {e}\n\nRaw transcript:\n```\n{transcript[:1500]}\n```"
+            )
+            return
 
         standup = StandupSummary(
             guild_id=guild_id,
@@ -98,7 +123,7 @@ class StandupCog(commands.Cog):
         guild_id = interaction.guild_id
         session = self.recorder.get_session(guild_id) if guild_id else None
         if session and session.is_active:
-            elapsed = (datetime.now(UTC) - session.started_at).seconds
+            elapsed = int((datetime.now(UTC) - session.started_at).total_seconds())
             minutes, seconds = divmod(elapsed, 60)
             await interaction.response.send_message(
                 f"Recording in progress — {minutes}m {seconds}s elapsed.", ephemeral=True

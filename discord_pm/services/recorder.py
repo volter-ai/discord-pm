@@ -3,7 +3,6 @@
 import array
 import asyncio
 import io
-import struct
 import wave
 from datetime import datetime, UTC
 

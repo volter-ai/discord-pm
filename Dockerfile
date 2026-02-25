@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Install Python deps first so this layer is cached when only source changes
 COPY pyproject.toml ./
-# Install deps before copying source so layer is cached on dep changes
-RUN pip install --no-cache-dir -e ".[dev]" || pip install --no-cache-dir \
+RUN pip install --no-cache-dir \
     "discord.py[voice]>=2.4" \
     "replicate>=0.34" \
     "anthropic>=0.40" \

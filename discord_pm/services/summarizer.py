@@ -1,8 +1,11 @@
 """Standup summarization using the Anthropic API."""
 
 import json
+import logging
 from anthropic import AsyncAnthropic
 from ..models.standup import ParticipantUpdate
+
+log = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
 You are a helpful project management assistant. You will receive a raw transcript of a team standup meeting.
@@ -47,8 +50,18 @@ class Summarizer:
         )
 
         raw = "{" + (response.content[0].text if response.content else "")
-        data = json.loads(raw)
 
-        participants = [ParticipantUpdate(**p) for p in data.get("participants", [])]
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("Failed to parse JSON from summarizer response, using raw text")
+            return [], raw.strip()
+
+        try:
+            participants = [ParticipantUpdate(**p) for p in data.get("participants", [])]
+        except Exception:
+            log.warning("Failed to parse participants from summarizer response")
+            participants = []
+
         summary_text = data.get("summary_text", "")
         return participants, summary_text
