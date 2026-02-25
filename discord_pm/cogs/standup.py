@@ -9,6 +9,7 @@ from discord.ext import commands
 from ..config import settings
 from ..models.standup import StandupSummary
 from ..services import Recorder, Transcriber, Summarizer
+from ..services.store import StandupStore
 
 
 class StandupCog(commands.Cog):
@@ -17,6 +18,8 @@ class StandupCog(commands.Cog):
         self.recorder = Recorder()
         self.transcriber = Transcriber(api_token=settings.replicate_api_token)
         self.summarizer = Summarizer(api_key=settings.anthropic_api_key)
+        # Reuse the store initialised on the bot if available, else own instance
+        self.store: StandupStore = getattr(bot, "store", StandupStore())
 
     standup = app_commands.Group(name="standup", description="Standup meeting commands")
 
@@ -32,7 +35,7 @@ class StandupCog(commands.Cog):
         assert voice_channel is not None
 
         try:
-            session = await self.recorder.start(
+            await self.recorder.start(
                 voice_channel,
                 max_duration=settings.recording_max_duration_seconds,
             )
@@ -61,7 +64,6 @@ class StandupCog(commands.Cog):
 
         await interaction.followup.send("Recording stopped. Transcribing...")
 
-        # Merge and transcribe audio
         if session.sink is None or not session.sink.audio_data:
             await interaction.followup.send("No audio was captured.")
             return
@@ -74,7 +76,6 @@ class StandupCog(commands.Cog):
             return
 
         transcript = await self.transcriber.transcribe(audio_bytes)
-
         await interaction.followup.send("Transcription complete. Summarizing...")
 
         participants, summary_text = await self.summarizer.summarize(transcript)
@@ -89,7 +90,8 @@ class StandupCog(commands.Cog):
             summary_text=summary_text,
         )
 
-        await self._post_summary(interaction, standup)
+        record_id = await self.store.save(standup)
+        await self._post_summary(interaction, standup, record_id)
 
     @standup.command(name="status", description="Show whether a standup is currently being recorded")
     async def standup_status(self, interaction: discord.Interaction):
@@ -104,7 +106,42 @@ class StandupCog(commands.Cog):
         else:
             await interaction.response.send_message("No standup recording in progress.", ephemeral=True)
 
-    async def _post_summary(self, interaction: discord.Interaction, standup: StandupSummary):
+    @standup.command(name="history", description="Show recent standup summaries for this server")
+    @app_commands.describe(count="Number of recent standups to show (default 5, max 10)")
+    async def standup_history(self, interaction: discord.Interaction, count: int = 5):
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+
+        count = max(1, min(count, 10))
+        summaries = await self.store.recent(guild_id, limit=count)
+
+        if not summaries:
+            await interaction.response.send_message("No standup records found for this server.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"Last {len(summaries)} Standup(s)",
+            color=discord.Color.blurple(),
+        )
+        for s in summaries:
+            date_str = s.started_at.strftime("%Y-%m-%d %H:%M UTC")
+            names = ", ".join(p.name for p in s.participants) or "unknown"
+            blockers = [b for p in s.participants for b in p.blockers]
+            blocker_line = f"\n⚠️ Blockers: {', '.join(blockers)}" if blockers else ""
+            embed.add_field(
+                name=date_str,
+                value=f"{s.summary_text[:200]}{'...' if len(s.summary_text) > 200 else ''}"
+                      f"\n👥 {names}{blocker_line}",
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _post_summary(
+        self, interaction: discord.Interaction, standup: StandupSummary, record_id: int
+    ):
         embed = discord.Embed(
             title="Standup Summary",
             description=standup.summary_text,
@@ -123,9 +160,11 @@ class StandupCog(commands.Cog):
             embed.add_field(name=p.name, value="\n".join(value_lines) or "No updates", inline=False)
 
         duration = standup.ended_at - standup.started_at
-        embed.set_footer(text=f"Duration: {int(duration.total_seconds() // 60)}m {int(duration.total_seconds() % 60)}s")
+        embed.set_footer(
+            text=f"Duration: {int(duration.total_seconds() // 60)}m "
+                 f"{int(duration.total_seconds() % 60)}s  •  Record #{record_id}"
+        )
 
-        # Post to summary channel if configured, otherwise reply in current channel
         target_channel = interaction.channel
         if settings.summary_channel_id:
             target_channel = interaction.guild.get_channel(settings.summary_channel_id)  # type: ignore[union-attr]

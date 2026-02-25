@@ -1,13 +1,19 @@
 """Voice channel recording using discord.py's built-in sink."""
 
+import array
 import asyncio
 import io
+import struct
 import wave
 from datetime import datetime, UTC
-from pathlib import Path
 
 import discord
 from discord.sinks import WaveSink
+
+# discord.py records stereo 48kHz 16-bit PCM
+_CHANNELS = 2
+_SAMPLE_WIDTH = 2  # bytes (16-bit)
+_FRAME_RATE = 48000
 
 
 class RecordingSession:
@@ -57,8 +63,8 @@ class Recorder:
             session,
         )
 
-        # Auto-stop after max_duration
-        asyncio.get_event_loop().call_later(max_duration, lambda: asyncio.ensure_future(self.stop(guild_id)))
+        loop = asyncio.get_running_loop()
+        loop.call_later(max_duration, lambda: asyncio.ensure_future(self.stop(guild_id)))
 
         return session
 
@@ -83,26 +89,45 @@ class Recorder:
 
     @staticmethod
     def merge_audio(sink: WaveSink) -> bytes:
-        """Merge all per-user WAV audio into a single mono WAV file."""
+        """Mix all per-user WAV tracks into a single stereo WAV by summing PCM samples.
+
+        discord.py records each speaker independently, time-aligned from the start of
+        the session (silence-padded for gaps). Summing samples preserves the natural
+        back-and-forth of the conversation, which is essential for accurate transcription.
+        """
         if not sink.audio_data:
             return b""
 
-        # Collect all PCM frames from each speaker
-        all_frames: list[bytes] = []
-        for user_id, audio in sink.audio_data.items():
+        # Decode each speaker's WAV into a signed-short array
+        tracks: list[array.array] = []
+        for audio in sink.audio_data.values():
             audio.file.seek(0)
             with wave.open(audio.file) as wf:
-                all_frames.append(wf.readframes(wf.getnframes()))
+                pcm = wf.readframes(wf.getnframes())
+            samples: array.array = array.array("h")
+            samples.frombytes(pcm)
+            tracks.append(samples)
 
-        # Simple mix: concatenate (real mixing would interleave by timestamp)
-        # For transcription purposes, sequential is good enough to start
-        combined = b"".join(all_frames)
+        if not tracks:
+            return b""
+
+        # Pad shorter tracks with silence so all are the same length
+        max_len = max(len(t) for t in tracks)
+        for t in tracks:
+            if len(t) < max_len:
+                t.extend(array.array("h", [0] * (max_len - len(t))))
+
+        # Sum samples across all speakers, clamping to 16-bit range
+        mixed = array.array("h", [0] * max_len)
+        for t in tracks:
+            for i in range(max_len):
+                mixed[i] = max(-32768, min(32767, mixed[i] + t[i]))
 
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
-            wf.setnchannels(2)
-            wf.setsampwidth(2)
-            wf.setframerate(48000)
-            wf.writeframes(combined)
+            wf.setnchannels(_CHANNELS)
+            wf.setsampwidth(_SAMPLE_WIDTH)
+            wf.setframerate(_FRAME_RATE)
+            wf.writeframes(mixed.tobytes())
 
         return buf.getvalue()

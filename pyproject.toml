@@ -11,6 +11,7 @@ dependencies = [
     "discord.py[voice]>=2.4",
     "replicate>=0.34",
     "anthropic>=0.40",
+    "aiosqlite>=0.20",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "aiofiles>=23.0",

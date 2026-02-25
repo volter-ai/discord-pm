@@ -22,6 +22,10 @@ recordings/
 transcripts/
 summaries/
 
+# Database
+data/
+*.db
+
 # IDE
 .vscode/
 .idea/
