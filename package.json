@@ -9,11 +9,17 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40",
-    "@discordjs/voice": "^0.17",
+    "@discordjs/voice": "^0.18",
     "@huggingface/transformers": "^3",
+    "@types/libsodium-wrappers": "^0.8.2",
     "discord.js": "^14.16",
     "dotenv": "^16",
+    "libsodium-wrappers": "^0.8.2",
     "opusscript": "^0.1.1",
     "tweetnacl": "^1.0.3"
-  }
+  },
+  "trustedDependencies": [
+    "onnxruntime-node",
+    "protobufjs"
+  ]
 }
