@@ -1,0 +1,19 @@
+{
+  "name": "discord-pm",
+  "version": "2.0.0",
+  "description": "Discord standup meeting transcriber with per-speaker attribution",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40",
+    "@discordjs/voice": "^0.17",
+    "@huggingface/transformers": "^3",
+    "discord.js": "^14.16",
+    "dotenv": "^16",
+    "opusscript": "^0.1.1",
+    "tweetnacl": "^1.0.3"
+  }
+}
