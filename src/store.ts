@@ -48,7 +48,7 @@ export class StandupStore {
     `);
   }
 
-  save(record: StandupRecord): number {
+  save(record: StandupRecord): { id: number; transcriptPath: string } {
     const stmt = this.db.prepare(`
       INSERT INTO standups (guild_id, channel_id, started_at, ended_at, participants, transcript, summary)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -64,8 +64,8 @@ export class StandupStore {
     );
 
     const id = result.lastInsertRowid as number;
-    this.exportMarkdown({ ...record, id });
-    return id;
+    const transcriptPath = this.exportMarkdown({ ...record, id });
+    return { id, transcriptPath };
   }
 
   recent(guildId: string, limit = 10): StandupRecord[] {
@@ -80,7 +80,7 @@ export class StandupStore {
     }));
   }
 
-  private exportMarkdown(record: StandupRecord & { id: number }) {
+  private exportMarkdown(record: StandupRecord & { id: number }): string {
     const date = new Date(record.started_at);
     const dateStr = date.toISOString().slice(0, 10);
     const timeStr = date.toISOString().slice(11, 16);
@@ -121,5 +121,6 @@ ${record.raw_transcript}
 
     writeFileSync(path, md, "utf8");
     console.log(`[store] Transcript saved → ${path}`);
+    return path;
   }
 }

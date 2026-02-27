@@ -9,6 +9,7 @@ import {
   Interaction,
   VoiceChannel,
   EmbedBuilder,
+  AttachmentBuilder,
   Colors,
   REST,
   Routes,
@@ -164,8 +165,16 @@ export class StandupBot {
     const speakerData = this.recorder.stop();
     this.activeSessions.delete(interaction.guildId!);
 
+    // Debug: always log what we captured
+    console.log(`[bot] stop: ${speakerData.size} speaker(s) in map`);
+    for (const [userId, audio] of speakerData) {
+      const chunks = audio.pcmSamples.length;
+      const seconds = (chunks * 960 / 48000).toFixed(2);
+      console.log(`[bot]   ${audio.member.displayName} (${userId}): ${chunks} chunks = ${seconds}s`);
+    }
+
     if (speakerData.size === 0) {
-      return interaction.followUp("No audio was captured.");
+      return interaction.followUp("No audio was captured. (No speaking events fired — check bot permissions or DAVE status.)");
     }
 
     // Transcribe each speaker in parallel
@@ -174,7 +183,9 @@ export class StandupBot {
     const results = await Promise.allSettled(
       [...speakerData.entries()].map(async ([userId, audio]) => {
         const mono = Recorder.toMono16k(audio.pcmSamples);
+        console.log(`[bot] Transcribing ${audio.member.displayName}: ${mono.length} mono samples (${(mono.length/16000).toFixed(2)}s)`);
         const text = await this.transcriber.transcribe(mono);
+        console.log(`[bot] → "${text.slice(0, 100)}"`);
         return { speaker: audio.member.displayName, userId, text };
       })
     );
@@ -210,7 +221,7 @@ export class StandupBot {
       return;
     }
 
-    const recordId = this.store.save({
+    const { id: recordId, transcriptPath } = this.store.save({
       guild_id: interaction.guildId!,
       channel_id: session?.channelId ?? "unknown",
       started_at: startedAt.toISOString(),
@@ -220,7 +231,7 @@ export class StandupBot {
       summary_text: summaryResult.summary_text,
     });
 
-    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId);
+    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, transcriptPath);
   }
 
   private async postSummaryEmbed(
@@ -228,8 +239,13 @@ export class StandupBot {
     result: any,
     startedAt: Date,
     endedAt: Date,
-    recordId: number
+    recordId: number,
+    transcriptPath: string
   ) {
+    const duration = Math.round((endedAt.getTime() - startedAt.getTime()) / 1000);
+    const min = Math.floor(duration / 60);
+    const sec = duration % 60;
+
     const embed = new EmbedBuilder()
       .setTitle("Standup Summary")
       .setDescription(result.summary_text)
@@ -244,12 +260,12 @@ export class StandupBot {
       embed.addFields({ name: p.name, value: lines.join("\n") || "No updates", inline: false });
     }
 
-    const duration = Math.round((endedAt.getTime() - startedAt.getTime()) / 1000);
-    const min = Math.floor(duration / 60);
-    const sec = duration % 60;
-    embed.setFooter({ text: `Duration: ${min}m ${sec}s  •  Record #${recordId}` });
+    embed.setFooter({ text: `Duration: ${min}m ${sec}s  •  Record #${recordId}  •  Full transcript attached` });
 
-    await interaction.followUp({ embeds: [embed] });
+    // Attach the markdown transcript file so users can read/download it directly.
+    const attachment = new AttachmentBuilder(transcriptPath);
+
+    await interaction.followUp({ embeds: [embed], files: [attachment] });
   }
 
   // ── /standup status ─────────────────────────────────────────────────────────

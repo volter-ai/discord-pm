@@ -35,6 +35,10 @@ export class Recorder {
   private speakers = new Map<string, SpeakerAudio>();
   // One OpusScript decoder per user (stateful)
   private decoders = new Map<string, InstanceType<typeof OpusScript>>();
+  // Tracks which userIds have an *active* (non-destroyed) stream.
+  // Separate from speakers so a destroyed stream can be re-created on the
+  // next speaking event without losing already-accumulated PCM data.
+  private activeStreams = new Set<string>();
   private guildId: string | null = null;
   private channelId: string | null = null;
 
@@ -53,6 +57,7 @@ export class Recorder {
     this.channelId = channel.id;
     this.speakers.clear();
     this.decoders.clear();
+    this.activeStreams.clear();
 
     this.connection = joinVoiceChannel({
       channelId: channel.id,
@@ -63,21 +68,65 @@ export class Recorder {
     });
 
     await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
+    console.log("[recorder] Voice connection ready.");
 
     const receiver = this.connection.receiver;
 
     // Subscribe to members already in the channel
-    for (const [userId, member] of channel.members) {
-      if (!member.user.bot) {
-        this.subscribeToUser(receiver, userId, member);
-      }
+    const membersInChannel = [...channel.members.values()].filter(m => !m.user.bot);
+    console.log(`[recorder] Members already in channel: ${membersInChannel.map(m => m.displayName).join(", ") || "(none cached)"}`);
+    for (const member of membersInChannel) {
+      this.subscribeToUser(receiver, member.id, member);
     }
 
-    // Subscribe to members who join after recording starts
+    // Subscribe to members who join after recording starts (or start speaking).
+    // If the member isn't in cache (GuildMembers intent not enabled, or race),
+    // we still subscribe using a minimal stub so audio isn't silently dropped.
     this.connection.receiver.speaking.on("start", (userId) => {
       const member = channel.guild.members.cache.get(userId);
-      if (member && !member.user.bot) {
-        this.subscribeToUser(receiver, userId, member);
+      console.log(`[recorder] speaking.start event for userId=${userId} member=${member?.displayName ?? "(not in cache — will still subscribe)"}`);
+      // Bots never send audio we want; skip known bots.  Unknown users subscribe.
+      if (member?.user.bot) return;
+      const effectiveMember = member ?? ({
+        user: { id: userId, bot: false },
+        displayName: `User-${userId.slice(-4)}`,
+        id: userId,
+      } as any);
+      this.subscribeToUser(receiver, userId, effectiveMember);
+      // Try to resolve the real member asynchronously for better display names
+      if (!member) {
+        channel.guild.members.fetch(userId).then(m => {
+          const entry = this.speakers.get(userId);
+          if (entry) entry.member = m;
+        }).catch(() => {/* non-fatal */});
+      }
+    });
+
+    this.connection.receiver.speaking.on("end", (userId) => {
+      const chunks = this.speakers.get(userId)?.pcmSamples.length ?? 0;
+      console.log(`[recorder] speaking.end for userId=${userId} — ${chunks} chunks so far`);
+    });
+
+    // Log connection state changes
+    this.connection.on("stateChange" as any, (oldState: any, newState: any) => {
+      console.log(`[recorder] connection state: ${oldState.status} → ${newState.status}`);
+    });
+
+    // Pipe internal debug events so we can see DAVE handshake + SSRC mapping
+    this.connection.on("debug" as any, (msg: string) => {
+      // Filter to only the most useful debug lines to avoid noise
+      if (
+        msg.includes("DAVE") ||
+        msg.includes("dave") ||
+        msg.includes("ssrc") ||
+        msg.includes("SSRC") ||
+        msg.includes("decrypt") ||
+        msg.includes("Speaking") ||
+        msg.includes("speaking") ||
+        msg.includes("ready") ||
+        msg.includes("Ready")
+      ) {
+        console.log(`[recorder:debug] ${msg}`);
       }
     });
   }
@@ -87,33 +136,79 @@ export class Recorder {
     userId: string,
     member: GuildMember
   ) {
-    if (this.speakers.has(userId)) return; // already subscribed
+    // Guard: only one live stream per user at a time.
+    // We do NOT check speakers.has() here so that a re-subscription after
+    // DAVE-induced stream destruction is allowed (preserving pcmSamples).
+    if (this.activeStreams.has(userId)) return;
+    this.activeStreams.add(userId);
 
+    // Preserve existing pcmSamples if re-subscribing after stream destruction.
+    if (!this.speakers.has(userId)) {
+      this.speakers.set(userId, {
+        member,
+        pcmSamples: [],
+        startedAt: Date.now(),
+      });
+    }
+
+    // Recreate decoder on each (re-)subscription so it starts fresh.
+    this.decoders.get(userId)?.delete();
     const decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
     this.decoders.set(userId, decoder);
-    this.speakers.set(userId, {
-      member,
-      pcmSamples: [],
-      startedAt: Date.now(),
-    });
+
+    const existing = this.speakers.get(userId)!.pcmSamples.length;
+    console.log(`[recorder] Subscribing to ${member.displayName} (${userId}) — existing chunks: ${existing}`);
 
     const stream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
     });
 
+    let packetCount = 0;
+    let decodeErrors = 0;
+
     stream.on("data", (opusPacket: Buffer) => {
+      packetCount++;
+      if (packetCount === 1) {
+        console.log(`[recorder] First Opus packet from ${member.displayName} — size=${opusPacket.length}B`);
+      }
+      if (packetCount % 500 === 0) {
+        console.log(`[recorder] ${member.displayName}: ${packetCount} packets received`);
+      }
       try {
-        // decodeFloat returns Float32Array of interleaved stereo samples
-        const decoded: Float32Array = decoder.decodeFloat(opusPacket, FRAME_SIZE);
-        this.speakers.get(userId)?.pcmSamples.push(decoded);
-      } catch {
-        // Drop malformed packets silently
+        // opusscript v0.1.1 decode() returns a Buffer of Int16 LE PCM samples.
+        const pcmBuf: Buffer = decoder.decode(opusPacket, FRAME_SIZE);
+        // Convert Int16 → Float32 (range -1..1), keeping stereo interleaving.
+        const numSamples = pcmBuf.length / 2;
+        const float32 = new Float32Array(numSamples);
+        for (let i = 0; i < numSamples; i++) {
+          float32[i] = pcmBuf.readInt16LE(i * 2) / 0x8000;
+        }
+        this.speakers.get(userId)?.pcmSamples.push(float32);
+      } catch (e: any) {
+        decodeErrors++;
+        if (decodeErrors <= 3) {
+          console.warn(`[recorder] Decode error #${decodeErrors} for ${member.displayName}: ${e.message}`);
+        }
       }
     });
 
-    stream.on("error", () => {
-      // Ignore stream errors; user may have left
+    stream.on("error", (e) => {
+      console.error(`[recorder] Stream error for ${member.displayName}:`, e);
     });
+
+    stream.on("close", () => {
+      // Mark stream as inactive so the next speaking event re-creates it.
+      this.activeStreams.delete(userId);
+      console.log(`[recorder] Stream closed for ${member.displayName} — ${packetCount} pkts, ${decodeErrors} errs, ${this.speakers.get(userId)?.pcmSamples.length ?? 0} chunks total`);
+    });
+  }
+
+  /**
+   * Inject pre-loaded PCM samples for a speaker (used in testing to bypass
+   * Discord self-echo restriction).
+   */
+  injectAudio(userId: string, member: GuildMember, pcmSamples: Float32Array[]): void {
+    this.speakers.set(userId, { member, pcmSamples, startedAt: Date.now() });
   }
 
   /** Stop recording and return the per-speaker audio data. */
@@ -130,6 +225,7 @@ export class Recorder {
 
     const data = new Map(this.speakers);
     this.speakers.clear();
+    this.activeStreams.clear();
     this.guildId = null;
     this.channelId = null;
     return data;
