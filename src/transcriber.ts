@@ -61,7 +61,8 @@ export class Transcriber {
 
   private async transcribeLocal(mono16k: Float32Array): Promise<string> {
     const pipe = await this.getLocalPipeline();
-    const result = await pipe(mono16k, { language: "english" });
+    // whisper-tiny.en is English-only; don't pass language/task options
+    const result = await pipe(mono16k);
     return (result as any).text?.trim() ?? "";
   }
 
