@@ -302,6 +302,7 @@ if (!PASSWORD) {
 
 export default {
   port: PORT,
+  hostname: "0.0.0.0",
   fetch: app.fetch,
 };
 
