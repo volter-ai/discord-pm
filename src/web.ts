@@ -34,7 +34,7 @@ function unauthorized() {
 
 function checkAuth(req: Request): boolean {
   if (!PASSWORD) return false; // block all if no password configured
-  const auth = req.header("Authorization");
+  const auth = req.headers.get("Authorization");
   if (!auth?.startsWith("Basic ")) return false;
   const decoded = atob(auth.slice(6));
   const colon = decoded.indexOf(":");
