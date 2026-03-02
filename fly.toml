@@ -9,6 +9,7 @@ primary_region = "iad"
 
 [env]
   WEB_PORT = "8080"
+  WEB_URL = "https://discord-pm.fly.dev"
 
 # Secrets to set via `fly secrets set`:
 #   DISCORD_BOT_TOKEN=...

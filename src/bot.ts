@@ -9,7 +9,6 @@ import {
   Interaction,
   VoiceChannel,
   EmbedBuilder,
-  AttachmentBuilder,
   Colors,
   REST,
   Routes,
@@ -211,19 +210,30 @@ export class StandupBot {
 
     await interaction.followUp("Transcription complete — summarizing with Claude…");
 
+    const webUrl = process.env.WEB_URL ?? "https://discord-pm.fly.dev";
+
     let summaryResult;
     try {
       summaryResult = await this.summarizer.summarize(transcript);
     } catch (e: any) {
       console.error("[bot] Summarization failed:", e);
-      // Post raw transcript on failure
+      // Save the record anyway so it's accessible via the web UI
+      const { id: recordId } = this.store.save({
+        guild_id: interaction.guildId!,
+        channel_id: session?.channelId ?? "unknown",
+        started_at: startedAt.toISOString(),
+        ended_at: endedAt.toISOString(),
+        participants: [],
+        raw_transcript: transcript,
+        summary_text: "(Summarization failed)",
+      });
       await interaction.followUp(
-        `Summarization failed. Raw transcript:\n\`\`\`\n${transcript.slice(0, 1800)}\n\`\`\``
+        `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
       );
       return;
     }
 
-    const { id: recordId, transcriptPath } = this.store.save({
+    const { id: recordId } = this.store.save({
       guild_id: interaction.guildId!,
       channel_id: session?.channelId ?? "unknown",
       started_at: startedAt.toISOString(),
@@ -233,7 +243,7 @@ export class StandupBot {
       summary_text: summaryResult.summary_text,
     });
 
-    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, transcriptPath);
+    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, webUrl);
   }
 
   private async postSummaryEmbed(
@@ -242,7 +252,7 @@ export class StandupBot {
     startedAt: Date,
     endedAt: Date,
     recordId: number,
-    transcriptPath: string
+    webUrl: string
   ) {
     const duration = Math.round((endedAt.getTime() - startedAt.getTime()) / 1000);
     const min = Math.floor(duration / 60);
@@ -262,12 +272,12 @@ export class StandupBot {
       embed.addFields({ name: p.name, value: lines.join("\n") || "No updates", inline: false });
     }
 
-    embed.setFooter({ text: `Duration: ${min}m ${sec}s  •  Record #${recordId}  •  Full transcript attached` });
+    embed.setFooter({ text: `Duration: ${min}m ${sec}s  •  Record #${recordId}` });
 
-    // Attach the markdown transcript file so users can read/download it directly.
-    const attachment = new AttachmentBuilder(transcriptPath);
-
-    await interaction.followUp({ embeds: [embed], files: [attachment] });
+    await interaction.followUp({
+      content: `Full transcript: ${webUrl}/transcripts/${recordId}`,
+      embeds: [embed],
+    });
   }
 
   // ── /standup status ─────────────────────────────────────────────────────────
