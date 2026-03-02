@@ -1,28 +1,25 @@
-FROM python:3.12-slim
+FROM oven/bun:1.3.10-debian
 
-# System deps for discord.py voice (libopus) and audio processing
+# System deps for @discordjs/voice (libopus) and opusscript
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopus0 \
-    ffmpeg \
+    libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python deps first so this layer is cached when only source changes
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir \
-    "discord.py[voice]>=2.4" \
-    "replicate>=0.34" \
-    "anthropic>=0.40" \
-    "aiosqlite>=0.20" \
-    "pydantic>=2.0" \
-    "pydantic-settings>=2.0" \
-    "aiofiles>=23.0"
+# Install deps first (cached layer)
+COPY package.json bun.lock* ./
+RUN bun install
 
-COPY discord_pm ./discord_pm
+# Copy source
+COPY src ./src
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-# Data directory for SQLite DB — mount a volume here to persist across restarts
+# Data dir for SQLite — mount a volume here
 RUN mkdir -p /app/data
-VOLUME ["/app/data"]
 
-CMD ["python", "-m", "discord_pm"]
+EXPOSE 8080
+
+CMD ["./entrypoint.sh"]

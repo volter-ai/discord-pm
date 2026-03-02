@@ -106,8 +106,8 @@ export class Recorder {
         // decodeFloat returns Float32Array of interleaved stereo samples
         const decoded: Float32Array = decoder.decodeFloat(opusPacket, FRAME_SIZE);
         this.speakers.get(userId)?.pcmSamples.push(decoded);
-      } catch {
-        // Drop malformed packets silently
+      } catch (e) {
+        console.warn(`[recorder] Opus decode error for user ${userId}:`, e);
       }
     });
 

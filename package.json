@@ -5,21 +5,23 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
-    "dev": "bun --watch src/index.ts"
+    "dev": "bun --watch src/index.ts",
+    "web": "bun run src/web.ts"
   },
   "dependencies": {
+    "hono": "^4",
     "@anthropic-ai/sdk": "^0.40",
-    "@discordjs/voice": "^0.18",
+    "@discordjs/voice": "^0.19.0",
     "@huggingface/transformers": "^3",
-    "@types/libsodium-wrappers": "^0.8.2",
+    "@snazzah/davey": "^0.1.9",
     "discord.js": "^14.16",
     "dotenv": "^16",
-    "libsodium-wrappers": "^0.8.2",
     "opusscript": "^0.1.1",
     "tweetnacl": "^1.0.3"
   },
   "trustedDependencies": [
     "onnxruntime-node",
-    "protobufjs"
+    "protobufjs",
+    "sharp"
   ]
 }

@@ -172,11 +172,15 @@ export class StandupBot {
     const segments: { speaker: string; userId: string; text: string }[] = [];
 
     const results = await Promise.allSettled(
-      [...speakerData.entries()].map(async ([userId, audio]) => {
-        const mono = Recorder.toMono16k(audio.pcmSamples);
-        const text = await this.transcriber.transcribe(mono);
-        return { speaker: audio.member.displayName, userId, text };
-      })
+      [...speakerData.entries()]
+        .filter(([, audio]) => audio.pcmSamples.length > 0)
+        .map(async ([userId, audio]) => {
+          const mono = Recorder.toMono16k(audio.pcmSamples);
+          console.log(`[bot] Speaker ${audio.member.displayName}: ${audio.pcmSamples.length} opus chunks, ${mono.length} mono samples (${(mono.length / 16000).toFixed(1)}s)`);
+          const text = await this.transcriber.transcribe(mono);
+          console.log(`[bot] Transcription for ${audio.member.displayName}: "${text.slice(0, 100)}"`);
+          return { speaker: audio.member.displayName, userId, text };
+        })
     );
 
     for (const r of results) {

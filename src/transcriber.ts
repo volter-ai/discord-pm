@@ -98,7 +98,7 @@ export class Transcriber {
       },
       body: JSON.stringify({
         version: "3ab86df6c8f54c11309d4d1f930ac292bad43ace52d10c80d87eb258b3c9f79c",
-        input: { audio: dataUri, language: "en" },
+        input: { audio: dataUri, language: "english" },
       }),
     });
     if (!res.ok) throw new Error(await res.text());
