@@ -1,28 +1,23 @@
-FROM python:3.12-slim
+FROM oven/bun:1-debian
 
-# System deps for discord.py voice (libopus) and audio processing
+# System deps:
+#   libopus0/libopus-dev — required by @discordjs/voice for Opus encoding
+#   python3 make g++     — required for native addon compilation (onnxruntime-node)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libopus0 \
-    ffmpeg \
+    libopus0 libopus-dev python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python deps first so this layer is cached when only source changes
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir \
-    "discord.py[voice]>=2.4" \
-    "replicate>=0.34" \
-    "anthropic>=0.40" \
-    "aiosqlite>=0.20" \
-    "pydantic>=2.0" \
-    "pydantic-settings>=2.0" \
-    "aiofiles>=23.0"
+# Install deps before copying source so this layer is cached on source-only changes
+COPY package.json ./
+RUN bun install
 
-COPY discord_pm ./discord_pm
+COPY src ./src
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-# Data directory for SQLite DB — mount a volume here to persist across restarts
-RUN mkdir -p /app/data
-VOLUME ["/app/data"]
+# Persistent directories — mount a Fly volume at /app/data
+RUN mkdir -p /app/data /app/transcripts /app/models
 
-CMD ["python", "-m", "discord_pm"]
+CMD ["./entrypoint.sh"]

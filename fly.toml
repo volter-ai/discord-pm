@@ -1,0 +1,38 @@
+# fly.toml — discord-pm standup bot + transcript UI
+# Deploy with: fly deploy
+# First-time setup: fly launch --no-deploy, then fly deploy
+
+app = "discord-pm"
+primary_region = "iad"
+
+[build]
+
+[env]
+  WEB_PORT = "8080"
+
+# Secrets to set via `fly secrets set`:
+#   DISCORD_BOT_TOKEN=...
+#   ANTHROPIC_API_KEY=...
+#   WEB_PASSWORD=...
+#   REPLICATE_API_TOKEN=...   (optional — falls back to local Whisper)
+#   OPENAI_API_KEY=...        (optional — preferred Whisper backend if set)
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[mounts]
+  source = "discord_pm_data"
+  destination = "/app/data"
