@@ -52,15 +52,19 @@ export class Summarizer {
           role: "user",
           content: `Standup transcript:\n\n${transcript}`,
         },
-        {
-          role: "assistant",
-          content: "{", // Prefill to steer directly into JSON
-        },
       ],
     });
 
-    const raw = "{" + (response.content[0] as any).text;
-    const parsed = JSON.parse(raw) as SummaryResult;
+    const text = (response.content[0] as any).text as string;
+
+    // Strip markdown fences if present, then find the outermost JSON object
+    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    const start = stripped.indexOf("{");
+    const end = stripped.lastIndexOf("}");
+    if (start === -1 || end === -1) {
+      throw new Error(`No JSON object found in summarizer response: ${text.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(stripped.slice(start, end + 1)) as SummaryResult;
     return parsed;
   }
 }
