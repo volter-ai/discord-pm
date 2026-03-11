@@ -73,14 +73,16 @@ interface StageInfo {
   order: number;
 }
 
+// Order matches actual SDLC: Draft → Ready → In Progress → In Review → QA → Done → Released
 const STAGE_MAP: Record<string, StageInfo> = {
-  "stage:in-progress": { emoji: "🔨", name: "In Progress", order: 1 },
-  "stage:in-review":   { emoji: "👀", name: "In Review", order: 2 },
-  "stage:qa":          { emoji: "🧪", name: "QA", order: 3 },
-  "stage:ready":       { emoji: "✅", name: "Ready", order: 4 },
-  "stage: ready":      { emoji: "✅", name: "Ready", order: 4 },
-  "stage: draft":      { emoji: "📝", name: "Draft", order: 5 },
-  "stage:done":        { emoji: "✔️", name: "Done", order: 6 },
+  "stage: draft":      { emoji: "📝", name: "Draft", order: 1 },
+  "stage:ready":       { emoji: "📋", name: "Ready", order: 2 },
+  "stage: ready":      { emoji: "📋", name: "Ready", order: 2 },
+  "ready-for-testing": { emoji: "📋", name: "Ready", order: 2 },
+  "stage:in-progress": { emoji: "🔨", name: "In Progress", order: 3 },
+  "stage:in-review":   { emoji: "👀", name: "In Review", order: 4 },
+  "stage:qa":          { emoji: "🧪", name: "QA", order: 5 },
+  "stage:done":        { emoji: "✅", name: "Done", order: 6 },
   "stage:released":    { emoji: "🚀", name: "Released", order: 7 },
 };
 
@@ -122,10 +124,10 @@ function timeAgo(iso: string): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
-function formatIssueLine(issue: GitHubIssue, compact = false): string {
+function formatIssueLine(issue: GitHubIssue): string {
   const prio = priorityEmoji(issue.labels);
   const bug = issue.labels.some((l) => l.toLowerCase() === "bug") ? "🐛 " : "";
-  const title = truncate(issue.title, compact ? 40 : 55);
+  const title = truncate(issue.title, 60);
   return `${prio}${bug}[#${issue.number}](${issue.url}) ${title}`;
 }
 
@@ -226,14 +228,14 @@ export async function buildStepEmbed(
 
   for (const [stage, issues] of stageGroups) {
     const shown = issues.slice(0, MAX_PER_COLUMN);
-    const lines = shown.map((i) => formatIssueLine(i, true));
+    const lines = shown.map((i) => formatIssueLine(i));
     const overflow = issues.length - shown.length;
     if (overflow > 0) lines.push(`*+${overflow} more*`);
 
     embed.addFields({
       name: `${stage.emoji} ${stage.name} (${issues.length})`,
       value: lines.join("\n") || "—",
-      inline: true,
+      inline: false,
     });
   }
 
