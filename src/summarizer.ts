@@ -55,7 +55,11 @@ export class Summarizer {
       ],
     });
 
-    const text = (response.content[0] as any).text as string;
+    const block = response.content.find((b) => b.type === "text");
+    if (!block || block.type !== "text") {
+      throw new Error("Summarizer: no text block in response");
+    }
+    const text = block.text;
 
     // Strip markdown fences if present, then find the outermost JSON object
     const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
@@ -64,7 +68,10 @@ export class Summarizer {
     if (start === -1 || end === -1) {
       throw new Error(`No JSON object found in summarizer response: ${text.slice(0, 200)}`);
     }
-    const parsed = JSON.parse(stripped.slice(start, end + 1)) as SummaryResult;
-    return parsed;
+    const parsed = JSON.parse(stripped.slice(start, end + 1));
+    if (!Array.isArray(parsed.participants) || typeof parsed.summary_text !== "string") {
+      throw new Error(`Summarizer response missing required fields: ${JSON.stringify(parsed).slice(0, 200)}`);
+    }
+    return parsed as SummaryResult;
   }
 }

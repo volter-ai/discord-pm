@@ -34,8 +34,16 @@ export class Transcriber {
    * Transcribe a single speaker's audio.
    * @param mono16k - Float32Array mono 16kHz PCM
    */
-  async transcribe(mono16k: Float32Array): Promise<string> {
+  async transcribe(mono16k: Float32Array, timeoutMs = 120_000): Promise<string> {
     if (mono16k.length < 1600) return ""; // < 0.1s — skip
+
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Transcription timed out")), timeoutMs)
+    );
+    return Promise.race([this.doTranscribe(mono16k), timeout]);
+  }
+
+  private async doTranscribe(mono16k: Float32Array): Promise<string> {
 
     // --- OpenAI backend ---
     if (process.env.OPENAI_API_KEY) {
@@ -56,7 +64,12 @@ export class Transcriber {
     }
 
     // --- Local Whisper (always available) ---
-    return await this.transcribeLocal(mono16k);
+    try {
+      return await this.transcribeLocal(mono16k);
+    } catch (e) {
+      console.warn("[transcriber] Local Whisper failed:", e);
+      return "";
+    }
   }
 
   private async transcribeLocal(mono16k: Float32Array): Promise<string> {
@@ -104,9 +117,11 @@ export class Transcriber {
     });
     if (!res.ok) throw new Error(await res.text());
 
-    // Poll for result
+    // Poll for result (max 80 attempts = 2 minutes)
     let prediction = (await res.json()) as any;
+    let attempts = 0;
     while (["starting", "processing"].includes(prediction.status)) {
+      if (++attempts > 80) throw new Error("Replicate prediction timed out after 2 minutes");
       await new Promise((r) => setTimeout(r, 1500));
       const poll = await fetch(prediction.urls.get, {
         headers: { Authorization: `Token ${process.env.REPLICATE_API_TOKEN}` },

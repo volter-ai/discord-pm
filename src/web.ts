@@ -63,15 +63,28 @@ function openDb(): Database | null {
   }
 }
 
-function listStandups(limit = 50): Row[] {
+function listStandups(limit = 50, offset = 0): Row[] {
   const db = openDb();
   if (!db) return [];
   try {
     return db
-      .query(`SELECT * FROM standups ORDER BY started_at DESC LIMIT ?`)
-      .all(limit) as Row[];
+      .query(`SELECT * FROM standups ORDER BY started_at DESC LIMIT ? OFFSET ?`)
+      .all(limit, offset) as Row[];
   } catch {
     return [];
+  } finally {
+    db.close();
+  }
+}
+
+function countStandups(): number {
+  const db = openDb();
+  if (!db) return 0;
+  try {
+    const row = db.query(`SELECT COUNT(*) as n FROM standups`).get() as { n: number } | null;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
   } finally {
     db.close();
   }
@@ -157,10 +170,22 @@ function page(title: string, body: string) {
 </html>`;
 }
 
-function listPage(rows: Row[]) {
+function listPage(rows: Row[], limit: number, offset: number, total: number) {
   const dbMissing = openDb() === null;
   const warning = dbMissing
     ? `<div class="warn">Database not found at <code>${DB_PATH}</code>. Run the bot first to generate transcripts.</div>`
+    : "";
+
+  const prevOffset = Math.max(0, offset - limit);
+  const nextOffset = offset + limit;
+  const hasPrev = offset > 0;
+  const hasNext = nextOffset < total;
+  const pagination = (hasPrev || hasNext)
+    ? `<div style="margin-top:1.25rem;display:flex;gap:1rem;font-size:.85rem">
+        ${hasPrev ? `<a href="/?limit=${limit}&offset=${prevOffset}">← Newer</a>` : `<span style="color:#334155">← Newer</span>`}
+        <span style="color:#64748b">${offset + 1}–${Math.min(offset + rows.length, total)} of ${total}</span>
+        ${hasNext ? `<a href="/?limit=${limit}&offset=${nextOffset}">Older →</a>` : `<span style="color:#334155">Older →</span>`}
+      </div>`
     : "";
 
   const tableRows = rows.map((r) => {
@@ -193,6 +218,7 @@ function listPage(rows: Row[]) {
     <h1>Standup Transcripts</h1>
     ${warning}
     ${table}
+    ${pagination}
   `);
 }
 
@@ -244,8 +270,11 @@ app.use("*", async (c, next) => {
 
 // HTML routes
 app.get("/", (c) => {
-  const rows = listStandups();
-  return c.html(listPage(rows));
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 200);
+  const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
+  const rows = listStandups(limit, offset);
+  const total = countStandups();
+  return c.html(listPage(rows, limit, offset, total));
 });
 
 app.get("/transcripts/:id", (c) => {
@@ -258,7 +287,9 @@ app.get("/transcripts/:id", (c) => {
 
 // JSON API routes
 app.get("/api/transcripts", (c) => {
-  const rows = listStandups(50).map((r) => ({
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 200);
+  const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
+  const rows = listStandups(limit, offset).map((r) => ({
     id: r.id,
     guild_id: r.guild_id,
     channel_id: r.channel_id,

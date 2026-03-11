@@ -41,18 +41,17 @@ export class Recorder {
   private activeStreams = new Set<string>();
   private guildId: string | null = null;
   private channelId: string | null = null;
+  // Set to true during stop() teardown so data handlers skip decode on deleted decoders
+  private stopping = false;
 
   get isRecording() {
     return this.connection !== null;
   }
 
-  get recordingChannelId() {
-    return this.channelId;
-  }
-
   async start(channel: VoiceChannel): Promise<void> {
     if (this.connection) throw new Error("Already recording.");
 
+    this.stopping = false;
     this.guildId = channel.guild.id;
     this.channelId = channel.id;
     this.speakers.clear();
@@ -98,7 +97,9 @@ export class Recorder {
         channel.guild.members.fetch(userId).then(m => {
           const entry = this.speakers.get(userId);
           if (entry) entry.member = m;
-        }).catch(() => {/* non-fatal */});
+        }).catch((e) => {
+          console.warn(`[recorder] Could not resolve member for userId=${userId}: ${e.message}`);
+        });
       }
     });
 
@@ -167,6 +168,7 @@ export class Recorder {
     let decodeErrors = 0;
 
     stream.on("data", (opusPacket: Buffer) => {
+      if (this.stopping) return;
       packetCount++;
       if (packetCount === 1) {
         console.log(`[recorder] First Opus packet from ${member.displayName} — size=${opusPacket.length}B`);
@@ -213,6 +215,8 @@ export class Recorder {
 
   /** Stop recording and return the per-speaker audio data. */
   stop(): Map<string, SpeakerAudio> {
+    // Set flag first so any in-flight data events skip decode on deleted decoders
+    this.stopping = true;
     for (const decoder of this.decoders.values()) {
       try { decoder.delete(); } catch { /* ignore */ }
     }

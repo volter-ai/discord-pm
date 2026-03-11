@@ -19,7 +19,8 @@ import { Transcriber } from "./transcriber";
 import { Summarizer } from "./summarizer";
 import { StandupStore } from "./store";
 
-const GUILD_ID = "1219420218233847878"; // volter.ai — syncs immediately
+// Guild-scoped commands sync instantly (vs global which take up to 1 hour).
+const GUILD_ID = process.env.DISCORD_GUILD_ID ?? "1219420218233847878";
 
 interface SessionMeta {
   startedAt: Date;
@@ -191,15 +192,20 @@ export class StandupBot {
         })
     );
 
+    let allFailed = true;
     for (const r of results) {
-      if (r.status === "fulfilled" && r.value.text.trim()) {
-        segments.push(r.value);
-      } else if (r.status === "rejected") {
+      if (r.status === "fulfilled") {
+        allFailed = false;
+        if (r.value.text.trim()) segments.push(r.value);
+      } else {
         console.error("[bot] Transcription error:", r.reason);
       }
     }
 
     if (segments.length === 0) {
+      if (allFailed) {
+        return interaction.followUp("Transcription failed for all speakers — check bot logs for details.");
+      }
       return interaction.followUp("Transcription returned no speech — maybe the meeting was silent?");
     }
 
