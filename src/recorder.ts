@@ -1,7 +1,10 @@
 /**
  * Per-speaker voice recording using @discordjs/voice.
  *
- * Each user in the voice channel gets their own Opus stream.
+ * Each speaking burst (speaking.start → speaking.end) is recorded as a
+ * separate Utterance with a timestamp, so the transcript can be assembled
+ * in chronological order rather than grouped by speaker.
+ *
  * Packets are accumulated in memory; silence between speakers is handled
  * by Whisper (it handles silence and gaps well).
  */
@@ -20,26 +23,31 @@ import { OpusEncoder } from "@discordjs/opus";
 const SAMPLE_RATE = 48000;
 const CHANNELS = 2;
 
-export interface SpeakerAudio {
+/** One contiguous speaking burst from a single user. */
+export interface Utterance {
+  userId: string;
   member: GuildMember;
   /** Decoded Float32 PCM samples, stereo interleaved, 48kHz */
   pcmSamples: Float32Array[];
-  /** Epoch ms of first packet — used for rough ordering */
+  /** Epoch ms when this burst started — used to sort the transcript */
   startedAt: number;
 }
 
 export class Recorder {
   private connection: VoiceConnection | null = null;
-  private speakers = new Map<string, SpeakerAudio>();
   // One Opus decoder per user (stateful)
   private decoders = new Map<string, OpusEncoder>();
   // Tracks which userIds have an *active* (non-destroyed) stream.
-  // Separate from speakers so a destroyed stream can be re-created on the
-  // next speaking event without losing already-accumulated PCM data.
   private activeStreams = new Set<string>();
+  // Member cache so speaking-event handlers can look up display names.
+  private memberCache = new Map<string, GuildMember>();
+  // Utterance currently being built for each user (reset on speaking.end).
+  private activeUtterances = new Map<string, Utterance>();
+  // Finalized utterances — appended on speaking.end or stop().
+  private completedUtterances: Utterance[] = [];
   private guildId: string | null = null;
   private channelId: string | null = null;
-  // Set to true during stop() teardown so data handlers skip decode on deleted decoders
+  // Set to true during stop() teardown so data handlers skip decode.
   private stopping = false;
 
   get isRecording() {
@@ -52,9 +60,11 @@ export class Recorder {
     this.stopping = false;
     this.guildId = channel.guild.id;
     this.channelId = channel.id;
-    this.speakers.clear();
     this.decoders.clear();
     this.activeStreams.clear();
+    this.memberCache.clear();
+    this.activeUtterances.clear();
+    this.completedUtterances = [];
 
     this.connection = joinVoiceChannel({
       channelId: channel.id,
@@ -69,41 +79,61 @@ export class Recorder {
 
     const receiver = this.connection.receiver;
 
-    // Subscribe to members already in the channel
+    // Pre-subscribe to members already in the channel so we don't miss their
+    // audio while waiting for a speaking.start event.
     const membersInChannel = [...channel.members.values()].filter(m => !m.user.bot);
     console.log(`[recorder] Members already in channel: ${membersInChannel.map(m => m.displayName).join(", ") || "(none cached)"}`);
     for (const member of membersInChannel) {
+      this.memberCache.set(member.id, member);
       this.subscribeToUser(receiver, member.id, member);
     }
 
-    // Subscribe to members who join after recording starts (or start speaking).
-    // If the member isn't in cache (GuildMembers intent not enabled, or race),
-    // we still subscribe using a minimal stub so audio isn't silently dropped.
+    // speaking.start: open a new utterance for this user.
     this.connection.receiver.speaking.on("start", (userId) => {
       const member = channel.guild.members.cache.get(userId);
-      console.log(`[recorder] speaking.start event for userId=${userId} member=${member?.displayName ?? "(not in cache — will still subscribe)"}`);
-      // Bots never send audio we want; skip known bots.  Unknown users subscribe.
+      console.log(`[recorder] speaking.start for userId=${userId} member=${member?.displayName ?? "(not cached)"}`);
       if (member?.user.bot) return;
       const effectiveMember = member ?? ({
         user: { id: userId, bot: false },
         displayName: `User-${userId.slice(-4)}`,
         id: userId,
       } as any);
+
+      this.memberCache.set(userId, effectiveMember);
+
+      // Start a fresh utterance for this burst.
+      this.activeUtterances.set(userId, {
+        userId,
+        member: effectiveMember,
+        pcmSamples: [],
+        startedAt: Date.now(),
+      });
+
+      // Subscribe to the audio stream if not already.
       this.subscribeToUser(receiver, userId, effectiveMember);
-      // Try to resolve the real member asynchronously for better display names
+
       if (!member) {
         channel.guild.members.fetch(userId).then(m => {
-          const entry = this.speakers.get(userId);
-          if (entry) entry.member = m;
+          this.memberCache.set(userId, m);
+          const active = this.activeUtterances.get(userId);
+          if (active) active.member = m;
         }).catch((e) => {
           console.warn(`[recorder] Could not resolve member for userId=${userId}: ${e.message}`);
         });
       }
     });
 
+    // speaking.end: finalize the current utterance.
     this.connection.receiver.speaking.on("end", (userId) => {
-      const chunks = this.speakers.get(userId)?.pcmSamples.length ?? 0;
-      console.log(`[recorder] speaking.end for userId=${userId} — ${chunks} chunks so far`);
+      const utterance = this.activeUtterances.get(userId);
+      if (utterance && utterance.pcmSamples.length > 0) {
+        this.completedUtterances.push(utterance);
+      }
+      this.activeUtterances.delete(userId);
+      const totalChunks = this.completedUtterances
+        .filter(u => u.userId === userId)
+        .reduce((s, u) => s + u.pcmSamples.length, 0);
+      console.log(`[recorder] speaking.end for userId=${userId} — ${utterance?.pcmSamples.length ?? 0} chunks this burst, ${totalChunks} total`);
     });
 
     // Log connection state changes
@@ -118,7 +148,6 @@ export class Recorder {
 
     // Pipe internal debug events so we can see DAVE handshake + SSRC mapping
     this.connection.on("debug" as any, (msg: string) => {
-      // Filter to only the most useful debug lines to avoid noise
       if (
         msg.includes("DAVE") ||
         msg.includes("dave") ||
@@ -140,28 +169,15 @@ export class Recorder {
     userId: string,
     member: GuildMember
   ) {
-    // Guard: only one live stream per user at a time.
-    // We do NOT check speakers.has() here so that a re-subscription after
-    // DAVE-induced stream destruction is allowed (preserving pcmSamples).
     if (this.activeStreams.has(userId)) return;
     this.activeStreams.add(userId);
-
-    // Preserve existing pcmSamples if re-subscribing after stream destruction.
-    if (!this.speakers.has(userId)) {
-      this.speakers.set(userId, {
-        member,
-        pcmSamples: [],
-        startedAt: Date.now(),
-      });
-    }
 
     // Recreate decoder on each (re-)subscription so it starts fresh.
     this.decoders.get(userId)?.destroy();
     const decoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
     this.decoders.set(userId, decoder);
 
-    const existing = this.speakers.get(userId)!.pcmSamples.length;
-    console.log(`[recorder] Subscribing to ${member.displayName} (${userId}) — existing chunks: ${existing}`);
+    console.log(`[recorder] Subscribing to ${member.displayName} (${userId})`);
 
     const stream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
@@ -190,7 +206,15 @@ export class Recorder {
         for (let i = 0; i < numSamples; i++) {
           float32[i] = pcmBuf.readInt16LE(i * 2) / 0x8000;
         }
-        this.speakers.get(userId)?.pcmSamples.push(float32);
+        // Route to the active utterance. If speaking.start hasn't fired yet
+        // (pre-subscribed member starts speaking), create an implicit utterance.
+        let utterance = this.activeUtterances.get(userId);
+        if (!utterance) {
+          const m = this.memberCache.get(userId) ?? member;
+          utterance = { userId, member: m, pcmSamples: [], startedAt: Date.now() };
+          this.activeUtterances.set(userId, utterance);
+        }
+        utterance.pcmSamples.push(float32);
       } catch (e: any) {
         decodeErrors++;
         if (decodeErrors <= 3) {
@@ -204,24 +228,33 @@ export class Recorder {
     });
 
     stream.on("close", () => {
-      // Mark stream as inactive so the next speaking event re-creates it.
       this.activeStreams.delete(userId);
-      console.log(`[recorder] Stream closed for ${member.displayName} — ${packetCount} pkts, ${decodeErrors} errs, ${this.speakers.get(userId)?.pcmSamples.length ?? 0} chunks total`);
+      console.log(`[recorder] Stream closed for ${member.displayName} — ${packetCount} pkts, ${decodeErrors} errs`);
     });
   }
 
   /**
-   * Inject pre-loaded PCM samples for a speaker (used in testing to bypass
-   * Discord self-echo restriction).
+   * Inject pre-loaded PCM samples for a speaker (used in testing).
    */
   injectAudio(userId: string, member: GuildMember, pcmSamples: Float32Array[]): void {
-    this.speakers.set(userId, { member, pcmSamples, startedAt: Date.now() });
+    this.completedUtterances.push({ userId, member, pcmSamples, startedAt: Date.now() });
   }
 
-  /** Stop recording and return the per-speaker audio data. */
-  stop(): Map<string, SpeakerAudio> {
-    // Set flag first so any in-flight data events skip decode on deleted decoders
+  /**
+   * Stop recording and return utterances sorted chronologically.
+   */
+  stop(): Utterance[] {
+    // Set flag first so any in-flight data events are ignored.
     this.stopping = true;
+
+    // Finalize any utterances still in progress when stop() was called.
+    for (const utterance of this.activeUtterances.values()) {
+      if (utterance.pcmSamples.length > 0) {
+        this.completedUtterances.push(utterance);
+      }
+    }
+    this.activeUtterances.clear();
+
     for (const decoder of this.decoders.values()) {
       try { decoder.destroy(); } catch { /* ignore */ }
     }
@@ -232,12 +265,16 @@ export class Recorder {
       this.connection = null;
     }
 
-    const data = new Map(this.speakers);
-    this.speakers.clear();
+    // Sort by start time to get chronological conversation order.
+    this.completedUtterances.sort((a, b) => a.startedAt - b.startedAt);
+    const result = this.completedUtterances;
+
+    this.completedUtterances = [];
     this.activeStreams.clear();
+    this.memberCache.clear();
     this.guildId = null;
     this.channelId = null;
-    return data;
+    return result;
   }
 
   /**
@@ -256,7 +293,7 @@ export class Recorder {
       offset += chunk.length;
     }
 
-    // Stereo → mono (average L and R), then downsample 48kHz → 16kHz (keep every 3rd sample)
+    // Stereo → mono (average L and R), then downsample 48kHz → 16kHz (keep every 3rd frame)
     const monoLen = Math.floor(stereo.length / (CHANNELS * 3));
     const mono = new Float32Array(monoLen);
     for (let i = 0; i < monoLen; i++) {

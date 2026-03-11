@@ -14,7 +14,7 @@ import {
   Routes,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
-import { Recorder } from "./recorder";
+import { Recorder, type Utterance } from "./recorder";
 import { Transcriber } from "./transcriber";
 import { Summarizer } from "./summarizer";
 import { StandupStore } from "./store";
@@ -160,59 +160,59 @@ export class StandupBot {
     const endedAt = new Date();
     const startedAt = session?.startedAt ?? endedAt;
 
-    await interaction.followUp("Recording stopped — transcribing each speaker (this may take a minute)…");
+    await interaction.followUp("Recording stopped — transcribing (this may take a minute)…");
 
-    const speakerData = this.recorder.stop();
+    const utterances = this.recorder.stop();
     this.activeSessions.delete(interaction.guildId!);
 
-    // Debug: always log what we captured
-    console.log(`[bot] stop: ${speakerData.size} speaker(s) in map`);
-    for (const [userId, audio] of speakerData) {
-      const chunks = audio.pcmSamples.length;
-      const seconds = (chunks * 960 / 48000).toFixed(2);
-      console.log(`[bot]   ${audio.member.displayName} (${userId}): ${chunks} chunks = ${seconds}s`);
+    // Debug: log per-speaker summary
+    console.log(`[bot] stop: ${utterances.length} utterance(s)`);
+    const byUser = new Map<string, { name: string; chunks: number; count: number }>();
+    for (const u of utterances) {
+      const e = byUser.get(u.userId) ?? { name: u.member.displayName, chunks: 0, count: 0 };
+      e.chunks += u.pcmSamples.length;
+      e.count++;
+      byUser.set(u.userId, e);
+    }
+    for (const [userId, { name, chunks, count }] of byUser) {
+      console.log(`[bot]   ${name} (${userId}): ${chunks} chunks = ${(chunks * 960 / 48000).toFixed(2)}s across ${count} utterance(s)`);
     }
 
-    if (speakerData.size === 0) {
+    if (utterances.length === 0) {
       return interaction.followUp("No audio was captured. (No speaking events fired — check bot permissions or DAVE status.)");
     }
 
-    // Transcribe each speaker in parallel
-    const segments: { speaker: string; userId: string; text: string }[] = [];
-
+    // Transcribe each utterance in parallel; order is already chronological.
     const results = await Promise.allSettled(
-      [...speakerData.entries()]
-        .filter(([, audio]) => audio.pcmSamples.length > 0)
-        .map(async ([userId, audio]) => {
-          const mono = Recorder.toMono16k(audio.pcmSamples);
-          console.log(`[bot] Transcribing ${audio.member.displayName}: ${mono.length} mono samples (${(mono.length/16000).toFixed(2)}s)`);
-          const text = await this.transcriber.transcribe(mono);
-          console.log(`[bot] → "${text.slice(0, 100)}"`);
-          return { speaker: audio.member.displayName, userId, text };
-        })
+      utterances.map(async (u: Utterance) => {
+        const mono = Recorder.toMono16k(u.pcmSamples);
+        console.log(`[bot] Transcribing ${u.member.displayName} utterance: ${mono.length} samples (${(mono.length/16000).toFixed(2)}s)`);
+        const text = await this.transcriber.transcribe(mono);
+        console.log(`[bot] → "${text.slice(0, 100)}"`);
+        return { speaker: u.member.displayName, userId: u.userId, text };
+      })
     );
 
     let allFailed = true;
+    const lines: string[] = [];
     for (const r of results) {
       if (r.status === "fulfilled") {
         allFailed = false;
-        if (r.value.text.trim()) segments.push(r.value);
+        if (r.value.text.trim()) lines.push(`[${r.value.speaker}]: ${r.value.text.trim()}`);
       } else {
         console.error("[bot] Transcription error:", r.reason);
       }
     }
 
-    if (segments.length === 0) {
+    if (lines.length === 0) {
       if (allFailed) {
         return interaction.followUp("Transcription failed for all speakers — check bot logs for details.");
       }
       return interaction.followUp("Transcription returned no speech — maybe the meeting was silent?");
     }
 
-    // Format transcript with speaker labels
-    const transcript = segments
-      .map((s) => `[${s.speaker}]: ${s.text}`)
-      .join("\n\n");
+    // Transcript lines are in chronological speaking order.
+    const transcript = lines.join("\n\n");
 
     await interaction.followUp("Transcription complete — summarizing with Claude…");
 
