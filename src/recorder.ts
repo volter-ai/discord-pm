@@ -15,12 +15,10 @@ import {
   entersState,
 } from "@discordjs/voice";
 import { VoiceChannel, GuildMember } from "discord.js";
-// @ts-ignore - opusscript has no types
-import OpusScript from "opusscript";
+import { OpusEncoder } from "@discordjs/opus";
 
 const SAMPLE_RATE = 48000;
 const CHANNELS = 2;
-const FRAME_SIZE = 960; // 20ms at 48kHz
 
 export interface SpeakerAudio {
   member: GuildMember;
@@ -33,8 +31,8 @@ export interface SpeakerAudio {
 export class Recorder {
   private connection: VoiceConnection | null = null;
   private speakers = new Map<string, SpeakerAudio>();
-  // One OpusScript decoder per user (stateful)
-  private decoders = new Map<string, InstanceType<typeof OpusScript>>();
+  // One Opus decoder per user (stateful)
+  private decoders = new Map<string, OpusEncoder>();
   // Tracks which userIds have an *active* (non-destroyed) stream.
   // Separate from speakers so a destroyed stream can be re-created on the
   // next speaking event without losing already-accumulated PCM data.
@@ -158,8 +156,8 @@ export class Recorder {
     }
 
     // Recreate decoder on each (re-)subscription so it starts fresh.
-    this.decoders.get(userId)?.delete();
-    let decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
+    this.decoders.get(userId)?.destroy();
+    const decoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
     this.decoders.set(userId, decoder);
 
     const existing = this.speakers.get(userId)!.pcmSamples.length;
@@ -171,13 +169,9 @@ export class Recorder {
 
     let packetCount = 0;
     let decodeErrors = 0;
-    // When the OpusScript WASM heap is corrupted, even creating a new instance
-    // fails. In that case we flag this stream as broken and skip further decoding
-    // rather than crashing the process.
-    let decoderBroken = false;
 
     stream.on("data", (opusPacket: Buffer) => {
-      if (this.stopping || decoderBroken) return;
+      if (this.stopping) return;
       packetCount++;
       if (packetCount === 1) {
         console.log(`[recorder] First Opus packet from ${member.displayName} — size=${opusPacket.length}B`);
@@ -186,8 +180,10 @@ export class Recorder {
         console.log(`[recorder] ${member.displayName}: ${packetCount} packets received`);
       }
       try {
-        // opusscript v0.1.1 decode() returns a Buffer of Int16 LE PCM samples.
-        const pcmBuf: Buffer = decoder.decode(opusPacket, FRAME_SIZE);
+        // @discordjs/opus decode() returns a Buffer of Int16 LE PCM samples.
+        // Native bindings have isolated memory per instance — a bad packet
+        // throws a catchable JS exception without corrupting other decoders.
+        const pcmBuf: Buffer = decoder.decode(opusPacket);
         // Convert Int16 → Float32 (range -1..1), keeping stereo interleaving.
         const numSamples = pcmBuf.length / 2;
         const float32 = new Float32Array(numSamples);
@@ -199,18 +195,6 @@ export class Recorder {
         decodeErrors++;
         if (decodeErrors <= 3) {
           console.warn(`[recorder] Decode error #${decodeErrors} for ${member.displayName}: ${e.message}`);
-        }
-        // A decode error corrupts the OpusScript internal state — try to recreate
-        // the decoder so subsequent packets aren't poisoned by the same failure.
-        // If the WASM heap itself is corrupt, new OpusScript() also throws; in
-        // that case mark the stream broken and stop decoding to avoid crashing.
-        try { decoder.delete(); } catch {}
-        try {
-          decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
-          this.decoders.set(userId, decoder);
-        } catch (wasmErr: any) {
-          console.error(`[recorder] OpusScript WASM unrecoverable for ${member.displayName}, disabling stream: ${wasmErr.message}`);
-          decoderBroken = true;
         }
       }
     });
@@ -239,7 +223,7 @@ export class Recorder {
     // Set flag first so any in-flight data events skip decode on deleted decoders
     this.stopping = true;
     for (const decoder of this.decoders.values()) {
-      try { decoder.delete(); } catch { /* ignore */ }
+      try { decoder.destroy(); } catch { /* ignore */ }
     }
     this.decoders.clear();
 
