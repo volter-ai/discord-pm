@@ -282,7 +282,7 @@ export class StandupBot {
       return interaction.followUp("No active recording found.");
     }
 
-    await interaction.followUp("Recording stopped — finishing transcription…");
+    await interaction.followUp("Recording stopped — processing…");
     await this.finishRecording(interaction, interaction.guildId!);
   }
 
@@ -335,10 +335,6 @@ export class StandupBot {
     for (const [userId, { name, count }] of byUser) {
       console.log(`[bot]   ${name} (${userId}): ${count} transcribed utterance(s)`);
     }
-
-    try {
-      await interaction.followUp?.("Transcription complete — summarizing with Claude…");
-    } catch { /* interaction may be expired */ }
 
     const webUrl = process.env.WEB_URL ?? "https://discord-pm.fly.dev";
 
@@ -393,21 +389,14 @@ export class StandupBot {
     const min = Math.floor(duration / 60);
     const sec = duration % 60;
 
+    const names = result.participants.map((p: any) => p.name).join(", ");
+
     const embed = new EmbedBuilder()
       .setTitle("Standup Summary")
       .setDescription(result.summary_text)
       .setColor(Colors.Green)
+      .setFooter({ text: `${names}  •  ${min}m ${sec}s  •  #${recordId}` })
       .setTimestamp(endedAt);
-
-    for (const p of result.participants) {
-      const lines: string[] = [];
-      if (p.did?.length) lines.push("**Did:**\n" + p.did.map((d: string) => `• ${d}`).join("\n"));
-      if (p.will_do?.length) lines.push("**Will do:**\n" + p.will_do.map((d: string) => `• ${d}`).join("\n"));
-      if (p.blockers?.length) lines.push("**Blockers:**\n" + p.blockers.map((d: string) => `• ${d}`).join("\n"));
-      embed.addFields({ name: p.name, value: lines.join("\n") || "No updates", inline: false });
-    }
-
-    embed.setFooter({ text: `Duration: ${min}m ${sec}s  •  Record #${recordId}` });
 
     try {
       await interaction.followUp({
