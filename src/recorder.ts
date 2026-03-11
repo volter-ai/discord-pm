@@ -213,6 +213,11 @@ export class Recorder {
           const m = this.memberCache.get(userId) ?? member;
           utterance = { userId, member: m, pcmSamples: [], startedAt: Date.now() };
           this.activeUtterances.set(userId, utterance);
+        } else if (utterance.pcmSamples.length === 0) {
+          // Pin startedAt to the moment the first actual packet arrives rather
+          // than when speaking.start fired — gives more accurate ordering when
+          // two speakers start within the same event-loop tick.
+          utterance.startedAt = Date.now();
         }
         utterance.pcmSamples.push(float32);
       } catch (e: any) {

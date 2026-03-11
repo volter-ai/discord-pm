@@ -35,12 +35,13 @@ export class Transcriber {
    * @param mono16k - Float32Array mono 16kHz PCM
    */
   async transcribe(mono16k: Float32Array, timeoutMs = 120_000): Promise<string> {
-    if (mono16k.length < 1600) return ""; // < 0.1s — skip
+    if (mono16k.length < 8000) return ""; // < 0.5s — skip (reduces hallucinations on short clips)
 
     const timeout = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error("Transcription timed out")), timeoutMs)
     );
-    return Promise.race([this.doTranscribe(mono16k), timeout]);
+    const text = await Promise.race([this.doTranscribe(mono16k), timeout]);
+    return filterHallucinations(text);
   }
 
   private async doTranscribe(mono16k: Float32Array): Promise<string> {
@@ -130,6 +131,42 @@ export class Transcriber {
     }
     return (prediction.output?.text ?? prediction.output?.transcription ?? "").trim();
   }
+}
+
+/**
+ * Whisper-tiny commonly outputs these strings on silent/noisy/very-short clips.
+ * Return empty string for any of these so they don't pollute the transcript.
+ */
+const HALLUCINATIONS = new Set([
+  "thank you.",
+  "thanks.",
+  "thank you very much.",
+  "thanks for watching.",
+  "thank you for watching.",
+  "thanks for listening.",
+  "thank you for listening.",
+  "you.",
+  "you",
+  ".",
+  "...",
+  "okay.",
+  "ok.",
+  "hmm.",
+  "hm.",
+  "uh.",
+  "um.",
+  "mhm.",
+  "[music]",
+  "[applause]",
+  "[laughter]",
+  "[ Silence ]",
+  "[silence]",
+]);
+
+function filterHallucinations(text: string): string {
+  const normalized = text.trim().toLowerCase();
+  if (HALLUCINATIONS.has(normalized)) return "";
+  return text.trim();
 }
 
 /** Encode a Float32Array of mono PCM samples into a 16-bit WAV buffer. */
