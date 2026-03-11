@@ -113,6 +113,11 @@ export class Recorder {
       console.log(`[recorder] connection state: ${oldState.status} → ${newState.status}`);
     });
 
+    // Prevent unhandled 'error' events from crashing the process
+    this.connection.on("error" as any, (err: Error) => {
+      console.error("[recorder] VoiceConnection error (non-fatal):", err.message);
+    });
+
     // Pipe internal debug events so we can see DAVE handshake + SSRC mapping
     this.connection.on("debug" as any, (msg: string) => {
       // Filter to only the most useful debug lines to avoid noise
@@ -166,9 +171,13 @@ export class Recorder {
 
     let packetCount = 0;
     let decodeErrors = 0;
+    // When the OpusScript WASM heap is corrupted, even creating a new instance
+    // fails. In that case we flag this stream as broken and skip further decoding
+    // rather than crashing the process.
+    let decoderBroken = false;
 
     stream.on("data", (opusPacket: Buffer) => {
-      if (this.stopping) return;
+      if (this.stopping || decoderBroken) return;
       packetCount++;
       if (packetCount === 1) {
         console.log(`[recorder] First Opus packet from ${member.displayName} — size=${opusPacket.length}B`);
@@ -191,11 +200,18 @@ export class Recorder {
         if (decodeErrors <= 3) {
           console.warn(`[recorder] Decode error #${decodeErrors} for ${member.displayName}: ${e.message}`);
         }
-        // A decode error corrupts the OpusScript internal state — recreate the
-        // decoder so subsequent packets aren't all poisoned by the same failure.
+        // A decode error corrupts the OpusScript internal state — try to recreate
+        // the decoder so subsequent packets aren't poisoned by the same failure.
+        // If the WASM heap itself is corrupt, new OpusScript() also throws; in
+        // that case mark the stream broken and stop decoding to avoid crashing.
         try { decoder.delete(); } catch {}
-        decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
-        this.decoders.set(userId, decoder);
+        try {
+          decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
+          this.decoders.set(userId, decoder);
+        } catch (wasmErr: any) {
+          console.error(`[recorder] OpusScript WASM unrecoverable for ${member.displayName}, disabling stream: ${wasmErr.message}`);
+          decoderBroken = true;
+        }
       }
     });
 
