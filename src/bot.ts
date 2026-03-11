@@ -1,6 +1,6 @@
 /**
  * Main bot class — sets up the Discord client, registers slash commands,
- * and handles /standup start | stop | status | history.
+ * and handles /standup start | stop | status | history and /review.
  *
  * Utterances are transcribed incrementally as speakers finish talking,
  * keeping memory usage low even during long meetings.
@@ -21,6 +21,7 @@ import { Recorder, type Utterance } from "./recorder";
 import { Transcriber } from "./transcriber";
 import { Summarizer } from "./summarizer";
 import { StandupStore } from "./store";
+import { STANDUPS, STANDUP_NAMES, buildStepEmbed } from "./review";
 
 const GUILD_ID = process.env.DISCORD_GUILD_ID ?? "1219420218233847878";
 
@@ -117,6 +118,19 @@ export class StandupBot {
           },
         ],
       },
+      {
+        name: "review",
+        description: "Walk through GitHub Issues for a standup",
+        options: [
+          {
+            type: 3, // STRING
+            name: "standup",
+            description: "Which standup to review",
+            required: true,
+            choices: STANDUP_NAMES.map((name) => ({ name, value: name })),
+          },
+        ],
+      },
     ];
 
     const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN!);
@@ -127,15 +141,26 @@ export class StandupBot {
   }
 
   private async handleInteraction(interaction: Interaction) {
+    // Button interactions (review:next, review:done)
+    if (interaction.isButton()) {
+      const id = interaction.customId;
+      if (id.startsWith("review:")) {
+        await this.handleReviewButton(interaction);
+      }
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== "standup") return;
 
-    const sub = interaction.options.getSubcommand();
-
-    if (sub === "start") await this.handleStart(interaction);
-    else if (sub === "stop") await this.handleStop(interaction);
-    else if (sub === "status") await this.handleStatus(interaction);
-    else if (sub === "history") await this.handleHistory(interaction);
+    if (interaction.commandName === "standup") {
+      const sub = interaction.options.getSubcommand();
+      if (sub === "start") await this.handleStart(interaction);
+      else if (sub === "stop") await this.handleStop(interaction);
+      else if (sub === "status") await this.handleStatus(interaction);
+      else if (sub === "history") await this.handleHistory(interaction);
+    } else if (interaction.commandName === "review") {
+      await this.handleReview(interaction);
+    }
   }
 
   // ── Concurrency-limited transcription queue ────────────────────────────────
@@ -458,5 +483,65 @@ export class StandupBot {
     }
 
     await interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  // ── /review ─────────────────────────────────────────────────────────────────
+
+  private async handleReview(interaction: any) {
+    const standupKey = interaction.options.getString("standup");
+    if (!standupKey || !STANDUPS[standupKey]) {
+      return interaction.reply({
+        content: `Unknown standup. Choose from: ${STANDUP_NAMES.join(", ")}`,
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const { embed, row } = await buildStepEmbed(standupKey, 0);
+      await interaction.followUp({ embeds: [embed], components: [row] });
+    } catch (e: any) {
+      console.error("[bot] Review error:", e);
+      await interaction.followUp(`Failed to fetch issues: ${e.message}`);
+    }
+  }
+
+  private async handleReviewButton(interaction: any) {
+    const parts = interaction.customId.split(":");
+    // Format: review:next:standupKey:stepIndex  or  review:done:standupKey
+    const action = parts[1];
+    const standupKey = parts[2];
+
+    if (action === "done") {
+      await interaction.update({
+        content: `Review of **${standupKey}** complete.`,
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+
+    if (action === "next") {
+      const stepIndex = parseInt(parts[3]);
+      if (!STANDUPS[standupKey] || isNaN(stepIndex)) {
+        await interaction.reply({ content: "Invalid review state.", ephemeral: true });
+        return;
+      }
+
+      await interaction.deferUpdate();
+
+      try {
+        const { embed, row } = await buildStepEmbed(standupKey, stepIndex);
+        await interaction.editReply({ embeds: [embed], components: [row] });
+      } catch (e: any) {
+        console.error("[bot] Review step error:", e);
+        await interaction.editReply({
+          content: `Failed to fetch issues for step ${stepIndex + 1}: ${e.message}`,
+          embeds: [],
+          components: [],
+        });
+      }
+    }
   }
 }

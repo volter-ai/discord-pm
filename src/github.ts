@@ -1,0 +1,100 @@
+/**
+ * GitHub REST API client for querying issues.
+ *
+ * Uses fetch + GITHUB_TOKEN env var. No npm dependency needed.
+ */
+
+const GITHUB_API = "https://api.github.com";
+
+export interface GitHubIssue {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  labels: string[];
+  updatedAt: string;
+  url: string;
+}
+
+function headers(): Record<string, string> {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) throw new Error("GITHUB_TOKEN not set");
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
+
+function parseIssues(raw: any[]): GitHubIssue[] {
+  return raw
+    .filter((i) => !i.pull_request) // exclude PRs (they show up in /issues)
+    .map((i) => ({
+      number: i.number,
+      title: i.title,
+      state: i.state as "open" | "closed",
+      labels: (i.labels ?? []).map((l: any) => l.name),
+      updatedAt: i.updated_at,
+      url: i.html_url,
+    }));
+}
+
+/**
+ * Fetch issues for an assignee updated within the last `sinceHours` hours.
+ * Returns both open and closed issues, sorted by most recently updated.
+ */
+export async function fetchRecentlyUpdated(
+  repo: string,
+  assignee: string,
+  sinceHours = 24,
+): Promise<GitHubIssue[]> {
+  const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000).toISOString();
+  const params = new URLSearchParams({
+    assignee,
+    state: "all",
+    sort: "updated",
+    direction: "desc",
+    since,
+    per_page: "50",
+  });
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues?${params}`, {
+    headers: headers(),
+  });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+  const raw = await res.json();
+  // The `since` param filters by updated_at >= since, which is exactly what we want.
+  return parseIssues(raw);
+}
+
+/**
+ * Fetch open issues for an assignee (or unassigned if assignee is null)
+ * that do NOT have the given backlog label.
+ */
+export async function fetchOpenNonBacklog(
+  repo: string,
+  assignee: string | null,
+  backlogLabel: string,
+): Promise<GitHubIssue[]> {
+  const params = new URLSearchParams({
+    state: "open",
+    sort: "updated",
+    direction: "desc",
+    per_page: "100",
+  });
+  if (assignee) {
+    params.set("assignee", assignee);
+  } else {
+    // "none" is GitHub's special value for unassigned
+    params.set("assignee", "none");
+  }
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues?${params}`, {
+    headers: headers(),
+  });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+  const raw = await res.json();
+  const issues = parseIssues(raw);
+  // Filter out issues with the backlog label (client-side because GitHub API
+  // doesn't support negative label filters).
+  return issues.filter(
+    (i) => !i.labels.some((l) => l.toLowerCase() === backlogLabel.toLowerCase()),
+  );
+}
