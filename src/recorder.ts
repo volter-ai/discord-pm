@@ -154,7 +154,7 @@ export class Recorder {
 
     // Recreate decoder on each (re-)subscription so it starts fresh.
     this.decoders.get(userId)?.delete();
-    const decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
+    let decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
     this.decoders.set(userId, decoder);
 
     const existing = this.speakers.get(userId)!.pcmSamples.length;
@@ -191,6 +191,11 @@ export class Recorder {
         if (decodeErrors <= 3) {
           console.warn(`[recorder] Decode error #${decodeErrors} for ${member.displayName}: ${e.message}`);
         }
+        // A decode error corrupts the OpusScript internal state — recreate the
+        // decoder so subsequent packets aren't all poisoned by the same failure.
+        try { decoder.delete(); } catch {}
+        decoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
+        this.decoders.set(userId, decoder);
       }
     });
 
