@@ -45,7 +45,7 @@ export class Summarizer {
   async summarize(transcript: string): Promise<SummaryResult> {
     const response = await this.client.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 1024,
+      max_tokens: 4096,
       system: SYSTEM_PROMPT,
       messages: [
         {

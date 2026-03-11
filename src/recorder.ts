@@ -2,11 +2,10 @@
  * Per-speaker voice recording using @discordjs/voice.
  *
  * Each speaking burst (speaking.start → speaking.end) is recorded as a
- * separate Utterance with a timestamp, so the transcript can be assembled
- * in chronological order rather than grouped by speaker.
- *
- * Packets are accumulated in memory; silence between speakers is handled
- * by Whisper (it handles silence and gaps well).
+ * separate Utterance with a timestamp. Completed utterances are delivered
+ * to the caller via an onUtterance callback so they can be transcribed
+ * incrementally — keeping peak memory to ~1 utterance instead of the
+ * entire meeting.
  */
 
 import {
@@ -23,6 +22,12 @@ import { OpusEncoder } from "@discordjs/opus";
 const SAMPLE_RATE = 48000;
 const CHANNELS = 2;
 
+/** Default auto-stop after 60 minutes to prevent runaway memory usage. */
+const DEFAULT_MAX_DURATION_MS = 60 * 60 * 1000;
+
+/** Max reconnection attempts before giving up. */
+const MAX_RECONNECT_ATTEMPTS = 3;
+
 /** One contiguous speaking burst from a single user. */
 export interface Utterance {
   userId: string;
@@ -33,54 +38,67 @@ export interface Utterance {
   startedAt: number;
 }
 
+export interface RecorderCallbacks {
+  /** Called when an utterance completes (speaking.end). Transcribe it now. */
+  onUtterance: (utterance: Utterance) => void;
+  /** Called when auto-stop timer fires. Caller should run stop logic. */
+  onTimeout: () => void;
+  /** Called when voice connection is permanently lost. */
+  onDisconnect: (reason: string) => void;
+}
+
 export class Recorder {
   private connection: VoiceConnection | null = null;
-  // One Opus decoder per user (stateful)
   private decoders = new Map<string, OpusEncoder>();
-  // Tracks which userIds have an *active* (non-destroyed) stream.
   private activeStreams = new Set<string>();
-  // Member cache so speaking-event handlers can look up display names.
   private memberCache = new Map<string, GuildMember>();
-  // Utterance currently being built for each user (reset on speaking.end).
   private activeUtterances = new Map<string, Utterance>();
-  // Finalized utterances — appended on speaking.end or stop().
-  private completedUtterances: Utterance[] = [];
   private guildId: string | null = null;
   private channelId: string | null = null;
-  // Set to true during stop() teardown so data handlers skip decode.
   private stopping = false;
+  private autoStopTimer: ReturnType<typeof setTimeout> | null = null;
+  private callbacks: RecorderCallbacks | null = null;
 
   get isRecording() {
     return this.connection !== null;
   }
 
-  async start(channel: VoiceChannel): Promise<void> {
+  async start(
+    channel: VoiceChannel,
+    callbacks: RecorderCallbacks,
+    maxDurationMs = DEFAULT_MAX_DURATION_MS,
+  ): Promise<void> {
     if (this.connection) throw new Error("Already recording.");
 
     this.stopping = false;
     this.guildId = channel.guild.id;
     this.channelId = channel.id;
+    this.callbacks = callbacks;
     this.decoders.clear();
     this.activeStreams.clear();
     this.memberCache.clear();
     this.activeUtterances.clear();
-    this.completedUtterances = [];
 
     this.connection = joinVoiceChannel({
       channelId: channel.id,
       guildId: channel.guild.id,
       adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false, // Must be false to receive audio
+      selfDeaf: false,
       selfMute: true,
     });
 
     await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
     console.log("[recorder] Voice connection ready.");
 
+    // Auto-stop safety net
+    this.autoStopTimer = setTimeout(() => {
+      console.warn(`[recorder] Auto-stop: max duration (${maxDurationMs / 60_000}m) reached.`);
+      callbacks.onTimeout();
+    }, maxDurationMs);
+
     const receiver = this.connection.receiver;
 
-    // Pre-subscribe to members already in the channel so we don't miss their
-    // audio while waiting for a speaking.start event.
+    // Pre-subscribe to members already in the channel
     const membersInChannel = [...channel.members.values()].filter(m => !m.user.bot);
     console.log(`[recorder] Members already in channel: ${membersInChannel.map(m => m.displayName).join(", ") || "(none cached)"}`);
     for (const member of membersInChannel) {
@@ -101,7 +119,6 @@ export class Recorder {
 
       this.memberCache.set(userId, effectiveMember);
 
-      // Start a fresh utterance for this burst.
       this.activeUtterances.set(userId, {
         userId,
         member: effectiveMember,
@@ -109,7 +126,6 @@ export class Recorder {
         startedAt: Date.now(),
       });
 
-      // Subscribe to the audio stream if not already.
       this.subscribeToUser(receiver, userId, effectiveMember);
 
       if (!member) {
@@ -123,30 +139,48 @@ export class Recorder {
       }
     });
 
-    // speaking.end: finalize the current utterance.
+    // speaking.end: deliver the completed utterance via callback.
     this.connection.receiver.speaking.on("end", (userId) => {
       const utterance = this.activeUtterances.get(userId);
       if (utterance && utterance.pcmSamples.length > 0) {
-        this.completedUtterances.push(utterance);
+        console.log(`[recorder] speaking.end for userId=${userId} — ${utterance.pcmSamples.length} chunks this burst`);
+        callbacks.onUtterance(utterance);
+      } else {
+        console.log(`[recorder] speaking.end for userId=${userId} — empty burst (no audio)`);
       }
       this.activeUtterances.delete(userId);
-      const totalChunks = this.completedUtterances
-        .filter(u => u.userId === userId)
-        .reduce((s, u) => s + u.pcmSamples.length, 0);
-      console.log(`[recorder] speaking.end for userId=${userId} — ${utterance?.pcmSamples.length ?? 0} chunks this burst, ${totalChunks} total`);
     });
 
-    // Log connection state changes
-    this.connection.on("stateChange" as any, (oldState: any, newState: any) => {
+    // Voice connection recovery
+    this.connection.on("stateChange" as any, async (oldState: any, newState: any) => {
       console.log(`[recorder] connection state: ${oldState.status} → ${newState.status}`);
+
+      if (newState.status === VoiceConnectionStatus.Disconnected) {
+        // Attempt reconnection
+        let reconnected = false;
+        for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+          console.warn(`[recorder] Disconnected — reconnection attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS}`);
+          try {
+            await entersState(this.connection!, VoiceConnectionStatus.Connecting, 5_000);
+            await entersState(this.connection!, VoiceConnectionStatus.Ready, 10_000);
+            console.log("[recorder] Reconnected successfully.");
+            reconnected = true;
+            break;
+          } catch {
+            console.warn(`[recorder] Reconnection attempt ${attempt} failed.`);
+          }
+        }
+        if (!reconnected && this.connection) {
+          console.error("[recorder] All reconnection attempts failed.");
+          callbacks.onDisconnect("Voice connection lost after 3 reconnection attempts.");
+        }
+      }
     });
 
-    // Prevent unhandled 'error' events from crashing the process
     this.connection.on("error" as any, (err: Error) => {
       console.error("[recorder] VoiceConnection error (non-fatal):", err.message);
     });
 
-    // Pipe internal debug events so we can see DAVE handshake + SSRC mapping
     this.connection.on("debug" as any, (msg: string) => {
       if (
         msg.includes("DAVE") ||
@@ -172,7 +206,6 @@ export class Recorder {
     if (this.activeStreams.has(userId)) return;
     this.activeStreams.add(userId);
 
-    // Recreate decoder on each (re-)subscription so it starts fresh.
     this.decoders.get(userId)?.destroy();
     const decoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
     this.decoders.set(userId, decoder);
@@ -196,27 +229,18 @@ export class Recorder {
         console.log(`[recorder] ${member.displayName}: ${packetCount} packets received`);
       }
       try {
-        // @discordjs/opus decode() returns a Buffer of Int16 LE PCM samples.
-        // Native bindings have isolated memory per instance — a bad packet
-        // throws a catchable JS exception without corrupting other decoders.
         const pcmBuf: Buffer = decoder.decode(opusPacket);
-        // Convert Int16 → Float32 (range -1..1), keeping stereo interleaving.
         const numSamples = pcmBuf.length / 2;
         const float32 = new Float32Array(numSamples);
         for (let i = 0; i < numSamples; i++) {
           float32[i] = pcmBuf.readInt16LE(i * 2) / 0x8000;
         }
-        // Route to the active utterance. If speaking.start hasn't fired yet
-        // (pre-subscribed member starts speaking), create an implicit utterance.
         let utterance = this.activeUtterances.get(userId);
         if (!utterance) {
           const m = this.memberCache.get(userId) ?? member;
           utterance = { userId, member: m, pcmSamples: [], startedAt: Date.now() };
           this.activeUtterances.set(userId, utterance);
         } else if (utterance.pcmSamples.length === 0) {
-          // Pin startedAt to the moment the first actual packet arrives rather
-          // than when speaking.start fired — gives more accurate ordering when
-          // two speakers start within the same event-loop tick.
           utterance.startedAt = Date.now();
         }
         utterance.pcmSamples.push(float32);
@@ -242,20 +266,27 @@ export class Recorder {
    * Inject pre-loaded PCM samples for a speaker (used in testing).
    */
   injectAudio(userId: string, member: GuildMember, pcmSamples: Float32Array[]): void {
-    this.completedUtterances.push({ userId, member, pcmSamples, startedAt: Date.now() });
+    this.callbacks?.onUtterance({ userId, member, pcmSamples, startedAt: Date.now() });
   }
 
   /**
-   * Stop recording and return utterances sorted chronologically.
+   * Stop recording and return any utterances still in progress (speakers who
+   * hadn't stopped talking when stop was called). Already-completed utterances
+   * were delivered via the onUtterance callback during the meeting.
    */
   stop(): Utterance[] {
-    // Set flag first so any in-flight data events are ignored.
     this.stopping = true;
 
-    // Finalize any utterances still in progress when stop() was called.
+    if (this.autoStopTimer) {
+      clearTimeout(this.autoStopTimer);
+      this.autoStopTimer = null;
+    }
+
+    // Finalize any utterances still in progress.
+    const remaining: Utterance[] = [];
     for (const utterance of this.activeUtterances.values()) {
       if (utterance.pcmSamples.length > 0) {
-        this.completedUtterances.push(utterance);
+        remaining.push(utterance);
       }
     }
     this.activeUtterances.clear();
@@ -270,16 +301,14 @@ export class Recorder {
       this.connection = null;
     }
 
-    // Sort by start time to get chronological conversation order.
-    this.completedUtterances.sort((a, b) => a.startedAt - b.startedAt);
-    const result = this.completedUtterances;
+    remaining.sort((a, b) => a.startedAt - b.startedAt);
 
-    this.completedUtterances = [];
     this.activeStreams.clear();
     this.memberCache.clear();
+    this.callbacks = null;
     this.guildId = null;
     this.channelId = null;
-    return result;
+    return remaining;
   }
 
   /**
@@ -289,7 +318,6 @@ export class Recorder {
   static toMono16k(chunks: Float32Array[]): Float32Array {
     if (chunks.length === 0) return new Float32Array(0);
 
-    // Concatenate all chunks
     const totalLen = chunks.reduce((a, c) => a + c.length, 0);
     const stereo = new Float32Array(totalLen);
     let offset = 0;
@@ -298,7 +326,6 @@ export class Recorder {
       offset += chunk.length;
     }
 
-    // Stereo → mono (average L and R), then downsample 48kHz → 16kHz (keep every 3rd frame)
     const monoLen = Math.floor(stereo.length / (CHANNELS * 3));
     const mono = new Float32Array(monoLen);
     for (let i = 0; i < monoLen; i++) {

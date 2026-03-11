@@ -1,6 +1,9 @@
 /**
  * Main bot class — sets up the Discord client, registers slash commands,
  * and handles /standup start | stop | status | history.
+ *
+ * Utterances are transcribed incrementally as speakers finish talking,
+ * keeping memory usage low even during long meetings.
  */
 
 import {
@@ -19,12 +22,30 @@ import { Transcriber } from "./transcriber";
 import { Summarizer } from "./summarizer";
 import { StandupStore } from "./store";
 
-// Guild-scoped commands sync instantly (vs global which take up to 1 hour).
 const GUILD_ID = process.env.DISCORD_GUILD_ID ?? "1219420218233847878";
+
+/** Max concurrent transcription API calls to avoid rate limits + memory spikes. */
+const MAX_CONCURRENT_TRANSCRIPTIONS = 3;
+
+interface TranscribedLine {
+  speaker: string;
+  userId: string;
+  text: string;
+  startedAt: number;
+}
 
 interface SessionMeta {
   startedAt: Date;
   channelId: string;
+  /** Lines transcribed incrementally during the meeting. */
+  lines: TranscribedLine[];
+  /** Number of transcriptions currently in-flight. */
+  inflight: number;
+  /** Queued utterances waiting for a concurrency slot. */
+  queue: Utterance[];
+  /** Resolves when the queue is fully drained (used at stop time). */
+  drainPromise: Promise<void> | null;
+  drainResolve: (() => void) | null;
 }
 
 export class StandupBot {
@@ -33,7 +54,7 @@ export class StandupBot {
   private transcriber = new Transcriber();
   private summarizer: Summarizer;
   private store = new StandupStore();
-  private activeSessions = new Map<string, SessionMeta>(); // guildId → meta
+  private activeSessions = new Map<string, SessionMeta>();
 
   constructor() {
     this.summarizer = new Summarizer(process.env.ANTHROPIC_API_KEY!);
@@ -65,7 +86,7 @@ export class StandupBot {
         description: "Standup meeting commands",
         options: [
           {
-            type: 1, // SUB_COMMAND
+            type: 1,
             name: "start",
             description: "Join your voice channel and start recording the standup",
           },
@@ -85,7 +106,7 @@ export class StandupBot {
             description: "Show recent standup summaries",
             options: [
               {
-                type: 4, // INTEGER
+                type: 4,
                 name: "count",
                 description: "Number of recent standups to show (default 5, max 10)",
                 required: false,
@@ -117,6 +138,76 @@ export class StandupBot {
     else if (sub === "history") await this.handleHistory(interaction);
   }
 
+  // ── Concurrency-limited transcription queue ────────────────────────────────
+
+  private enqueueUtterance(guildId: string, utterance: Utterance) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+    session.queue.push(utterance);
+    this.drainQueue(guildId);
+  }
+
+  private drainQueue(guildId: string) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+
+    while (session.inflight < MAX_CONCURRENT_TRANSCRIPTIONS && session.queue.length > 0) {
+      const utterance = session.queue.shift()!;
+      session.inflight++;
+      this.transcribeOne(guildId, utterance).finally(() => {
+        session.inflight--;
+        // Continue draining
+        this.drainQueue(guildId);
+        // Resolve drain promise if queue is empty and nothing in-flight
+        if (session.inflight === 0 && session.queue.length === 0 && session.drainResolve) {
+          session.drainResolve();
+          session.drainResolve = null;
+          session.drainPromise = null;
+        }
+      });
+    }
+  }
+
+  private async transcribeOne(guildId: string, utterance: Utterance) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+
+    try {
+      const mono = Recorder.toMono16k(utterance.pcmSamples);
+      const durationSec = (mono.length / 16000).toFixed(2);
+      console.log(`[bot] Transcribing ${utterance.member.displayName} utterance: ${mono.length} samples (${durationSec}s)`);
+
+      const text = await this.transcriber.transcribe(mono);
+      console.log(`[bot] → "${text.slice(0, 100)}"`);
+
+      if (text.trim()) {
+        session.lines.push({
+          speaker: utterance.member.displayName,
+          userId: utterance.userId,
+          text: text.trim(),
+          startedAt: utterance.startedAt,
+        });
+      }
+    } catch (e: any) {
+      console.error(`[bot] Transcription error for ${utterance.member.displayName}:`, e.message);
+    }
+    // PCM data is now unreferenced → eligible for GC
+  }
+
+  /** Wait for all queued and in-flight transcriptions to finish. */
+  private waitForDrain(guildId: string): Promise<void> {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return Promise.resolve();
+    if (session.inflight === 0 && session.queue.length === 0) return Promise.resolve();
+
+    if (!session.drainPromise) {
+      session.drainPromise = new Promise<void>((resolve) => {
+        session.drainResolve = resolve;
+      });
+    }
+    return session.drainPromise;
+  }
+
   // ── /standup start ──────────────────────────────────────────────────────────
 
   private async handleStart(interaction: any) {
@@ -133,17 +224,52 @@ export class StandupBot {
       return interaction.followUp("A recording is already in progress. Use `/standup stop` first.");
     }
 
+    const guildId = interaction.guildId!;
+    const session: SessionMeta = {
+      startedAt: new Date(),
+      channelId: voiceChannel.id,
+      lines: [],
+      inflight: 0,
+      queue: [],
+      drainPromise: null,
+      drainResolve: null,
+    };
+    this.activeSessions.set(guildId, session);
+
     try {
-      await this.recorder.start(voiceChannel);
-      this.activeSessions.set(interaction.guildId!, {
-        startedAt: new Date(),
-        channelId: voiceChannel.id,
+      await this.recorder.start(voiceChannel, {
+        onUtterance: (utterance) => {
+          this.enqueueUtterance(guildId, utterance);
+        },
+        onTimeout: () => {
+          console.warn("[bot] Auto-stop triggered by timeout.");
+          this.autoStop(interaction, guildId);
+        },
+        onDisconnect: (reason) => {
+          console.error(`[bot] Voice disconnected: ${reason}`);
+          this.autoStop(interaction, guildId);
+        },
       });
+
       await interaction.followUp(
         `Recording standup in **${voiceChannel.name}**. Use \`/standup stop\` when done.`
       );
     } catch (e: any) {
+      this.activeSessions.delete(guildId);
       await interaction.followUp(`Failed to start recording: ${e.message}`);
+    }
+  }
+
+  /** Auto-stop triggered by timeout or disconnect — posts results to the original channel. */
+  private async autoStop(interaction: any, guildId: string) {
+    if (!this.recorder.isRecording) return;
+
+    try {
+      const channel = interaction.channel;
+      await channel?.send("Recording auto-stopped (timeout or disconnection). Processing...");
+      await this.finishRecording(interaction, guildId);
+    } catch (e: any) {
+      console.error("[bot] Auto-stop error:", e);
     }
   }
 
@@ -156,65 +282,63 @@ export class StandupBot {
       return interaction.followUp("No active recording found.");
     }
 
-    const session = this.activeSessions.get(interaction.guildId!);
+    await interaction.followUp("Recording stopped — finishing transcription…");
+    await this.finishRecording(interaction, interaction.guildId!);
+  }
+
+  /** Shared stop logic: drain transcription queue, summarize, post results. */
+  private async finishRecording(interaction: any, guildId: string) {
+    const session = this.activeSessions.get(guildId);
     const endedAt = new Date();
     const startedAt = session?.startedAt ?? endedAt;
 
-    await interaction.followUp("Recording stopped — transcribing (this may take a minute)…");
+    // Stop recorder — returns any utterances still in-progress.
+    const remaining = this.recorder.stop();
 
-    const utterances = this.recorder.stop();
-    this.activeSessions.delete(interaction.guildId!);
+    // Transcribe remaining utterances (people who were mid-sentence at stop).
+    for (const utterance of remaining) {
+      this.enqueueUtterance(guildId, utterance);
+    }
 
-    // Debug: log per-speaker summary
-    console.log(`[bot] stop: ${utterances.length} utterance(s)`);
-    const byUser = new Map<string, { name: string; chunks: number; count: number }>();
-    for (const u of utterances) {
-      const e = byUser.get(u.userId) ?? { name: u.member.displayName, chunks: 0, count: 0 };
-      e.chunks += u.pcmSamples.length;
+    // Wait for ALL transcriptions (incremental + remaining) to complete.
+    const totalPending = (session?.inflight ?? 0) + (session?.queue.length ?? 0);
+    if (totalPending > 0) {
+      console.log(`[bot] Waiting for ${totalPending} pending transcription(s)…`);
+      try {
+        await interaction.followUp?.(`Finishing ${totalPending} remaining transcription(s)…`);
+      } catch { /* interaction may be expired */ }
+    }
+    await this.waitForDrain(guildId);
+
+    this.activeSessions.delete(guildId);
+
+    if (!session || session.lines.length === 0) {
+      try {
+        await interaction.followUp?.("No speech was captured — meeting may have been silent or too short.");
+      } catch {
+        await interaction.channel?.send("No speech was captured — meeting may have been silent or too short.");
+      }
+      return;
+    }
+
+    // Sort lines chronologically and build transcript.
+    session.lines.sort((a, b) => a.startedAt - b.startedAt);
+    const transcript = session.lines.map(l => `[${l.speaker}]: ${l.text}`).join("\n\n");
+
+    // Debug summary
+    const byUser = new Map<string, { name: string; count: number }>();
+    for (const l of session.lines) {
+      const e = byUser.get(l.userId) ?? { name: l.speaker, count: 0 };
       e.count++;
-      byUser.set(u.userId, e);
+      byUser.set(l.userId, e);
     }
-    for (const [userId, { name, chunks, count }] of byUser) {
-      console.log(`[bot]   ${name} (${userId}): ${chunks} chunks = ${(chunks * 960 / 48000).toFixed(2)}s across ${count} utterance(s)`);
-    }
-
-    if (utterances.length === 0) {
-      return interaction.followUp("No audio was captured. (No speaking events fired — check bot permissions or DAVE status.)");
+    for (const [userId, { name, count }] of byUser) {
+      console.log(`[bot]   ${name} (${userId}): ${count} transcribed utterance(s)`);
     }
 
-    // Transcribe each utterance in parallel; order is already chronological.
-    const results = await Promise.allSettled(
-      utterances.map(async (u: Utterance) => {
-        const mono = Recorder.toMono16k(u.pcmSamples);
-        console.log(`[bot] Transcribing ${u.member.displayName} utterance: ${mono.length} samples (${(mono.length/16000).toFixed(2)}s)`);
-        const text = await this.transcriber.transcribe(mono);
-        console.log(`[bot] → "${text.slice(0, 100)}"`);
-        return { speaker: u.member.displayName, userId: u.userId, text };
-      })
-    );
-
-    let allFailed = true;
-    const lines: string[] = [];
-    for (const r of results) {
-      if (r.status === "fulfilled") {
-        allFailed = false;
-        if (r.value.text.trim()) lines.push(`[${r.value.speaker}]: ${r.value.text.trim()}`);
-      } else {
-        console.error("[bot] Transcription error:", r.reason);
-      }
-    }
-
-    if (lines.length === 0) {
-      if (allFailed) {
-        return interaction.followUp("Transcription failed for all speakers — check bot logs for details.");
-      }
-      return interaction.followUp("Transcription returned no speech — maybe the meeting was silent?");
-    }
-
-    // Transcript lines are in chronological speaking order.
-    const transcript = lines.join("\n\n");
-
-    await interaction.followUp("Transcription complete — summarizing with Claude…");
+    try {
+      await interaction.followUp?.("Transcription complete — summarizing with Claude…");
+    } catch { /* interaction may be expired */ }
 
     const webUrl = process.env.WEB_URL ?? "https://discord-pm.fly.dev";
 
@@ -223,25 +347,30 @@ export class StandupBot {
       summaryResult = await this.summarizer.summarize(transcript);
     } catch (e: any) {
       console.error("[bot] Summarization failed:", e);
-      // Save the record anyway so it's accessible via the web UI
       const { id: recordId } = this.store.save({
-        guild_id: interaction.guildId!,
-        channel_id: session?.channelId ?? "unknown",
+        guild_id: guildId,
+        channel_id: session.channelId,
         started_at: startedAt.toISOString(),
         ended_at: endedAt.toISOString(),
         participants: [],
         raw_transcript: transcript,
         summary_text: "(Summarization failed)",
       });
-      await interaction.followUp(
-        `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
-      );
+      try {
+        await interaction.followUp?.(
+          `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
+        );
+      } catch {
+        await interaction.channel?.send(
+          `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
+        );
+      }
       return;
     }
 
     const { id: recordId } = this.store.save({
-      guild_id: interaction.guildId!,
-      channel_id: session?.channelId ?? "unknown",
+      guild_id: guildId,
+      channel_id: session.channelId,
       started_at: startedAt.toISOString(),
       ended_at: endedAt.toISOString(),
       participants: summaryResult.participants,
@@ -280,10 +409,18 @@ export class StandupBot {
 
     embed.setFooter({ text: `Duration: ${min}m ${sec}s  •  Record #${recordId}` });
 
-    await interaction.followUp({
-      content: `Full transcript: ${webUrl}/transcripts/${recordId}`,
-      embeds: [embed],
-    });
+    try {
+      await interaction.followUp({
+        content: `Full transcript: ${webUrl}/transcripts/${recordId}`,
+        embeds: [embed],
+      });
+    } catch {
+      // Interaction expired (auto-stop after long meeting) — send to channel directly.
+      await interaction.channel?.send({
+        content: `Full transcript: ${webUrl}/transcripts/${recordId}`,
+        embeds: [embed],
+      });
+    }
   }
 
   // ── /standup status ─────────────────────────────────────────────────────────
@@ -294,7 +431,12 @@ export class StandupBot {
       const elapsed = Math.round((Date.now() - session.startedAt.getTime()) / 1000);
       const min = Math.floor(elapsed / 60);
       const sec = elapsed % 60;
-      await interaction.reply({ content: `Recording in progress — ${min}m ${sec}s elapsed.`, ephemeral: true });
+      const transcribed = session.lines.length;
+      const pending = session.inflight + session.queue.length;
+      await interaction.reply({
+        content: `Recording in progress — ${min}m ${sec}s elapsed. ${transcribed} utterance(s) transcribed${pending > 0 ? `, ${pending} pending` : ""}.`,
+        ephemeral: true,
+      });
     } else {
       await interaction.reply({ content: "No standup recording in progress.", ephemeral: true });
     }
