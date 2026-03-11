@@ -69,6 +69,26 @@ export async function fetchRecentlyUpdated(
  * Fetch open issues for an assignee (or unassigned if assignee is null)
  * that do NOT have the given backlog label.
  */
+/** Cache avatars so we don't re-fetch on every step. */
+const avatarCache = new Map<string, string>();
+
+export async function fetchUserAvatar(username: string): Promise<string> {
+  const cached = avatarCache.get(username);
+  if (cached) return cached;
+  try {
+    const res = await fetch(`${GITHUB_API}/users/${username}`, {
+      headers: headers(),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const url = data.avatar_url as string;
+      avatarCache.set(username, url);
+      return url;
+    }
+  } catch { /* fall through */ }
+  return `https://github.com/${username}.png?size=64`;
+}
+
 export async function fetchOpenNonBacklog(
   repo: string,
   assignee: string | null,
