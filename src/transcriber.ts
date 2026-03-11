@@ -1,10 +1,14 @@
 /**
- * Transcription service with multiple backends.
+ * Transcription service with API backends.
  *
  * Priority:
  *   1. OpenAI Whisper API  (if OPENAI_API_KEY set)
  *   2. Replicate Whisper   (if REPLICATE_API_TOKEN set)
- *   3. Local HuggingFace Whisper via @huggingface/transformers (always available)
+ *
+ * Local Whisper was removed — the ONNX fp32 model uses ~300-500MB of RAM,
+ * which OOM-kills the process on a 1GB VM when combined with audio recording.
+ * If both API backends are unavailable, the utterance is silently skipped
+ * rather than crashing the entire meeting.
  *
  * Input: mono 16kHz Float32Array PCM from Recorder.toMono16k()
  * Output: transcribed string
@@ -17,19 +21,6 @@ export interface TranscriptSegment {
 }
 
 export class Transcriber {
-  private pipeline: any = null;
-
-  private async getLocalPipeline() {
-    if (this.pipeline) return this.pipeline;
-    console.log("[transcriber] Loading local Whisper model (first run downloads ~40MB)…");
-    const { pipeline, env } = await import("@huggingface/transformers");
-    // Cache models alongside the bot
-    env.cacheDir = "./models";
-    this.pipeline = await pipeline("automatic-speech-recognition", "Xenova/whisper-tiny.en");
-    console.log("[transcriber] Whisper model ready.");
-    return this.pipeline;
-  }
-
   /**
    * Transcribe a single speaker's audio.
    * @param mono16k - Float32Array mono 16kHz PCM
@@ -60,24 +51,13 @@ export class Transcriber {
       try {
         return await this.transcribeReplicate(mono16k);
       } catch (e) {
-        console.warn("[transcriber] Replicate failed, falling back:", e);
+        console.warn("[transcriber] Replicate failed:", e);
       }
     }
 
-    // --- Local Whisper (always available) ---
-    try {
-      return await this.transcribeLocal(mono16k);
-    } catch (e) {
-      console.warn("[transcriber] Local Whisper failed:", e);
-      return "";
-    }
-  }
-
-  private async transcribeLocal(mono16k: Float32Array): Promise<string> {
-    const pipe = await this.getLocalPipeline();
-    // whisper-tiny.en is English-only; don't pass language/task options
-    const result = await pipe(mono16k);
-    return (result as any).text?.trim() ?? "";
+    // No backends available — skip this utterance rather than OOM with local model
+    console.warn("[transcriber] All backends unavailable — skipping utterance");
+    return "";
   }
 
   private async transcribeOpenAI(mono16k: Float32Array): Promise<string> {
