@@ -22,6 +22,15 @@ export interface StandupRecord {
   summary_text: string;
 }
 
+export interface UtteranceSegment {
+  speaker: string;
+  user_id: string;
+  issue_number: number | null;
+  issue_repo: string | null;
+  text: string;
+  started_at: number; // epoch ms
+}
+
 const TRANSCRIPTS_DIR = "./transcripts";
 const DB_PATH = "./data/standups.db";
 
@@ -46,6 +55,20 @@ export class StandupStore {
       );
       CREATE INDEX IF NOT EXISTS idx_guild ON standups (guild_id, started_at DESC);
     `);
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS utterance_segments (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        standup_id   INTEGER NOT NULL,
+        speaker      TEXT NOT NULL,
+        user_id      TEXT NOT NULL,
+        issue_number INTEGER,
+        issue_repo   TEXT,
+        text         TEXT NOT NULL,
+        started_at   INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_segments_standup ON utterance_segments (standup_id);
+    `);
   }
 
   save(record: StandupRecord): { id: number; transcriptPath: string } {
@@ -66,6 +89,33 @@ export class StandupStore {
     const id = result.lastInsertRowid as number;
     const transcriptPath = this.exportMarkdown({ ...record, id });
     return { id, transcriptPath };
+  }
+
+  /** Save utterance segments linked to a standup record. */
+  saveSegments(standupId: number, segments: UtteranceSegment[]): void {
+    if (segments.length === 0) return;
+
+    const stmt = this.db.prepare(`
+      INSERT INTO utterance_segments (standup_id, speaker, user_id, issue_number, issue_repo, text, started_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const insertAll = this.db.transaction(() => {
+      for (const seg of segments) {
+        stmt.run(
+          standupId,
+          seg.speaker,
+          seg.user_id,
+          seg.issue_number,
+          seg.issue_repo,
+          seg.text,
+          seg.started_at,
+        );
+      }
+    });
+
+    insertAll();
+    console.log(`[store] Saved ${segments.length} utterance segment(s) for standup #${standupId}`);
   }
 
   recent(guildId: string, limit = 10): StandupRecord[] {

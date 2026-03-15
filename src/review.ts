@@ -36,7 +36,7 @@ interface StepUnassigned {
 
 type Step = StepAssignee | StepUnassigned;
 
-interface StandupConfig {
+export interface StandupConfig {
   repo: string;
   backlogLabel: string;
   steps: Step[];
@@ -67,14 +67,14 @@ export const STANDUP_NAMES = Object.keys(STANDUPS);
 
 // ── Stage labels → display ───────────────────────────────────────────────────
 
-interface StageInfo {
+export interface StageInfo {
   emoji: string;
   name: string;
   order: number;
 }
 
 // Order matches actual SDLC: Draft → Ready → In Progress → In Review → QA → Done → Released
-const STAGE_MAP: Record<string, StageInfo> = {
+export const STAGE_MAP: Record<string, StageInfo> = {
   "stage: draft":      { emoji: "📝", name: "Draft", order: 1 },
   "stage:ready":       { emoji: "📋", name: "Ready", order: 2 },
   "stage: ready":      { emoji: "📋", name: "Ready", order: 2 },
@@ -86,7 +86,7 @@ const STAGE_MAP: Record<string, StageInfo> = {
   "stage:released":    { emoji: "🚀", name: "Released", order: 7 },
 };
 
-function getStage(labels: string[]): StageInfo | null {
+export function getStage(labels: string[]): StageInfo | null {
   for (const label of labels) {
     const key = label.toLowerCase();
     if (STAGE_MAP[key]) return STAGE_MAP[key];

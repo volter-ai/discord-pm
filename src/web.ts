@@ -11,15 +11,11 @@
  *   GET /api/transcripts/:id    → single transcript (JSON)
  *
  * Required env: WEB_PASSWORD
- * Optional env: WEB_PORT (default 8080)
  */
 
 import { Hono } from "hono";
 import { Database } from "bun:sqlite";
-import { config } from "dotenv";
-config();
 
-const PORT = parseInt(process.env.WEB_PORT ?? "8080");
 const PASSWORD = process.env.WEB_PASSWORD ?? "";
 const DB_PATH = "./data/standups.db";
 
@@ -53,6 +49,17 @@ interface Row {
   participants: string; // JSON
   transcript: string;
   summary: string;
+}
+
+interface SegmentRow {
+  id: number;
+  standup_id: number;
+  speaker: string;
+  user_id: string;
+  issue_number: number | null;
+  issue_repo: string | null;
+  text: string;
+  started_at: number;
 }
 
 function openDb(): Database | null {
@@ -97,6 +104,20 @@ function getStandup(id: number): Row | null {
     return (db.query(`SELECT * FROM standups WHERE id = ?`).get(id) as Row) ?? null;
   } catch {
     return null;
+  } finally {
+    db.close();
+  }
+}
+
+function getSegments(standupId: number): SegmentRow[] {
+  const db = openDb();
+  if (!db) return [];
+  try {
+    return db
+      .query(`SELECT * FROM utterance_segments WHERE standup_id = ? ORDER BY started_at`)
+      .all(standupId) as SegmentRow[];
+  } catch {
+    return [];
   } finally {
     db.close();
   }
@@ -155,6 +176,11 @@ const CSS = `
   .meta{color:#64748b;font-size:.82rem;margin-bottom:1rem}
   .empty{color:#64748b;padding:2rem 0;text-align:center}
   .warn{background:#451a03;color:#fdba74;padding:.75rem 1rem;border-radius:.5rem;margin-bottom:1.5rem;font-size:.88rem}
+  .issue-section{background:#0f172a;border:1px solid #1e293b;border-radius:.5rem;padding:1rem;margin-bottom:.75rem}
+  .issue-section h3{color:#c7d2fe;margin-bottom:.5rem}
+  .issue-section h3 a{color:#818cf8}
+  .issue-speakers{color:#64748b;font-size:.82rem;margin-bottom:.5rem}
+  .issue-snippet{font-size:.88rem;line-height:1.6;color:#cbd5e1}
 `;
 
 function page(title: string, body: string) {
@@ -193,7 +219,7 @@ function listPage(rows: Row[], limit: number, offset: number, total: number) {
     const names = parts.map((p) => `<span class="tag name-tag">${esc(p.name)}</span>`).join(" ");
     const blockers = parts.flatMap((p) => p.blockers);
     const blockerBadge = blockers.length
-      ? `<span class="tag blocker-tag">⚠ ${blockers.length} blocker${blockers.length > 1 ? "s" : ""}</span>`
+      ? `<span class="tag blocker-tag">${blockers.length} blocker${blockers.length > 1 ? "s" : ""}</span>`
       : "";
     const snippet = r.summary.length > 120 ? r.summary.slice(0, 120) + "…" : r.summary;
     return `<tr>
@@ -222,7 +248,7 @@ function listPage(rows: Row[], limit: number, offset: number, total: number) {
   `);
 }
 
-function detailPage(r: Row) {
+function detailPage(r: Row, segments: SegmentRow[]) {
   const parts = parseParticipants(r.participants);
 
   const participantBlocks = parts.map((p) => {
@@ -238,6 +264,37 @@ function detailPage(r: Row) {
     return `<div class="participant"><h3>${esc(p.name)}</h3>${did}${willDo}${blockers}</div>`;
   }).join("\n");
 
+  // Issue-aware transcript sections (if segments exist)
+  let issueTranscriptHtml = "";
+  if (segments.length > 0) {
+    const byIssue = new Map<number | null, SegmentRow[]>();
+    for (const seg of segments) {
+      const key = seg.issue_number;
+      if (!byIssue.has(key)) byIssue.set(key, []);
+      byIssue.get(key)!.push(seg);
+    }
+
+    const issueSections: string[] = [];
+    for (const [issueNum, segs] of byIssue) {
+      const speakers = [...new Set(segs.map(s => s.speaker))].join(", ");
+      const snippets = segs.map(s => `<div class="issue-snippet"><strong>${esc(s.speaker)}:</strong> ${esc(s.text)}</div>`).join("\n");
+      const repo = segs[0]?.issue_repo ?? "";
+      const title = issueNum
+        ? `<a href="https://github.com/${repo}/issues/${issueNum}" target="_blank">#${issueNum}</a>`
+        : "General Discussion";
+      issueSections.push(`<div class="issue-section">
+        <h3>${title}</h3>
+        <div class="issue-speakers">${esc(speakers)}</div>
+        ${snippets}
+      </div>`);
+    }
+
+    issueTranscriptHtml = `
+      <h2>By Issue</h2>
+      ${issueSections.join("\n")}
+    `;
+  }
+
   return page(`#${r.id}`, `
     <a class="back" href="/">← All transcripts</a>
     <h1>Standup #${r.id}</h1>
@@ -249,6 +306,8 @@ function detailPage(r: Row) {
     <h2>Per Participant</h2>
     ${participantBlocks || '<p class="empty">No participant data.</p>'}
 
+    ${issueTranscriptHtml}
+
     <h2>Full Transcript</h2>
     <pre>${esc(r.transcript)}</pre>
   `);
@@ -258,83 +317,76 @@ function esc(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ── App ──────────────────────────────────────────────────────────────────────
+// ── App factory ─────────────────────────────────────────────────────────────
 
-const app = new Hono();
+export function createWebApp(): Hono {
+  const app = new Hono();
 
-// Auth middleware
-app.use("*", async (c, next) => {
-  if (!checkAuth(c.req.raw)) return unauthorized();
-  await next();
-});
-
-// HTML routes
-app.get("/", (c) => {
-  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 200);
-  const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
-  const rows = listStandups(limit, offset);
-  const total = countStandups();
-  return c.html(listPage(rows, limit, offset, total));
-});
-
-app.get("/transcripts/:id", (c) => {
-  const id = parseInt(c.req.param("id"));
-  if (isNaN(id)) return c.notFound();
-  const row = getStandup(id);
-  if (!row) return c.notFound();
-  return c.html(detailPage(row));
-});
-
-// JSON API routes
-app.get("/api/transcripts", (c) => {
-  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 200);
-  const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
-  const rows = listStandups(limit, offset).map((r) => ({
-    id: r.id,
-    guild_id: r.guild_id,
-    channel_id: r.channel_id,
-    started_at: r.started_at,
-    ended_at: r.ended_at,
-    duration_seconds: Math.round(
-      (new Date(r.ended_at).getTime() - new Date(r.started_at).getTime()) / 1000
-    ),
-    participants: parseParticipants(r.participants),
-    summary: r.summary,
-  }));
-  return c.json(rows);
-});
-
-app.get("/api/transcripts/:id", (c) => {
-  const id = parseInt(c.req.param("id"));
-  if (isNaN(id)) return c.json({ error: "invalid id" }, 400);
-  const row = getStandup(id);
-  if (!row) return c.json({ error: "not found" }, 404);
-  return c.json({
-    id: row.id,
-    guild_id: row.guild_id,
-    channel_id: row.channel_id,
-    started_at: row.started_at,
-    ended_at: row.ended_at,
-    duration_seconds: Math.round(
-      (new Date(row.ended_at).getTime() - new Date(row.started_at).getTime()) / 1000
-    ),
-    participants: parseParticipants(row.participants),
-    summary: row.summary,
-    transcript: row.transcript,
+  // Auth middleware
+  app.use("*", async (c, next) => {
+    if (!checkAuth(c.req.raw)) {
+      console.log(`[web] Auth DENIED for ${c.req.method} ${new URL(c.req.url).pathname}`);
+      return unauthorized();
+    }
+    await next();
   });
-});
 
-// ── Start ────────────────────────────────────────────────────────────────────
+  // HTML routes
+  app.get("/", (c) => {
+    const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
+    const rows = listStandups(limit, offset);
+    const total = countStandups();
+    return c.html(listPage(rows, limit, offset, total));
+  });
 
-if (!PASSWORD) {
-  console.error("[web] WEB_PASSWORD is not set — refusing to start. Set it in your environment.");
-  process.exit(1);
+  app.get("/transcripts/:id", (c) => {
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.notFound();
+    const row = getStandup(id);
+    if (!row) return c.notFound();
+    const segments = getSegments(id);
+    return c.html(detailPage(row, segments));
+  });
+
+  // JSON API routes
+  app.get("/api/transcripts", (c) => {
+    const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
+    const rows = listStandups(limit, offset).map((r) => ({
+      id: r.id,
+      guild_id: r.guild_id,
+      channel_id: r.channel_id,
+      started_at: r.started_at,
+      ended_at: r.ended_at,
+      duration_seconds: Math.round(
+        (new Date(r.ended_at).getTime() - new Date(r.started_at).getTime()) / 1000
+      ),
+      participants: parseParticipants(r.participants),
+      summary: r.summary,
+    }));
+    return c.json(rows);
+  });
+
+  app.get("/api/transcripts/:id", (c) => {
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.json({ error: "invalid id" }, 400);
+    const row = getStandup(id);
+    if (!row) return c.json({ error: "not found" }, 404);
+    return c.json({
+      id: row.id,
+      guild_id: row.guild_id,
+      channel_id: row.channel_id,
+      started_at: row.started_at,
+      ended_at: row.ended_at,
+      duration_seconds: Math.round(
+        (new Date(row.ended_at).getTime() - new Date(row.started_at).getTime()) / 1000
+      ),
+      participants: parseParticipants(row.participants),
+      summary: row.summary,
+      transcript: row.transcript,
+    });
+  });
+
+  return app;
 }
-
-export default {
-  port: PORT,
-  hostname: "0.0.0.0",
-  fetch: app.fetch,
-};
-
-console.log(`[web] Transcript server listening on :${PORT}`);

@@ -20,7 +20,7 @@ import {
 import { Recorder, type Utterance } from "./recorder";
 import { Transcriber } from "./transcriber";
 import { Summarizer } from "./summarizer";
-import { StandupStore } from "./store";
+import { StandupStore, type UtteranceSegment } from "./store";
 import { STANDUPS, STANDUP_NAMES, buildStepEmbed } from "./review";
 
 const GUILD_ID = process.env.DISCORD_GUILD_ID ?? "1219420218233847878";
@@ -33,6 +33,8 @@ interface TranscribedLine {
   userId: string;
   text: string;
   startedAt: number;
+  /** GitHub issue # that was focused in the Activity when this was spoken. */
+  issueNumber: number | null;
 }
 
 interface SessionMeta {
@@ -47,6 +49,16 @@ interface SessionMeta {
   /** Resolves when the queue is fully drained (used at stop time). */
   drainPromise: Promise<void> | null;
   drainResolve: (() => void) | null;
+
+  // ── Activity state ──
+  /** GitHub issue # currently focused in the Activity UI. */
+  focusedIssue: number | null;
+  /** Discord user ID of who has presenter controls. */
+  presenter: string | null;
+  /** Connected Activity WebSocket clients. */
+  activityClients: Set<any>;
+  /** Repo string for issue-aware transcripts (e.g. "volter-ai/runhuman"). */
+  issueRepo: string | null;
 }
 
 export class StandupBot {
@@ -79,6 +91,89 @@ export class StandupBot {
   async start(token: string) {
     await this.client.login(token);
   }
+
+  // ── Activity integration ────────────────────────────────────────────────
+
+  /** Get the first active recording session (used by Activity to connect). */
+  getFirstActiveSession(): { guildId: string; meta: SessionMeta } | null {
+    for (const [guildId, meta] of this.activeSessions) {
+      return { guildId, meta };
+    }
+    return null;
+  }
+
+  /** Register an Activity WebSocket client for a guild session. */
+  addActivityClient(guildId: string, ws: any) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      session.activityClients.add(ws);
+      console.log(`[bot] Activity client added (${session.activityClients.size} total)`);
+    }
+  }
+
+  /** Remove an Activity WebSocket client. */
+  removeActivityClient(guildId: string) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      // Remove any closed connections
+      for (const ws of session.activityClients) {
+        try {
+          if (ws.readyState !== undefined && ws.readyState > 1) {
+            session.activityClients.delete(ws);
+          }
+        } catch {
+          session.activityClients.delete(ws);
+        }
+      }
+    }
+  }
+
+  /** Set the currently focused issue from Activity. */
+  setFocusedIssue(guildId: string, issueNumber: number | null) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      session.focusedIssue = issueNumber;
+      this.broadcastToActivity(guildId, {
+        type: "state",
+        focusedIssue: issueNumber,
+        presenter: session.presenter,
+        recording: true,
+        elapsed: Math.round((Date.now() - session.startedAt.getTime()) / 1000),
+        utteranceCount: session.lines.length,
+      });
+    }
+  }
+
+  /** Set the current presenter from Activity. */
+  setPresenter(guildId: string, userId: string) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      session.presenter = userId;
+    }
+  }
+
+  /** Broadcast a message to all connected Activity clients for a guild. */
+  private broadcastToActivity(guildId: string, message: object) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+
+    const json = JSON.stringify(message);
+    const closed: any[] = [];
+
+    for (const ws of session.activityClients) {
+      try {
+        ws.send(json);
+      } catch {
+        closed.push(ws);
+      }
+    }
+
+    for (const ws of closed) {
+      session.activityClients.delete(ws);
+    }
+  }
+
+  // ── Command registration ───────────────────────────────────────────────
 
   private async registerCommands() {
     const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
@@ -163,7 +258,7 @@ export class StandupBot {
     }
   }
 
-  // ── Concurrency-limited transcription queue ────────────────────────────────
+  // ── Concurrency-limited transcription queue ────────────────────────────
 
   private enqueueUtterance(guildId: string, utterance: Utterance) {
     const session = this.activeSessions.get(guildId);
@@ -197,6 +292,9 @@ export class StandupBot {
     const session = this.activeSessions.get(guildId);
     if (!session) return;
 
+    // Capture the focused issue at the time this utterance started
+    const issueAtTime = session.focusedIssue;
+
     try {
       const mono = Recorder.toMono16k(utterance.pcmSamples);
       const durationSec = (mono.length / 16000).toFixed(2);
@@ -206,11 +304,22 @@ export class StandupBot {
       console.log(`[bot] → "${text.slice(0, 100)}"`);
 
       if (text.trim()) {
-        session.lines.push({
+        const line: TranscribedLine = {
           speaker: utterance.member.displayName,
           userId: utterance.userId,
           text: text.trim(),
           startedAt: utterance.startedAt,
+          issueNumber: issueAtTime,
+        };
+        session.lines.push(line);
+
+        // Broadcast to Activity clients
+        this.broadcastToActivity(guildId, {
+          type: "utterance",
+          speaker: line.speaker,
+          issueNumber: line.issueNumber,
+          text: line.text,
+          startedAt: line.startedAt,
         });
       }
     } catch (e: any) {
@@ -233,7 +342,7 @@ export class StandupBot {
     return session.drainPromise;
   }
 
-  // ── /standup start ──────────────────────────────────────────────────────────
+  // ── /standup start ──────────────────────────────────────────────────────
 
   private async handleStart(interaction: any) {
     await interaction.deferReply();
@@ -258,6 +367,10 @@ export class StandupBot {
       queue: [],
       drainPromise: null,
       drainResolve: null,
+      focusedIssue: null,
+      presenter: null,
+      activityClients: new Set(),
+      issueRepo: null,
     };
     this.activeSessions.set(guildId, session);
 
@@ -274,10 +387,18 @@ export class StandupBot {
           console.error(`[bot] Voice disconnected: ${reason}`);
           this.autoStop(interaction, guildId);
         },
+        onSpeakingChange: (userId, displayName, speaking) => {
+          this.broadcastToActivity(guildId, {
+            type: "speaker",
+            userId,
+            name: displayName,
+            speaking,
+          });
+        },
       });
 
       await interaction.followUp(
-        `Recording standup in **${voiceChannel.name}**. Use \`/standup stop\` when done.`
+        `Recording standup in **${voiceChannel.name}**. Use \`/standup stop\` when done.\nLaunch the **Standup Activity** from the Activities shelf for visual issue review!`
       );
     } catch (e: any) {
       this.activeSessions.delete(guildId);
@@ -298,7 +419,7 @@ export class StandupBot {
     }
   }
 
-  // ── /standup stop ───────────────────────────────────────────────────────────
+  // ── /standup stop ───────────────────────────────────────────────────────
 
   private async handleStop(interaction: any) {
     await interaction.deferReply();
@@ -335,6 +456,13 @@ export class StandupBot {
     }
     await this.waitForDrain(guildId);
 
+    // Close Activity WebSocket clients
+    if (session) {
+      for (const ws of session.activityClients) {
+        try { ws.close(); } catch { /* ignore */ }
+      }
+    }
+
     this.activeSessions.delete(guildId);
 
     if (!session || session.lines.length === 0) {
@@ -363,9 +491,18 @@ export class StandupBot {
 
     const webUrl = process.env.WEB_URL ?? "https://discord-pm.fly.dev";
 
+    // Check if we have issue-tagged data from the Activity
+    const hasIssueData = session.lines.some(l => l.issueNumber !== null);
+
     let summaryResult;
     try {
-      summaryResult = await this.summarizer.summarize(transcript);
+      if (hasIssueData) {
+        // Build issue-organized transcript for the summarizer
+        const issueTranscript = this.buildIssueTranscript(session.lines);
+        summaryResult = await this.summarizer.summarizeByIssue(issueTranscript);
+      } else {
+        summaryResult = await this.summarizer.summarize(transcript);
+      }
     } catch (e: any) {
       console.error("[bot] Summarization failed:", e);
       const { id: recordId } = this.store.save({
@@ -399,7 +536,42 @@ export class StandupBot {
       summary_text: summaryResult.summary_text,
     });
 
+    // Save utterance segments if we have issue data
+    if (hasIssueData) {
+      const segments: UtteranceSegment[] = session.lines
+        .filter(l => l.text.trim())
+        .map(l => ({
+          speaker: l.speaker,
+          user_id: l.userId,
+          issue_number: l.issueNumber,
+          issue_repo: session.issueRepo,
+          text: l.text,
+          started_at: l.startedAt,
+        }));
+      this.store.saveSegments(recordId, segments);
+    }
+
     await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, webUrl);
+  }
+
+  /** Build an issue-organized transcript string for the issue-aware summarizer. */
+  private buildIssueTranscript(lines: TranscribedLine[]): string {
+    const byIssue = new Map<number | null, TranscribedLine[]>();
+    for (const line of lines) {
+      const key = line.issueNumber;
+      if (!byIssue.has(key)) byIssue.set(key, []);
+      byIssue.get(key)!.push(line);
+    }
+
+    const sections: string[] = [];
+
+    for (const [issueNum, issueLines] of byIssue) {
+      const header = issueNum ? `## Issue #${issueNum}` : `## General Discussion`;
+      const body = issueLines.map(l => `[${l.speaker}]: ${l.text}`).join("\n\n");
+      sections.push(`${header}\n\n${body}`);
+    }
+
+    return sections.join("\n\n---\n\n");
   }
 
   private async postSummaryEmbed(
@@ -437,7 +609,7 @@ export class StandupBot {
     }
   }
 
-  // ── /standup status ─────────────────────────────────────────────────────────
+  // ── /standup status ─────────────────────────────────────────────────────
 
   private async handleStatus(interaction: any) {
     const session = this.activeSessions.get(interaction.guildId!);
@@ -447,8 +619,9 @@ export class StandupBot {
       const sec = elapsed % 60;
       const transcribed = session.lines.length;
       const pending = session.inflight + session.queue.length;
+      const issueTag = session.focusedIssue ? ` Focused: #${session.focusedIssue}.` : "";
       await interaction.reply({
-        content: `Recording in progress — ${min}m ${sec}s elapsed. ${transcribed} utterance(s) transcribed${pending > 0 ? `, ${pending} pending` : ""}.`,
+        content: `Recording in progress — ${min}m ${sec}s elapsed. ${transcribed} utterance(s) transcribed${pending > 0 ? `, ${pending} pending` : ""}.${issueTag}`,
         ephemeral: true,
       });
     } else {
@@ -456,7 +629,7 @@ export class StandupBot {
     }
   }
 
-  // ── /standup history ────────────────────────────────────────────────────────
+  // ── /standup history ────────────────────────────────────────────────────
 
   private async handleHistory(interaction: any) {
     const count = interaction.options.getInteger("count") ?? 5;
@@ -485,7 +658,7 @@ export class StandupBot {
     await interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  // ── /review ─────────────────────────────────────────────────────────────────
+  // ── /review ─────────────────────────────────────────────────────────────
 
   private async handleReview(interaction: any) {
     const standupKey = interaction.options.getString("standup");

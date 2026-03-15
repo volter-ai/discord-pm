@@ -45,6 +45,8 @@ export interface RecorderCallbacks {
   onTimeout: () => void;
   /** Called when voice connection is permanently lost. */
   onDisconnect: (reason: string) => void;
+  /** Called when a user starts or stops speaking (for Activity live indicators). */
+  onSpeakingChange?: (userId: string, displayName: string, speaking: boolean) => void;
 }
 
 export class Recorder {
@@ -127,6 +129,7 @@ export class Recorder {
       });
 
       this.subscribeToUser(receiver, userId, effectiveMember);
+      callbacks.onSpeakingChange?.(userId, effectiveMember.displayName, true);
 
       if (!member) {
         channel.guild.members.fetch(userId).then(m => {
@@ -142,6 +145,8 @@ export class Recorder {
     // speaking.end: deliver the completed utterance via callback.
     this.connection.receiver.speaking.on("end", (userId) => {
       const utterance = this.activeUtterances.get(userId);
+      const member = this.memberCache.get(userId);
+      callbacks.onSpeakingChange?.(userId, member?.displayName ?? `User-${userId.slice(-4)}`, false);
       if (utterance && utterance.pcmSamples.length > 0) {
         console.log(`[recorder] speaking.end for userId=${userId} — ${utterance.pcmSamples.length} chunks this burst`);
         callbacks.onUtterance(utterance);
