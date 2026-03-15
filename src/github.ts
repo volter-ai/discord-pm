@@ -94,27 +94,13 @@ export async function fetchOpenNonBacklog(
   assignee: string | null,
   backlogLabel: string,
 ): Promise<GitHubIssue[]> {
-  const params = new URLSearchParams({
-    state: "open",
-    sort: "updated",
-    direction: "desc",
-    per_page: "100",
-  });
-  if (assignee) {
-    params.set("assignee", assignee);
-  } else {
-    // "none" is GitHub's special value for unassigned
-    params.set("assignee", "none");
-  }
-  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues?${params}`, {
+  const assigneePart = assignee ? `assignee:${assignee}` : "no:assignee";
+  const q = `is:issue repo:${repo} is:open ${assigneePart} -label:"${backlogLabel}"`;
+  const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "100" });
+  const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
     headers: headers(),
   });
   if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
-  const raw = await res.json();
-  const issues = parseIssues(raw);
-  // Filter out issues with the backlog label (client-side because GitHub API
-  // doesn't support negative label filters).
-  return issues.filter(
-    (i) => !i.labels.some((l) => l.toLowerCase() === backlogLabel.toLowerCase()),
-  );
+  const { items } = await res.json();
+  return parseIssues(items);
 }
