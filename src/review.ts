@@ -73,15 +73,15 @@ export interface StageInfo {
   order: number;
 }
 
-// Order matches actual SDLC: Draft → Ready → In Progress → In Review → QA → Done → Released
+// Order: most active first — In Progress → In Review → QA → Ready → Draft → Done → Released
 export const STAGE_MAP: Record<string, StageInfo> = {
-  "stage: draft":      { emoji: "📝", name: "Draft", order: 1 },
-  "stage:ready":       { emoji: "📋", name: "Ready", order: 2 },
-  "stage: ready":      { emoji: "📋", name: "Ready", order: 2 },
-  "ready-for-testing": { emoji: "📋", name: "Ready", order: 2 },
-  "stage:in-progress": { emoji: "🔨", name: "In Progress", order: 3 },
-  "stage:in-review":   { emoji: "👀", name: "In Review", order: 4 },
-  "stage:qa":          { emoji: "🧪", name: "QA", order: 5 },
+  "stage:in-progress": { emoji: "🔨", name: "In Progress", order: 1 },
+  "stage:in-review":   { emoji: "👀", name: "In Review", order: 2 },
+  "stage:qa":          { emoji: "🧪", name: "QA", order: 3 },
+  "stage:ready":       { emoji: "📋", name: "Ready", order: 4 },
+  "stage: ready":      { emoji: "📋", name: "Ready", order: 4 },
+  "ready-for-testing": { emoji: "📋", name: "Ready", order: 4 },
+  "stage: draft":      { emoji: "📝", name: "Draft", order: 5 },
   "stage:done":        { emoji: "✅", name: "Done", order: 6 },
   "stage:released":    { emoji: "🚀", name: "Released", order: 7 },
 };
@@ -223,6 +223,20 @@ export async function buildStepEmbed(
 
   embed.setDescription(statsLine);
 
+  // ── Recently closed section (first — what got done) ──
+  if (recentClosed.length > 0) {
+    const shown = recentClosed.slice(0, 5);
+    const lines = shown.map(formatClosedLine);
+    const overflow = recentClosed.length - shown.length;
+    if (overflow > 0) lines.push(`*+${overflow} more*`);
+
+    embed.addFields({
+      name: `🏁 Closed Today (${recentClosed.length})`,
+      value: lines.join("\n"),
+      inline: false,
+    });
+  }
+
   // ── Kanban columns for open issues ──
   const stageGroups = groupByStage(allOpen);
 
@@ -244,20 +258,6 @@ export async function buildStepEmbed(
     embed.addFields({
       name: "✨ All clear",
       value: "No unassigned non-backlog issues.",
-      inline: false,
-    });
-  }
-
-  // ── Recently closed section ──
-  if (recentClosed.length > 0) {
-    const shown = recentClosed.slice(0, 5);
-    const lines = shown.map(formatClosedLine);
-    const overflow = recentClosed.length - shown.length;
-    if (overflow > 0) lines.push(`*+${overflow} more*`);
-
-    embed.addFields({
-      name: `🏁 Closed Today (${recentClosed.length})`,
-      value: lines.join("\n"),
       inline: false,
     });
   }

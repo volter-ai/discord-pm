@@ -89,6 +89,44 @@ export async function fetchUserAvatar(username: string): Promise<string> {
   return `https://github.com/${username}.png?size=64`;
 }
 
+export interface GitHubIssueDetail extends GitHubIssue {
+  body: string;
+  comments: { user: string; body: string; createdAt: string }[];
+}
+
+/**
+ * Fetch a single issue with its body and recent comments.
+ */
+export async function fetchIssueDetail(
+  repo: string,
+  number: number,
+): Promise<GitHubIssueDetail> {
+  const [issueRes, commentsRes] = await Promise.all([
+    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}`, { headers: headers() }),
+    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=20&direction=desc`, { headers: headers() }),
+  ]);
+
+  if (!issueRes.ok) throw new Error(`GitHub API ${issueRes.status}: ${await issueRes.text()}`);
+  const issue = await issueRes.json();
+
+  const rawComments = commentsRes.ok ? await commentsRes.json() : [];
+
+  return {
+    number: issue.number,
+    title: issue.title,
+    state: issue.state as "open" | "closed",
+    labels: (issue.labels ?? []).map((l: any) => l.name),
+    updatedAt: issue.updated_at,
+    url: issue.html_url,
+    body: issue.body ?? "",
+    comments: rawComments.reverse().map((c: any) => ({
+      user: c.user?.login ?? "unknown",
+      body: c.body ?? "",
+      createdAt: c.created_at,
+    })),
+  };
+}
+
 export async function fetchOpenNonBacklog(
   repo: string,
   assignee: string | null,
