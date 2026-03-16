@@ -15,6 +15,10 @@ import {
   Colors,
   REST,
   Routes,
+  InviteTargetType,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { Recorder, type Utterance } from "./recorder";
@@ -38,6 +42,7 @@ interface TranscribedLine {
 }
 
 interface SessionMeta {
+  type: "standup" | "meeting";
   startedAt: Date;
   channelId: string;
   /** Lines transcribed incrementally during the meeting. */
@@ -242,6 +247,22 @@ export class StandupBot {
         ],
       },
       {
+        name: "meeting",
+        description: "Meeting transcription commands",
+        options: [
+          {
+            type: 1,
+            name: "start",
+            description: "Join your voice channel and start recording a meeting",
+          },
+          {
+            type: 1,
+            name: "stop",
+            description: "Stop recording, transcribe, and post a summary",
+          },
+        ],
+      },
+      {
         name: "review",
         description: "Walk through GitHub Issues for a standup",
         options: [
@@ -281,6 +302,10 @@ export class StandupBot {
       else if (sub === "stop") await this.handleStop(interaction);
       else if (sub === "status") await this.handleStatus(interaction);
       else if (sub === "history") await this.handleHistory(interaction);
+    } else if (interaction.commandName === "meeting") {
+      const sub = interaction.options.getSubcommand();
+      if (sub === "start") await this.handleMeetingStart(interaction);
+      else if (sub === "stop") await this.handleMeetingStop(interaction);
     } else if (interaction.commandName === "review") {
       await this.handleReview(interaction);
     }
@@ -383,11 +408,132 @@ export class StandupBot {
     }
 
     if (this.recorder.isRecording) {
-      return interaction.followUp("A recording is already in progress. Use `/standup stop` first.");
+      return interaction.followUp("A recording is already in progress. Stop it first.");
     }
 
     const guildId = interaction.guildId!;
     const session: SessionMeta = {
+      type: "standup",
+      startedAt: new Date(),
+      channelId: voiceChannel.id,
+      lines: [],
+      inflight: 0,
+      queue: [],
+      drainPromise: null,
+      drainResolve: null,
+      focusedIssue: null,
+      presenter: null,
+      activeParticipantIndex: 0,
+      activityClients: new Set(),
+      issueRepo: null,
+      hadActivity: false,
+      issueMeta: new Map(),
+    };
+    this.activeSessions.set(guildId, session);
+
+    try {
+      await this.recorder.start(voiceChannel, {
+        onUtterance: (utterance) => {
+          this.enqueueUtterance(guildId, utterance);
+        },
+        onTimeout: () => {
+          console.warn("[bot] Auto-stop triggered by timeout.");
+          this.autoStop(interaction, guildId);
+        },
+        onDisconnect: (reason) => {
+          console.error(`[bot] Voice disconnected: ${reason}`);
+          this.autoStop(interaction, guildId);
+        },
+        onSpeakingChange: (userId, displayName, speaking) => {
+          this.broadcastToActivity(guildId, {
+            type: "speaker",
+            userId,
+            name: displayName,
+            speaking,
+          });
+        },
+      });
+
+      // Try to create an Activity invite button for one-click launch
+      let components: ActionRowBuilder<ButtonBuilder>[] | undefined;
+      try {
+        const invite = await voiceChannel.createInvite({
+          targetType: InviteTargetType.EmbeddedApplication,
+          targetApplication: this.client.application!.id,
+          maxAge: 3600,
+        });
+        components = [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setLabel("Open Standup Activity")
+              .setStyle(ButtonStyle.Link)
+              .setURL(invite.url)
+          ),
+        ];
+      } catch (e: any) {
+        console.warn("[bot] Could not create Activity invite:", e.message);
+      }
+
+      await interaction.followUp({
+        content: `Recording standup in **${voiceChannel.name}**. Use \`/standup stop\` when done.`,
+        ...(components ? { components } : {}),
+      });
+    } catch (e: any) {
+      this.activeSessions.delete(guildId);
+      await interaction.followUp(`Failed to start recording: ${e.message}`);
+    }
+  }
+
+  /** Auto-stop triggered by timeout or disconnect — posts results to the original channel. */
+  private async autoStop(interaction: any, guildId: string) {
+    if (!this.recorder.isRecording) return;
+
+    try {
+      const channel = interaction.channel;
+      await channel?.send("Recording auto-stopped (timeout or disconnection). Processing...");
+      await this.finishRecording(interaction, guildId);
+    } catch (e: any) {
+      console.error("[bot] Auto-stop error:", e);
+    }
+  }
+
+  // ── /standup stop ───────────────────────────────────────────────────────
+
+  private async handleStop(interaction: any) {
+    await interaction.deferReply();
+
+    if (!this.recorder.isRecording) {
+      return interaction.followUp("No active recording found.");
+    }
+
+    const session = this.activeSessions.get(interaction.guildId!);
+    if (session?.type === "meeting") {
+      return interaction.followUp("A meeting is being recorded. Use `/meeting stop` to stop it.");
+    }
+
+    await interaction.followUp("Recording stopped — processing…");
+    await this.finishRecording(interaction, interaction.guildId!);
+  }
+
+  // ── /meeting start ────────────────────────────────────────────────────
+
+  private async handleMeetingStart(interaction: any) {
+    await interaction.deferReply();
+
+    const member = interaction.member;
+    const voiceChannel = member?.voice?.channel as VoiceChannel | null;
+
+    if (!voiceChannel) {
+      return interaction.followUp("You must be in a voice channel to start recording.");
+    }
+
+    if (this.recorder.isRecording) {
+      return interaction.followUp("A recording is already in progress. Stop it first.");
+    }
+
+    const guildId = interaction.guildId!;
+    const session: SessionMeta = {
+      type: "meeting",
       startedAt: new Date(),
       channelId: voiceChannel.id,
       lines: [],
@@ -429,7 +575,7 @@ export class StandupBot {
       });
 
       await interaction.followUp(
-        `Recording standup in **${voiceChannel.name}**. Use \`/standup stop\` when done.\nLaunch the **Standup Activity** from the Activities shelf for visual issue review!`
+        `Recording meeting in **${voiceChannel.name}**. Use \`/meeting stop\` when done.`
       );
     } catch (e: any) {
       this.activeSessions.delete(guildId);
@@ -437,26 +583,18 @@ export class StandupBot {
     }
   }
 
-  /** Auto-stop triggered by timeout or disconnect — posts results to the original channel. */
-  private async autoStop(interaction: any, guildId: string) {
-    if (!this.recorder.isRecording) return;
+  // ── /meeting stop ─────────────────────────────────────────────────────
 
-    try {
-      const channel = interaction.channel;
-      await channel?.send("Recording auto-stopped (timeout or disconnection). Processing...");
-      await this.finishRecording(interaction, guildId);
-    } catch (e: any) {
-      console.error("[bot] Auto-stop error:", e);
-    }
-  }
-
-  // ── /standup stop ───────────────────────────────────────────────────────
-
-  private async handleStop(interaction: any) {
+  private async handleMeetingStop(interaction: any) {
     await interaction.deferReply();
 
     if (!this.recorder.isRecording) {
       return interaction.followUp("No active recording found.");
+    }
+
+    const session = this.activeSessions.get(interaction.guildId!);
+    if (session?.type === "standup") {
+      return interaction.followUp("A standup is being recorded. Use `/standup stop` to stop it.");
     }
 
     await interaction.followUp("Recording stopped — processing…");
@@ -587,7 +725,8 @@ export class StandupBot {
       this.store.saveSegments(recordId, segments);
     }
 
-    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, webUrl);
+    const label = session.type === "meeting" ? "Meeting" : "Standup";
+    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, webUrl, label);
   }
 
   /** Build an issue-organized transcript string for the issue-aware summarizer. */
@@ -616,7 +755,8 @@ export class StandupBot {
     startedAt: Date,
     endedAt: Date,
     recordId: number,
-    webUrl: string
+    webUrl: string,
+    label = "Standup"
   ) {
     const duration = Math.round((endedAt.getTime() - startedAt.getTime()) / 1000);
     const min = Math.floor(duration / 60);
@@ -625,7 +765,7 @@ export class StandupBot {
     const names = result.participants.map((p: any) => p.name).join(", ");
 
     const embed = new EmbedBuilder()
-      .setTitle("Standup Summary")
+      .setTitle(`${label} Summary`)
       .setDescription(result.summary_text)
       .setColor(Colors.Green)
       .setFooter({ text: `${names}  •  ${min}m ${sec}s  •  #${recordId}` })
