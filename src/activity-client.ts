@@ -44,7 +44,7 @@ type ServerMessage =
   | { type: "speaker"; userId: string; name: string; speaking: boolean }
   | { type: "utterance"; speaker: string; issueNumber: number | null; text: string; startedAt: number }
   | { type: "session"; recording: boolean; elapsed: number; utteranceCount: number }
-  | { type: "state"; focusedIssue: number | null; presenter: string | null; recording: boolean; elapsed: number; utteranceCount: number };
+  | { type: "state"; focusedIssue: number | null; presenter: string | null; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number };
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 
@@ -62,7 +62,21 @@ let elapsedSeconds = 0;
 let utteranceCount = 0;
 let speakingUsers = new Set<string>();
 let standupKey = "";
+let repo = "";
 let timerInterval: ReturnType<typeof setInterval> | null = null;
+let issueTimers = new Map<number, number>(); // issue# → accumulated ms
+let focusStartTime: number | null = null;
+let detailCache = new Map<string, any>(); // "repo/number" → detail
+
+// ── Sync / Freestyle state ──────────────────────────────────────────────────
+/** Whether this client is following the presenter (synced mode). Default true. */
+let syncMode = true;
+/** Discord user ID of the current presenter, or null if nobody has controls. */
+let presenterUserId: string | null = null;
+/** Server's canonical focused issue (applied to local state when syncing). */
+let serverFocusedIssue: number | null = null;
+/** Server's canonical active participant tab index. */
+let serverActiveTabIndex = 0;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -168,6 +182,7 @@ async function loadStandup(key: string) {
 
   const data: IssuesResponse = await res.json();
   participants = data.participants;
+  repo = data.repo;
   activeTabIndex = 0;
 
   connectWebSocket();
@@ -229,14 +244,39 @@ function handleServerMessage(msg: ServerMessage) {
       updateHeader();
       break;
 
-    case "state":
-      focusedIssue = msg.focusedIssue;
+    case "state": {
+      // Track who the presenter is — needed for sync badge + permission checks
+      presenterUserId = msg.presenter;
+      // Save server's canonical state
+      serverFocusedIssue = msg.focusedIssue;
+      serverActiveTabIndex = msg.activeParticipantIndex ?? 0;
       isRecording = msg.recording;
       elapsedSeconds = msg.elapsed;
       utteranceCount = msg.utteranceCount;
-      updateHeader();
-      updateFocusHighlight();
+
+      if (syncMode) {
+        // Apply server state to local view
+        const tabChanged = activeTabIndex !== serverActiveTabIndex;
+        const focusChanged = focusedIssue !== serverFocusedIssue;
+        activeTabIndex = serverActiveTabIndex;
+        focusedIssue = serverFocusedIssue;
+        if (tabChanged) {
+          render();
+        } else if (focusChanged) {
+          updateFocusHighlight();
+          updateHeader();
+          updateSyncBadge();
+        } else {
+          updateHeader();
+          updateSyncBadge();
+        }
+      } else {
+        // Not synced — just update timer/counts and the badge
+        updateHeader();
+        updateSyncBadge();
+      }
       break;
+    }
   }
 }
 
@@ -261,18 +301,36 @@ function render() {
 function renderHeader(): string {
   const elapsed = formatTime(elapsedSeconds);
   const recDot = isRecording ? `<span class="rec-dot"></span>` : "";
+  const discussed = issueTimers.size;
+  const discussedBadge = discussed > 0 ? `<span class="discussed-count" id="discussed-count">${discussed} issue${discussed !== 1 ? "s" : ""}</span>` : "";
+  const syncBadge = renderSyncBadge();
   return `
     <div class="header" id="header">
       <div class="header-left">
         <span class="header-title">Standup — ${escapeHtml(standupKey)}</span>
+        <span id="sync-badge">${syncBadge}</span>
       </div>
       <div class="header-right">
+        ${discussedBadge}
         <span class="timer" id="timer">${elapsed}</span>
         ${recDot}
         <span class="utterance-count" id="utt-count">${utteranceCount} utterances</span>
       </div>
     </div>
   `;
+}
+
+function renderSyncBadge(): string {
+  if (isPresenter()) {
+    return `<span class="sync-badge sync-badge-presenter">🎤 Presenting</span>`;
+  }
+  if (syncMode && presenterUserId) {
+    return `<span class="sync-badge sync-badge-synced">🔴 Live</span>`;
+  }
+  if (!syncMode) {
+    return `<span class="sync-badge sync-badge-freestyle">🔓 Freestyle</span>`;
+  }
+  return ""; // no presenter, no badge needed
 }
 
 function renderTabs(): string {
@@ -290,17 +348,21 @@ function renderBoard(): string {
   if (!participant) return `<div class="empty-board">No participants found</div>`;
 
   const stagesHtml = participant.stages.map((stage) => {
+    const isClosed = stage.name === "Closed Today";
     const issuesHtml = stage.issues.map((issue) => {
       const focused = focusedIssue === issue.number ? "issue-focused" : "";
+      const closedClass = isClosed ? "issue-card-closed" : "";
       const prio = priorityBadge(issue.labels);
       const bug = issue.labels.some(l => l.toLowerCase() === "bug") ? `<span class="badge badge-bug">bug</span>` : "";
+      const age = `<span class="issue-age ${freshnessClass(issue.updatedAt)}">${relativeTime(issue.updatedAt)}</span>`;
+      const timer = focusedIssue === issue.number ? `<span class="issue-timer" id="issue-timer-${issue.number}">${formatTime(Math.floor((issueTimers.get(issue.number) ?? 0) / 1000))}</span>` : "";
       return `
-        <div class="issue-card ${focused}" data-issue="${issue.number}" data-url="${escapeHtml(issue.url)}">
+        <div class="issue-card ${focused} ${closedClass}" data-issue="${issue.number}" data-url="${escapeHtml(issue.url)}" data-title="${escapeHtml(issue.title)}" data-state="${escapeHtml(issue.state)}">
           <div class="issue-header">
-            <span class="issue-number">#${issue.number}</span>
-            <span class="issue-title">${escapeHtml(truncate(issue.title, 55))}</span>
+            <span class="issue-number" data-detail="${issue.number}">#${issue.number}</span>
+            <span class="issue-title">${escapeHtml(truncate(issue.title, 50))}</span>
           </div>
-          <div class="issue-badges">${prio}${bug}</div>
+          <div class="issue-badges">${timer}${age}${prio}${bug}</div>
         </div>
       `;
     }).join("");
@@ -318,10 +380,11 @@ function renderBoard(): string {
   const prevName = prevIdx >= 0 ? participants[prevIdx].name : null;
   const nextName = nextIdx < participants.length ? participants[nextIdx].name : null;
 
+  const centerBtn = renderNavCenterButton();
   const navHtml = `
     <div class="board-nav">
       <button class="nav-btn" id="btn-prev" ${!prevName ? "disabled" : ""}>${prevName ? `← ${escapeHtml(prevName)}` : "←"}</button>
-      <button class="nav-btn nav-btn-primary" id="btn-controls">Take Controls</button>
+      ${centerBtn}
       <button class="nav-btn" id="btn-next" ${!nextName ? "disabled" : ""}>${nextName ? `${escapeHtml(nextName)} →` : "→"}</button>
     </div>
   `;
@@ -338,6 +401,72 @@ function renderBoard(): string {
   `;
 }
 
+// ── Sync / Freestyle helpers ────────────────────────────────────────────────
+
+function isPresenter(): boolean {
+  return currentUser !== null && currentUser.id === presenterUserId;
+}
+
+function renderNavCenterButton(): string {
+  if (isPresenter()) {
+    return `<button class="nav-btn nav-btn-presenter" id="btn-controls" disabled>🎤 Presenting</button>`;
+  }
+  if (syncMode && presenterUserId) {
+    // Following presenter — offer to go freestyle
+    return `<button class="nav-btn nav-btn-synced" id="btn-freestyle">🔓 Go Freestyle</button>`;
+  }
+  if (!syncMode && presenterUserId) {
+    // In freestyle while presenter exists — offer to sync back
+    return `<button class="nav-btn nav-btn-sync" id="btn-sync">↩ Sync</button>`;
+  }
+  // No presenter — collaborative navigation, offer to take controls
+  return `<button class="nav-btn nav-btn-primary" id="btn-controls">Take Controls</button>`;
+}
+
+/** Enter freestyle mode (stop following presenter). */
+function enterFreestyle() {
+  syncMode = false;
+  updateSyncBadge();
+  updateNavCenter();
+}
+
+/** Snap to server state and re-enter sync mode. */
+function snapToSync() {
+  syncMode = true;
+  flushFocusTimer();
+  const tabChanged = activeTabIndex !== serverActiveTabIndex;
+  activeTabIndex = serverActiveTabIndex;
+  focusedIssue = serverFocusedIssue;
+  focusStartTime = null;
+  if (tabChanged) {
+    render();
+  } else {
+    updateFocusHighlight();
+    updateHeader();
+    updateSyncBadge();
+    updateNavCenter();
+  }
+}
+
+/** Update just the sync badge in the header (without full re-render). */
+function updateSyncBadge() {
+  const el = document.getElementById("sync-badge");
+  if (el) el.innerHTML = renderSyncBadge();
+}
+
+/** Update just the center nav button (without full re-render). */
+function updateNavCenter() {
+  const existing = document.getElementById("btn-controls")
+    ?? document.getElementById("btn-freestyle")
+    ?? document.getElementById("btn-sync");
+  if (existing) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = renderNavCenterButton();
+    const newBtn = tmp.firstElementChild!;
+    existing.replaceWith(newBtn);
+  }
+}
+
 // ── Event Delegation ────────────────────────────────────────────────────────
 
 document.addEventListener("click", (e) => {
@@ -346,41 +475,83 @@ document.addEventListener("click", (e) => {
   // Tab click
   const tab = target.closest(".tab") as HTMLElement | null;
   if (tab) {
-    activeTabIndex = parseInt(tab.dataset.index!);
+    const newIdx = parseInt(tab.dataset.index!);
+    if (syncMode && !isPresenter() && presenterUserId) enterFreestyle();
+    activeTabIndex = newIdx;
+    flushFocusTimer();
     focusedIssue = null;
-    sendWs({ type: "focus", issueNumber: null });
+    focusStartTime = null;
+    if (isPresenter() || !presenterUserId) {
+      sendWs({ type: "tab", participantIndex: newIdx });
+      sendWs({ type: "focus", issueNumber: null });
+    }
     render();
     return;
   }
 
-  // Issue card click
+  // Issue number click → open detail panel
+  const issueNumEl = target.closest(".issue-number[data-detail]") as HTMLElement | null;
+  if (issueNumEl) {
+    const issueNum = parseInt(issueNumEl.dataset.detail!);
+    openDetailPanel(issueNum);
+    return;
+  }
+
+  // Detail panel close
+  if (target.closest(".detail-close") || target.classList.contains("detail-overlay")) {
+    closeDetailPanel();
+    return;
+  }
+
+  // Issue card click → toggle focus
   const card = target.closest(".issue-card") as HTMLElement | null;
   if (card) {
+    if (syncMode && !isPresenter() && presenterUserId) enterFreestyle();
     const issueNum = parseInt(card.dataset.issue!);
     if (focusedIssue === issueNum) {
-      // Unfocus
+      flushFocusTimer();
       focusedIssue = null;
-      sendWs({ type: "focus", issueNumber: null });
+      focusStartTime = null;
+      if (isPresenter() || !presenterUserId) sendWs({ type: "focus", issueNumber: null });
     } else {
+      flushFocusTimer();
       focusedIssue = issueNum;
-      sendWs({ type: "focus", issueNumber: issueNum });
+      focusStartTime = Date.now();
+      if (!issueTimers.has(issueNum)) issueTimers.set(issueNum, 0);
+      if (isPresenter() || !presenterUserId) {
+        const meta = findIssue(issueNum);
+        sendWs({ type: "focus", issueNumber: issueNum, issueTitle: meta?.title ?? null, issueState: meta?.state ?? null });
+      }
     }
     updateFocusHighlight();
+    updateHeader();
     return;
   }
 
   // Navigation buttons
   if (target.id === "btn-prev" && activeTabIndex > 0) {
+    if (syncMode && !isPresenter() && presenterUserId) enterFreestyle();
     activeTabIndex--;
+    flushFocusTimer();
     focusedIssue = null;
-    sendWs({ type: "focus", issueNumber: null });
+    focusStartTime = null;
+    if (isPresenter() || !presenterUserId) {
+      sendWs({ type: "tab", participantIndex: activeTabIndex });
+      sendWs({ type: "focus", issueNumber: null });
+    }
     render();
     return;
   }
   if (target.id === "btn-next" && activeTabIndex < participants.length - 1) {
+    if (syncMode && !isPresenter() && presenterUserId) enterFreestyle();
     activeTabIndex++;
+    flushFocusTimer();
     focusedIssue = null;
-    sendWs({ type: "focus", issueNumber: null });
+    focusStartTime = null;
+    if (isPresenter() || !presenterUserId) {
+      sendWs({ type: "tab", participantIndex: activeTabIndex });
+      sendWs({ type: "focus", issueNumber: null });
+    }
     render();
     return;
   }
@@ -388,22 +559,20 @@ document.addEventListener("click", (e) => {
     sendWs({ type: "controls", userId: currentUser.id });
     return;
   }
-
-  // Issue link — open in new window via SDK
-  if (card) {
-    const url = card.dataset.url;
-    if (url) {
-      window.open(url, "_blank");
-    }
+  if (target.id === "btn-freestyle") {
+    enterFreestyle();
+    return;
   }
+  if (target.id === "btn-sync") {
+    snapToSync();
+    return;
+  }
+
 });
 
-// Double-click issue to open on GitHub
-document.addEventListener("dblclick", (e) => {
-  const card = (e.target as HTMLElement).closest(".issue-card") as HTMLElement | null;
-  if (card?.dataset.url) {
-    window.open(card.dataset.url, "_blank");
-  }
+// Escape key closes detail panel
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeDetailPanel();
 });
 
 // ── UI Updates ──────────────────────────────────────────────────────────────
@@ -413,6 +582,20 @@ function updateHeader() {
   if (timer) timer.textContent = formatTime(elapsedSeconds);
   const uttCount = document.getElementById("utt-count");
   if (uttCount) uttCount.textContent = `${utteranceCount} utterances`;
+  const disc = document.getElementById("discussed-count");
+  if (disc) {
+    const n = issueTimers.size;
+    disc.textContent = `${n} issue${n !== 1 ? "s" : ""}`;
+  }
+  // Update focused issue timer display
+  if (focusedIssue !== null) {
+    const el = document.getElementById(`issue-timer-${focusedIssue}`);
+    if (el) {
+      const accumulated = issueTimers.get(focusedIssue) ?? 0;
+      const live = focusStartTime ? Date.now() - focusStartTime : 0;
+      el.textContent = formatTime(Math.floor((accumulated + live) / 1000));
+    }
+  }
 }
 
 function updateFocusHighlight() {
@@ -451,8 +634,8 @@ function startTimer() {
   timerInterval = setInterval(() => {
     if (isRecording) {
       elapsedSeconds++;
-      updateHeader();
     }
+    updateHeader();
   }, 1000);
 }
 
@@ -470,6 +653,116 @@ function truncate(s: string, max: number): string {
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function relativeTime(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const days = Math.floor(hr / 24);
+  if (days < 30) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
+
+function freshnessClass(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  const hours = ms / (1000 * 60 * 60);
+  if (hours < 24) return "fresh-today";
+  if (hours < 168) return "fresh-week";
+  return "fresh-stale";
+}
+
+function findIssue(num: number): Issue | null {
+  for (const p of participants) {
+    for (const stage of p.stages) {
+      for (const issue of stage.issues) {
+        if (issue.number === num) return issue;
+      }
+    }
+  }
+  return null;
+}
+
+function flushFocusTimer() {
+  if (focusedIssue !== null && focusStartTime !== null) {
+    const elapsed = Date.now() - focusStartTime;
+    issueTimers.set(focusedIssue, (issueTimers.get(focusedIssue) ?? 0) + elapsed);
+  }
+}
+
+// ── Issue Detail Panel ─────────────────────────────────────────────────────
+
+async function openDetailPanel(issueNumber: number) {
+  const cacheKey = `${repo}/${issueNumber}`;
+  let detail = detailCache.get(cacheKey);
+
+  if (!detail) {
+    // Show loading overlay
+    const overlay = document.createElement("div");
+    overlay.className = "detail-overlay";
+    overlay.innerHTML = `<div class="detail-panel"><div class="loading" style="min-height:200px">Loading issue #${issueNumber}...</div></div>`;
+    document.body.appendChild(overlay);
+
+    try {
+      const res = await fetch(`/api/issues/${encodeURIComponent(repo)}/${issueNumber}`);
+      if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
+      detail = await res.json();
+      detailCache.set(cacheKey, detail);
+    } catch (e: any) {
+      overlay.remove();
+      console.error("Detail fetch error:", e);
+      return;
+    }
+    overlay.remove();
+  }
+
+  renderDetailOverlay(detail);
+}
+
+function renderDetailOverlay(detail: any) {
+  const existing = document.querySelector(".detail-overlay");
+  if (existing) existing.remove();
+
+  const labelsHtml = (detail.labels ?? []).map((l: string) => `<span class="detail-label">${escapeHtml(l)}</span>`).join(" ");
+  const bodyHtml = detail.body ? formatPlainText(detail.body) : "<em>No description</em>";
+  const commentsHtml = (detail.comments ?? []).map((c: any) => `
+    <div class="detail-comment">
+      <div class="comment-meta"><strong>${escapeHtml(c.user)}</strong> <span class="comment-date">${relativeTime(c.createdAt)}</span></div>
+      <div class="comment-body">${formatPlainText(c.body)}</div>
+    </div>
+  `).join("");
+
+  const overlay = document.createElement("div");
+  overlay.className = "detail-overlay";
+  overlay.innerHTML = `
+    <div class="detail-panel">
+      <div class="detail-header">
+        <span class="detail-number">#${detail.number}</span>
+        <span class="detail-title">${escapeHtml(detail.title)}</span>
+        <button class="detail-close">X</button>
+      </div>
+      <div class="detail-labels">${labelsHtml}</div>
+      <div class="detail-body">${bodyHtml}</div>
+      ${commentsHtml ? `<div class="detail-comments-header">Comments (${detail.comments?.length ?? 0})</div>${commentsHtml}` : ""}
+      <a class="detail-link" href="${escapeHtml(detail.url)}" target="_blank">View on GitHub</a>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+}
+
+function closeDetailPanel() {
+  const overlay = document.querySelector(".detail-overlay");
+  if (overlay) overlay.remove();
+}
+
+function formatPlainText(text: string): string {
+  return escapeHtml(text)
+    .replace(/\n/g, "<br>")
+    .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" style="color:#818cf8">$1</a>');
 }
 
 function priorityBadge(labels: string[]): string {

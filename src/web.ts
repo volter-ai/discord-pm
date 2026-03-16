@@ -58,6 +58,8 @@ interface SegmentRow {
   user_id: string;
   issue_number: number | null;
   issue_repo: string | null;
+  issue_title: string | null;
+  issue_state: string | null;
   text: string;
   started_at: number;
 }
@@ -177,10 +179,23 @@ const CSS = `
   .empty{color:#64748b;padding:2rem 0;text-align:center}
   .warn{background:#451a03;color:#fdba74;padding:.75rem 1rem;border-radius:.5rem;margin-bottom:1.5rem;font-size:.88rem}
   .issue-section{background:#0f172a;border:1px solid #1e293b;border-radius:.5rem;padding:1rem;margin-bottom:.75rem}
-  .issue-section h3{color:#c7d2fe;margin-bottom:.5rem}
+  .issue-section h3{color:#c7d2fe;margin-bottom:.25rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
   .issue-section h3 a{color:#818cf8}
+  .issue-title-text{color:#e2e8f0;font-size:.9rem;font-weight:400;margin-bottom:.4rem}
+  .issue-meta-row{display:flex;align-items:center;gap:.75rem;margin-bottom:.5rem;flex-wrap:wrap}
+  .status-badge{display:inline-block;padding:.1rem .45rem;border-radius:.75rem;font-size:.72rem;font-weight:600;letter-spacing:.02em}
+  .status-open{background:#14532d;color:#86efac}
+  .status-closed{background:#1c1917;color:#a8a29e}
+  .issue-gh-link{color:#818cf8;font-size:.8rem;text-decoration:none}
+  .issue-gh-link:hover{text-decoration:underline}
   .issue-speakers{color:#64748b;font-size:.82rem;margin-bottom:.5rem}
   .issue-snippet{font-size:.88rem;line-height:1.6;color:#cbd5e1}
+  .toc{background:#1e293b;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:1rem;font-size:.875rem}
+  .toc-title{color:#94a3b8;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.4rem}
+  .toc-list{list-style:none;padding:0;line-height:1.9}
+  .toc-list li a{color:#818cf8}
+  .toc-list li a:hover{text-decoration:underline}
+  .toc-general{color:#64748b;font-size:.8rem;margin-left:.4rem}
 `;
 
 function page(title: string, body: string) {
@@ -274,23 +289,60 @@ function detailPage(r: Row, segments: SegmentRow[]) {
       byIssue.get(key)!.push(seg);
     }
 
+    // Build ToC entries and section HTML together
+    const tocItems: string[] = [];
     const issueSections: string[] = [];
+
     for (const [issueNum, segs] of byIssue) {
-      const speakers = [...new Set(segs.map(s => s.speaker))].join(", ");
-      const snippets = segs.map(s => `<div class="issue-snippet"><strong>${esc(s.speaker)}:</strong> ${esc(s.text)}</div>`).join("\n");
       const repo = segs[0]?.issue_repo ?? "";
-      const title = issueNum
-        ? `<a href="https://github.com/${repo}/issues/${issueNum}" target="_blank">#${issueNum}</a>`
-        : "General Discussion";
-      issueSections.push(`<div class="issue-section">
-        <h3>${title}</h3>
-        <div class="issue-speakers">${esc(speakers)}</div>
-        ${snippets}
-      </div>`);
+      const issueTitle = segs[0]?.issue_title ?? null;
+      const issueState = segs[0]?.issue_state ?? "open";
+      const speakers = [...new Set(segs.map(s => s.speaker))].join(", ");
+      const snippets = segs.map(s =>
+        `<div class="issue-snippet"><strong>${esc(s.speaker)}:</strong> ${esc(s.text)}</div>`
+      ).join("\n");
+
+      if (issueNum) {
+        const anchorId = `issue-${issueNum}`;
+        const ghUrl = `https://github.com/${repo}/issues/${issueNum}`;
+        const stateCls = issueState === "closed" ? "status-closed" : "status-open";
+        const stateLabel = issueState === "closed" ? "closed" : "open";
+        const titleLine = issueTitle
+          ? `<div class="issue-title-text">${esc(issueTitle)}</div>`
+          : "";
+        const metaRow = `<div class="issue-meta-row">
+          <span class="status-badge ${stateCls}">${stateLabel}</span>
+          <a class="issue-gh-link" href="${ghUrl}" target="_blank">View on GitHub ↗</a>
+        </div>`;
+
+        tocItems.push(
+          `<li><a href="#${anchorId}">#${issueNum}</a>${issueTitle ? ` — ${esc(issueTitle)}` : ""}</li>`
+        );
+        issueSections.push(`<div class="issue-section" id="${anchorId}">
+          <h3><a href="${ghUrl}" target="_blank">#${issueNum}</a></h3>
+          ${titleLine}
+          ${metaRow}
+          <div class="issue-speakers">${esc(speakers)}</div>
+          ${snippets}
+        </div>`);
+      } else {
+        tocItems.unshift(`<li><a href="#general-discussion">General Discussion</a> <span class="toc-general">${esc(speakers)}</span></li>`);
+        issueSections.unshift(`<div class="issue-section" id="general-discussion">
+          <h3>General Discussion</h3>
+          <div class="issue-speakers">${esc(speakers)}</div>
+          ${snippets}
+        </div>`);
+      }
     }
+
+    const toc = `<div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul class="toc-list">${tocItems.join("\n")}</ul>
+    </div>`;
 
     issueTranscriptHtml = `
       <h2>By Issue</h2>
+      ${toc}
       ${issueSections.join("\n")}
     `;
   }

@@ -27,6 +27,8 @@ export interface UtteranceSegment {
   user_id: string;
   issue_number: number | null;
   issue_repo: string | null;
+  issue_title: string | null;
+  issue_state: string | null;
   text: string;
   started_at: number; // epoch ms
 }
@@ -64,11 +66,18 @@ export class StandupStore {
         user_id      TEXT NOT NULL,
         issue_number INTEGER,
         issue_repo   TEXT,
+        issue_title  TEXT,
+        issue_state  TEXT,
         text         TEXT NOT NULL,
         started_at   INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_segments_standup ON utterance_segments (standup_id);
     `);
+
+    // Migrate existing tables that may lack the new columns
+    for (const col of ["issue_title TEXT", "issue_state TEXT"]) {
+      try { this.db.run(`ALTER TABLE utterance_segments ADD COLUMN ${col}`); } catch { /* already exists */ }
+    }
   }
 
   save(record: StandupRecord): { id: number; transcriptPath: string } {
@@ -96,8 +105,8 @@ export class StandupStore {
     if (segments.length === 0) return;
 
     const stmt = this.db.prepare(`
-      INSERT INTO utterance_segments (standup_id, speaker, user_id, issue_number, issue_repo, text, started_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO utterance_segments (standup_id, speaker, user_id, issue_number, issue_repo, issue_title, issue_state, text, started_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const insertAll = this.db.transaction(() => {
@@ -108,6 +117,8 @@ export class StandupStore {
           seg.user_id,
           seg.issue_number,
           seg.issue_repo,
+          seg.issue_title,
+          seg.issue_state,
           seg.text,
           seg.started_at,
         );

@@ -55,10 +55,16 @@ interface SessionMeta {
   focusedIssue: number | null;
   /** Discord user ID of who has presenter controls. */
   presenter: string | null;
+  /** Which participant tab is active in the Activity UI (index into standup steps). */
+  activeParticipantIndex: number;
   /** Connected Activity WebSocket clients. */
   activityClients: Set<any>;
   /** Repo string for issue-aware transcripts (e.g. "volter-ai/runhuman"). */
   issueRepo: string | null;
+  /** Whether an Activity client was ever connected during this session. */
+  hadActivity: boolean;
+  /** Cached issue metadata (title + state) keyed by issue number. */
+  issueMeta: Map<number, { title: string; state: string }>;
 }
 
 export class StandupBot {
@@ -107,6 +113,7 @@ export class StandupBot {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.activityClients.add(ws);
+      session.hadActivity = true;
       console.log(`[bot] Activity client added (${session.activityClients.size} total)`);
     }
   }
@@ -128,28 +135,49 @@ export class StandupBot {
     }
   }
 
-  /** Set the currently focused issue from Activity. */
-  setFocusedIssue(guildId: string, issueNumber: number | null) {
+  /** Set the currently focused issue from Activity. Broadcasts state to all clients. */
+  setFocusedIssue(guildId: string, issueNumber: number | null, issueTitle?: string, issueState?: string) {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.focusedIssue = issueNumber;
-      this.broadcastToActivity(guildId, {
-        type: "state",
-        focusedIssue: issueNumber,
-        presenter: session.presenter,
-        recording: true,
-        elapsed: Math.round((Date.now() - session.startedAt.getTime()) / 1000),
-        utteranceCount: session.lines.length,
-      });
+      if (issueNumber && issueTitle) {
+        session.issueMeta.set(issueNumber, { title: issueTitle, state: issueState ?? "open" });
+      }
+      this.broadcastActivityState(guildId);
     }
   }
 
-  /** Set the current presenter from Activity. */
+  /** Set the active participant tab index from Activity. Broadcasts state to all clients. */
+  setActiveTab(guildId: string, participantIndex: number) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      session.activeParticipantIndex = participantIndex;
+      this.broadcastActivityState(guildId);
+    }
+  }
+
+  /** Set the current presenter from Activity. Broadcasts state so all clients learn the new presenter. */
   setPresenter(guildId: string, userId: string) {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.presenter = userId;
+      this.broadcastActivityState(guildId);
     }
+  }
+
+  /** Broadcast current session state to all connected Activity clients. */
+  private broadcastActivityState(guildId: string) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+    this.broadcastToActivity(guildId, {
+      type: "state",
+      focusedIssue: session.focusedIssue,
+      presenter: session.presenter,
+      activeParticipantIndex: session.activeParticipantIndex,
+      recording: true,
+      elapsed: Math.round((Date.now() - session.startedAt.getTime()) / 1000),
+      utteranceCount: session.lines.length,
+    });
   }
 
   /** Broadcast a message to all connected Activity clients for a guild. */
@@ -369,8 +397,11 @@ export class StandupBot {
       drainResolve: null,
       focusedIssue: null,
       presenter: null,
+      activeParticipantIndex: 0,
       activityClients: new Set(),
       issueRepo: null,
+      hadActivity: false,
+      issueMeta: new Map(),
     };
     this.activeSessions.set(guildId, session);
 
@@ -540,14 +571,19 @@ export class StandupBot {
     if (hasIssueData) {
       const segments: UtteranceSegment[] = session.lines
         .filter(l => l.text.trim())
-        .map(l => ({
-          speaker: l.speaker,
-          user_id: l.userId,
-          issue_number: l.issueNumber,
-          issue_repo: session.issueRepo,
-          text: l.text,
-          started_at: l.startedAt,
-        }));
+        .map(l => {
+          const meta = l.issueNumber != null ? session.issueMeta.get(l.issueNumber) : null;
+          return {
+            speaker: l.speaker,
+            user_id: l.userId,
+            issue_number: l.issueNumber,
+            issue_repo: session.issueRepo,
+            issue_title: meta?.title ?? null,
+            issue_state: meta?.state ?? null,
+            text: l.text,
+            started_at: l.startedAt,
+          };
+        });
       this.store.saveSegments(recordId, segments);
     }
 

@@ -23,6 +23,7 @@ import {
   fetchRecentlyUpdated,
   fetchOpenNonBacklog,
   fetchUserAvatar,
+  fetchIssueDetail,
   type GitHubIssue,
 } from "./github";
 import type { StandupBot } from "./bot";
@@ -151,6 +152,59 @@ const ACTIVITY_CSS = `
   .live-entry{font-size:.82rem;color:#94a3b8;padding:.25rem 0;border-bottom:1px solid #0f172a;line-height:1.4}
   .live-entry strong{color:#c7d2fe}
   .live-issue{background:#1e1b4b;color:#a5b4fc;padding:.05rem .3rem;border-radius:.2rem;font-size:.75rem;margin-right:.25rem}
+
+  /* Freshness indicators */
+  .issue-age{font-size:.7rem;margin-left:.25rem;flex-shrink:0}
+  .fresh-today{color:#4ade80}
+  .fresh-week{color:#fbbf24}
+  .fresh-stale{color:#64748b}
+
+  /* Per-issue timer */
+  .issue-timer{font-family:monospace;font-size:.7rem;background:#1e1b4b;color:#a5b4fc;padding:.1rem .35rem;border-radius:.25rem;margin-right:.25rem}
+
+  /* Discussed count in header */
+  .discussed-count{background:#1e1b4b;color:#a5b4fc;padding:.15rem .5rem;border-radius:.25rem;font-size:.78rem}
+
+  /* Issue number clickable */
+  .issue-number{cursor:pointer;text-decoration:underline;text-decoration-color:transparent;transition:text-decoration-color .15s}
+  .issue-number:hover{text-decoration-color:#818cf8}
+
+  /* Detail overlay */
+  .detail-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:100;display:flex;align-items:center;justify-content:center;padding:1rem}
+  .detail-panel{background:#1e293b;border:1px solid #334155;border-radius:.5rem;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;padding:1.25rem}
+  .detail-header{display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.75rem}
+  .detail-number{color:#818cf8;font-weight:700;font-size:1.1rem;flex-shrink:0}
+  .detail-title{color:#e2e8f0;font-size:1rem;font-weight:600;flex:1}
+  .detail-close{background:none;border:none;color:#64748b;cursor:pointer;font-size:1rem;padding:.25rem .5rem;margin-left:auto;flex-shrink:0}
+  .detail-close:hover{color:#e2e8f0}
+  .detail-labels{display:flex;gap:.25rem;flex-wrap:wrap;margin-bottom:.75rem}
+  .detail-label{font-size:.72rem;padding:.15rem .4rem;background:#0f172a;color:#94a3b8;border-radius:.25rem}
+  .detail-body{font-size:.85rem;line-height:1.6;color:#cbd5e1;border-top:1px solid #334155;padding-top:.75rem;margin-bottom:.75rem;word-break:break-word}
+  .detail-comments-header{color:#94a3b8;font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.5rem;padding-top:.5rem;border-top:1px solid #334155}
+  .detail-comment{background:#0f172a;border-radius:.375rem;padding:.75rem;margin-bottom:.5rem}
+  .comment-meta{font-size:.78rem;color:#94a3b8;margin-bottom:.35rem}
+  .comment-meta strong{color:#c7d2fe}
+  .comment-date{color:#64748b;margin-left:.5rem}
+  .comment-body{font-size:.82rem;line-height:1.5;color:#cbd5e1;word-break:break-word}
+  .detail-link{display:inline-block;margin-top:.75rem;color:#818cf8;font-size:.85rem;text-decoration:none}
+  .detail-link:hover{text-decoration:underline}
+
+  /* Closed issue cards */
+  .issue-card-closed{opacity:.7}
+  .issue-card-closed .issue-title{text-decoration:line-through;text-decoration-color:#64748b}
+
+  /* Sync / Freestyle badge */
+  .sync-badge{font-size:.72rem;padding:.15rem .45rem;border-radius:.25rem;font-weight:600;margin-left:.5rem}
+  .sync-badge-presenter{background:#1e3a1e;color:#4ade80}
+  .sync-badge-synced{background:#3b0000;color:#fca5a5}
+  .sync-badge-freestyle{background:#1c1917;color:#a8a29e}
+
+  /* Nav center button variants */
+  .nav-btn-presenter{background:#1e3a1e;color:#4ade80;border-color:#166534;opacity:.9}
+  .nav-btn-synced{background:#3b0000;color:#fca5a5;border-color:#7f1d1d}
+  .nav-btn-synced:hover{background:#450a0a;color:#fca5a5}
+  .nav-btn-sync{background:#1e1b4b;color:#a5b4fc;border-color:#3730a3}
+  .nav-btn-sync:hover{background:#2e27a0;color:#c7d2fe}
 `;
 
 // ── Issue data helpers ──────────────────────────────────────────────────────
@@ -183,12 +237,14 @@ async function fetchParticipantData(config: StandupConfig) {
 
   for (const step of config.steps) {
     let allOpen: GitHubIssue[] = [];
+    let recentClosed: GitHubIssue[] = [];
 
     if (step.type === "assignee") {
       const recent = await fetchRecentlyUpdated(config.repo, step.user);
       const open = await fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel);
       const recentNums = new Set(recent.map(i => i.number));
       const recentOpen = recent.filter(i => i.state === "open");
+      recentClosed = recent.filter(i => i.state === "closed");
       const openDeduped = open.filter(i => !recentNums.has(i.number));
       allOpen = [...recentOpen, ...openDeduped];
     } else {
@@ -199,11 +255,18 @@ async function fetchParticipantData(config: StandupConfig) {
       ? await fetchUserAvatar(step.user)
       : "";
 
+    // Build stage groups: recently closed first, then open by stage
+    const stages: StageGroupOutput[] = [];
+    if (recentClosed.length > 0) {
+      stages.push({ emoji: "🏁", name: "Closed Today", issues: recentClosed });
+    }
+    stages.push(...groupByStage(allOpen));
+
     results.push({
       name: step.name,
       githubUser: step.type === "assignee" ? step.user : null,
       avatarUrl,
-      stages: groupByStage(allOpen),
+      stages,
     });
   }
 
@@ -291,6 +354,21 @@ export function createActivityApp(
     }
   });
 
+  // Single issue detail (body + comments)
+  app.get("/api/issues/:repo/:number", async (c) => {
+    const repo = decodeURIComponent(c.req.param("repo"));
+    const number = parseInt(c.req.param("number"));
+    if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
+
+    try {
+      const detail = await fetchIssueDetail(repo, number);
+      return c.json(detail);
+    } catch (e: any) {
+      console.error("[activity] Issue detail error:", e.message);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
   // WebSocket for real-time session state
   app.get(
     "/ws",
@@ -317,6 +395,7 @@ export function createActivityApp(
                   type: "state",
                   focusedIssue: session.meta.focusedIssue,
                   presenter: session.meta.presenter,
+                  activeParticipantIndex: session.meta.activeParticipantIndex,
                   recording: true,
                   elapsed: Math.round((Date.now() - session.meta.startedAt.getTime()) / 1000),
                   utteranceCount: session.meta.lines.length,
@@ -326,6 +405,7 @@ export function createActivityApp(
                   type: "state",
                   focusedIssue: null,
                   presenter: null,
+                  activeParticipantIndex: 0,
                   recording: false,
                   elapsed: 0,
                   utteranceCount: 0,
@@ -334,7 +414,11 @@ export function createActivityApp(
             }
 
             if (msg.type === "focus" && guildId) {
-              bot.setFocusedIssue(guildId, msg.issueNumber ?? null);
+              bot.setFocusedIssue(guildId, msg.issueNumber ?? null, msg.issueTitle, msg.issueState);
+            }
+
+            if (msg.type === "tab" && guildId && typeof msg.participantIndex === "number") {
+              bot.setActiveTab(guildId, msg.participantIndex);
             }
 
             if (msg.type === "controls" && guildId) {
