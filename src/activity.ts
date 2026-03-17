@@ -112,10 +112,13 @@ const ACTIVITY_CSS = `
 
   /* Tabs */
   .tabs{display:flex;gap:.25rem;padding:.5rem 1rem;background:#0f172a;border-bottom:1px solid #1e293b;flex-shrink:0;overflow-x:auto}
-  .tab{background:#1e293b;color:#94a3b8;border:1px solid #334155;padding:.4rem 1rem;border-radius:.375rem;cursor:pointer;font-size:.85rem;white-space:nowrap;transition:all .15s}
+  .tab{display:flex;align-items:center;gap:.35rem;background:#1e293b;color:#94a3b8;border:1px solid #334155;padding:.4rem 1rem;border-radius:.375rem;cursor:pointer;font-size:.85rem;white-space:nowrap;transition:all .15s}
   .tab:hover{background:#334155;color:#e2e8f0}
   .tab-active{background:#4f46e5;color:white;border-color:#4f46e5}
   .tab-speaking{box-shadow:0 0 0 2px rgba(129,140,248,.5)}
+  .tab-name{}
+  .tab-time{font-size:.7rem;color:#4ade80;font-family:monospace;min-width:2.2rem;text-align:right}
+  .tab-active .tab-time{color:#a5f3c8}
 
   /* Board */
   .board{flex:1;overflow-y:auto;padding:1rem}

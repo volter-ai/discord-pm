@@ -15,9 +15,21 @@
 
 import { Hono } from "hono";
 import { Database } from "bun:sqlite";
+import { Summarizer, type GitHubSuggestion } from "./summarizer";
+import { createIssue, createComment } from "./github";
 
 const PASSWORD = process.env.WEB_PASSWORD ?? "";
 const DB_PATH = "./data/standups.db";
+
+let _summarizer: Summarizer | null = null;
+function getSummarizer(): Summarizer | null {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return null;
+  if (!_summarizer) _summarizer = new Summarizer(key);
+  return _summarizer;
+}
+
+const suggestionsCache = new Map<number, GitHubSuggestion[]>();
 
 // ── Auth ────────────────────────────────────────────────────────────────────
 
@@ -259,6 +271,24 @@ const CSS = `
   .top-issue-num:hover{text-decoration:underline}
   .top-issue-title{color:#cbd5e1;font-size:.82rem;margin:.2rem 0 .4rem;line-height:1.4}
   .top-issue-time{color:#4ade80;font-size:.85rem;font-weight:600}
+
+  /* AI Suggestions */
+  .suggest-section{margin-top:2rem}
+  .suggest-btn{background:#4f46e5;color:white;border:none;padding:.5rem 1.25rem;border-radius:.375rem;cursor:pointer;font-size:.88rem;transition:background .15s}
+  .suggest-btn:hover:not(:disabled){background:#4338ca}
+  .suggest-btn:disabled{opacity:.6;cursor:not-allowed}
+  .suggestion-card{background:#1e293b;border:1px solid #334155;border-radius:.5rem;padding:1rem;margin-bottom:.75rem}
+  .sug-type{color:#94a3b8;font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem}
+  .sug-title{color:#e2e8f0;font-size:.95rem;font-weight:600;margin-bottom:.5rem}
+  .sug-body{background:#0f172a;border-radius:.375rem;padding:.75rem;font-size:.82rem;line-height:1.6;color:#cbd5e1;white-space:pre-wrap;word-break:break-word;margin-bottom:.5rem}
+  .sug-reasoning{color:#64748b;font-size:.8rem;font-style:italic;margin-bottom:.75rem}
+  .sug-actions{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+  .sug-btn{border:none;padding:.35rem .9rem;border-radius:.375rem;cursor:pointer;font-size:.82rem;transition:all .15s}
+  .sug-apply{background:#1e3a1e;color:#86efac;border:1px solid #166534}
+  .sug-apply:hover:not(:disabled){background:#14532d}
+  .sug-dismiss{background:#1c1917;color:#a8a29e;border:1px solid #292524}
+  .sug-dismiss:hover{background:#292524;color:#e2e8f0}
+  .sug-empty{color:#64748b;padding:.75rem 0;font-size:.88rem}
 `;
 
 function page(title: string, body: string) {
@@ -324,6 +354,70 @@ function listPage(rows: Row[], limit: number, offset: number, total: number) {
     ${table}
     ${pagination}
   `);
+}
+
+function suggestionsSection(id: number): string {
+  return `
+    <div class="suggest-section" id="suggest-box" data-id="${id}">
+      <h2>AI Suggested GitHub Actions</h2>
+      <button class="suggest-btn" id="btn-suggest" onclick="window._generateSuggestions()">Generate Suggestions</button>
+      <div id="suggestion-list" style="margin-top:1rem"></div>
+    </div>
+    <script>
+(function() {
+  var transcriptId = '${id}';
+  var _sugg = [];
+  function h(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  window._generateSuggestions = async function() {
+    var btn = document.getElementById('btn-suggest');
+    btn.disabled = true; btn.textContent = 'Generating\u2026 (10\u201315s)';
+    try {
+      var res = await fetch('/transcripts/' + transcriptId + '/suggestions');
+      if (!res.ok) throw new Error('Server error: ' + res.status);
+      _sugg = await res.json();
+      var list = document.getElementById('suggestion-list');
+      btn.style.display = 'none';
+      if (!_sugg.length) { list.innerHTML = '<p class="sug-empty">No suggestions generated.</p>'; return; }
+      list.innerHTML = _sugg.map(function(s,i) {
+        var type = s.type === 'new_issue'
+          ? '&#128221; New Issue'
+          : '&#128172; Comment on <a href="https://github.com/' + h(s.repo) + '/issues/' + s.issueNumber + '" target="_blank" style="color:#818cf8">#' + s.issueNumber + (s.issueTitle ? ' \u2014 ' + h(s.issueTitle) : '') + '</a>';
+        var titleRow = s.title ? '<div class="sug-title">' + h(s.title) + '</div>' : '';
+        return '<div class="suggestion-card" id="sug-'+i+'">'+
+          '<div class="sug-type">'+type+'</div>'+
+          titleRow+
+          '<pre class="sug-body">'+h(s.body)+'</pre>'+
+          '<div class="sug-reasoning">'+h(s.reasoning)+'</div>'+
+          '<div class="sug-actions">'+
+            '<button class="sug-btn sug-apply" onclick="window._applySugg('+i+')">&#10003; Apply to GitHub</button> '+
+            '<button class="sug-btn sug-dismiss" onclick="document.getElementById(\'sug-'+i+'\').remove()">&#10007; Dismiss</button>'+
+          '</div>'+
+        '</div>';
+      }).join('');
+    } catch(e) { btn.textContent = '! Failed \u2014 retry'; btn.disabled = false; }
+  };
+  window._applySugg = async function(i) {
+    var s = _sugg[i];
+    var card = document.getElementById('sug-'+i);
+    var btn = card.querySelector('.sug-apply');
+    btn.disabled = true; btn.textContent = 'Applying\u2026';
+    try {
+      var res = await fetch('/transcripts/' + transcriptId + '/suggestions/apply', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(s)
+      });
+      if (!res.ok) throw new Error('Error: ' + res.status);
+      var result = await res.json();
+      btn.textContent = '&#10003; Applied'; btn.style.background='#14532d'; btn.style.color='#86efac';
+      if (result.url) {
+        var a = document.createElement('a'); a.href=result.url; a.target='_blank';
+        a.style.cssText='color:#818cf8;font-size:.8rem;margin-left:.5rem'; a.textContent='View on GitHub \u2197';
+        btn.parentNode.insertBefore(a, btn.nextSibling);
+      }
+    } catch(e) { btn.textContent='! Failed'; btn.disabled=false; btn.style.background='#450a0a'; }
+  };
+})();
+    </script>
+  `;
 }
 
 function detailPage(r: Row, segments: SegmentRow[]) {
@@ -479,6 +573,8 @@ function detailPage(r: Row, segments: SegmentRow[]) {
     `;
   }
 
+  const suggestionsHtml = suggestionsSection(r.id);
+
   return page(`#${r.id}`, `
     <a class="back" href="/">← All transcripts</a>
     <h1>Standup #${r.id}</h1>
@@ -493,6 +589,8 @@ function detailPage(r: Row, segments: SegmentRow[]) {
     ${participantBlocks || '<p class="empty">No participant data.</p>'}
 
     ${issueTranscriptHtml}
+
+    ${suggestionsHtml}
 
     <h2>Full Transcript</h2>
     <pre>${esc(r.transcript)}</pre>
@@ -572,6 +670,68 @@ export function createWebApp(): Hono {
       summary: row.summary,
       transcript: row.transcript,
     });
+  });
+
+  // AI-suggested GitHub actions for a transcript
+  app.get("/transcripts/:id/suggestions", async (c) => {
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.json({ error: "invalid id" }, 400);
+
+    const cached = suggestionsCache.get(id);
+    if (cached) return c.json(cached);
+
+    const row = getStandup(id);
+    if (!row) return c.json({ error: "not found" }, 404);
+
+    const summarizer = getSummarizer();
+    if (!summarizer) return c.json({ error: "ANTHROPIC_API_KEY not configured" }, 500);
+
+    const segments = getSegments(id);
+    const repo = segments.find(s => s.issue_repo)?.issue_repo ?? null;
+    if (!repo) return c.json({ error: "Cannot determine repo from transcript" }, 400);
+
+    const issueSet = new Map<number, string>();
+    for (const seg of segments) {
+      if (seg.issue_number && seg.issue_title) {
+        issueSet.set(seg.issue_number, seg.issue_title);
+      }
+    }
+    const issues = [...issueSet.entries()].map(([number, title]) => ({ number, title }));
+
+    try {
+      const suggestions = await summarizer.suggestGitHubActions(row.transcript, issues, repo);
+      suggestionsCache.set(id, suggestions);
+      return c.json(suggestions);
+    } catch (e: any) {
+      console.error("[web] suggestGitHubActions error:", e.message);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // Apply a suggestion to GitHub
+  app.post("/transcripts/:id/suggestions/apply", async (c) => {
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.json({ error: "invalid id" }, 400);
+
+    const body = await c.req.json() as GitHubSuggestion;
+    const { type, title, issueNumber, repo, body: content } = body;
+    if (!type || !content || !repo) return c.json({ error: "Missing required fields" }, 400);
+
+    try {
+      if (type === "new_issue") {
+        if (!title) return c.json({ error: "Missing title" }, 400);
+        const result = await createIssue(repo, title, content);
+        return c.json({ ok: true, url: result.url, number: result.number });
+      } else if (type === "comment") {
+        if (!issueNumber) return c.json({ error: "Missing issueNumber" }, 400);
+        await createComment(repo, issueNumber, content);
+        return c.json({ ok: true, url: `https://github.com/${repo}/issues/${issueNumber}` });
+      }
+      return c.json({ error: "Unknown type" }, 400);
+    } catch (e: any) {
+      console.error("[web] apply suggestion error:", e.message);
+      return c.json({ error: e.message }, 500);
+    }
   });
 
   return app;

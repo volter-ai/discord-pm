@@ -79,6 +79,16 @@ export interface IssueSummaryResult {
   summary_text: string;
 }
 
+export interface GitHubSuggestion {
+  type: "new_issue" | "comment";
+  title?: string;           // for new_issue
+  issueNumber?: number;     // for comment
+  issueTitle?: string;      // for comment (display only)
+  body: string;
+  reasoning: string;
+  repo: string;
+}
+
 export class Summarizer {
   private client: Anthropic;
 
@@ -137,6 +147,71 @@ export class Summarizer {
       throw new Error(`Summarizer response missing required fields: ${JSON.stringify(parsed).slice(0, 200)}`);
     }
     return parsed as IssueSummaryResult;
+  }
+
+  async suggestGitHubActions(
+    transcript: string,
+    issues: Array<{ number: number; title: string }>,
+    repo: string,
+  ): Promise<GitHubSuggestion[]> {
+    const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+    const issueList = issues.length > 0
+      ? issues.map(i => `#${i.number}: ${i.title}`).join("\n")
+      : "(none — general discussion only)";
+
+    const prompt = `You are reviewing a standup meeting transcript for the GitHub repo "${repo}".
+
+Issues discussed in this standup:
+${issueList}
+
+Transcript:
+${transcript}
+
+Suggest GitHub actions to take based on what was discussed. Respond ONLY with valid JSON (no markdown fences):
+{
+  "suggestions": [
+    {
+      "type": "new_issue",
+      "title": "Short issue title",
+      "body": "Detailed description with context from standup...",
+      "reasoning": "Why this should be filed as a new issue",
+      "repo": "${repo}"
+    },
+    {
+      "type": "comment",
+      "issueNumber": 123,
+      "issueTitle": "Issue title here",
+      "body": "Standup ${today}: ...",
+      "reasoning": "Why this comment is useful",
+      "repo": "${repo}"
+    }
+  ]
+}
+
+Guidelines:
+- Suggest NEW issues for: bugs described in the standup, features/tasks mentioned but not already in the issue list above
+- Suggest COMMENTS for: blockers, decisions, action items, or notable progress on issues that ARE in the list above
+- Comment body should start with "Standup ${today}: " and be 2-4 sentences, factual
+- New issue body should be specific and actionable (include steps, context, impact)
+- Only suggest high-value actions — 3 to 8 suggestions max
+- Do NOT suggest creating issues for things already in the issue list above`;
+
+    const response = await this.client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2048,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const block = response.content.find((b) => b.type === "text");
+    if (!block || block.type !== "text") throw new Error("No text block in response");
+    const text = block.text;
+    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    const start = stripped.indexOf("{");
+    const end = stripped.lastIndexOf("}");
+    if (start === -1 || end === -1) throw new Error(`No JSON found in suggest response: ${text.slice(0, 200)}`);
+    const parsed = JSON.parse(stripped.slice(start, end + 1));
+    if (!Array.isArray(parsed.suggestions)) return [];
+    return parsed.suggestions as GitHubSuggestion[];
   }
 
   private parseResponse(response: any): SummaryResult {

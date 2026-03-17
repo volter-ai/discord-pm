@@ -144,6 +144,37 @@ export async function fetchIssueDetail(
   };
 }
 
+export async function createIssue(
+  repo: string,
+  title: string,
+  body: string,
+  labels: string[] = [],
+): Promise<{ number: number; url: string }> {
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues`, {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ title, body, labels }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub createIssue ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return { number: data.number, url: data.html_url };
+}
+
+export async function createComment(
+  repo: string,
+  issueNumber: number,
+  body: string,
+): Promise<void> {
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues/${issueNumber}/comments`, {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub createComment ${res.status}: ${await res.text()}`);
+}
+
 export async function fetchOpenNonBacklog(
   repo: string,
   assignee: string | null,

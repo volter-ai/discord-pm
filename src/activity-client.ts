@@ -61,6 +61,9 @@ let isRecording = false;
 let elapsedSeconds = 0;
 let utteranceCount = 0;
 let speakingUsers = new Set<string>();
+let speakingNames = new Set<string>();
+let participantTimers = new Map<string, number>(); // name → accumulated ms
+let speakerStartTimes = new Map<string, number>();  // name → start timestamp
 let standupKey = "";
 let repo = "";
 let timerInterval: ReturnType<typeof setInterval> | null = null;
@@ -257,8 +260,16 @@ function handleServerMessage(msg: ServerMessage) {
     case "speaker":
       if (msg.speaking) {
         speakingUsers.add(msg.userId);
+        speakingNames.add(msg.name);
+        speakerStartTimes.set(msg.name, Date.now());
       } else {
         speakingUsers.delete(msg.userId);
+        speakingNames.delete(msg.name);
+        const start = speakerStartTimes.get(msg.name);
+        if (start !== undefined) {
+          participantTimers.set(msg.name, (participantTimers.get(msg.name) ?? 0) + (Date.now() - start));
+          speakerStartTimes.delete(msg.name);
+        }
       }
       updateSpeakerIndicators();
       break;
@@ -367,11 +378,23 @@ function renderSyncBadge(): string {
 function renderTabs(): string {
   const tabs = participants.map((p, i) => {
     const active = i === activeTabIndex ? "tab-active" : "";
-    const speakingClass = speakingUsers.size > 0 ? "tab-speaking" : "";
-    return `<button class="tab ${active} ${speakingClass}" data-index="${i}">${escapeHtml(p.name)}</button>`;
+    const speakingClass = speakingNames.has(p.name) ? "tab-speaking" : "";
+    return `<button class="tab ${active} ${speakingClass}" data-index="${i}"><span class="tab-name">${escapeHtml(p.name)}</span><span class="tab-time" id="tab-time-${i}"></span></button>`;
   }).join("");
 
   return `<div class="tabs" id="tabs">${tabs}</div>`;
+}
+
+function updateTabTimes() {
+  participants.forEach((p, i) => {
+    const el = document.getElementById(`tab-time-${i}`);
+    if (!el) return;
+    const totalMs = participantTimers.get(p.name) ?? 0;
+    const isSpeaking = speakingNames.has(p.name);
+    const liveMs = isSpeaking ? (Date.now() - (speakerStartTimes.get(p.name) ?? Date.now())) : 0;
+    const totalSec = Math.floor((totalMs + liveMs) / 1000);
+    el.textContent = totalSec > 0 ? formatTime(totalSec) : "";
+  });
 }
 
 function renderBoard(): string {
@@ -642,11 +665,16 @@ function updateFocusHighlight() {
 }
 
 function updateSpeakerIndicators() {
-  // For now, pulse the header when anyone is speaking
   const header = document.getElementById("header");
   if (header) {
     header.classList.toggle("speaking-active", speakingUsers.size > 0);
   }
+  // Pulse only the specific participant tab that's speaking
+  document.querySelectorAll<HTMLElement>(".tab[data-index]").forEach((el) => {
+    const idx = parseInt(el.dataset.index!);
+    const name = participants[idx]?.name ?? "";
+    el.classList.toggle("tab-speaking", speakingNames.has(name));
+  });
 }
 
 function addLiveUtterance(speaker: string, text: string, issueNumber: number | null) {
@@ -672,6 +700,7 @@ function startTimer() {
       elapsedSeconds++;
     }
     updateHeader();
+    updateTabTimes();
   }, 1000);
 }
 
