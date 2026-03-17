@@ -151,6 +151,50 @@ function fmtDuration(start: string, end: string) {
   return `${m}m ${sec}s`;
 }
 
+// ── Analytics helpers ────────────────────────────────────────────────────────
+
+/**
+ * Estimate ms spent per issue using inter-segment gaps (capped at 2 min).
+ * Segments must be ordered by started_at.
+ */
+function computeIssueTimes(segments: SegmentRow[]): Map<number | null, number> {
+  const times = new Map<number | null, number>();
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const next = segments[i + 1];
+    const durationMs = next
+      ? Math.min(next.started_at - seg.started_at, 120_000)
+      : 30_000;
+    times.set(seg.issue_number, (times.get(seg.issue_number) ?? 0) + durationMs);
+  }
+  return times;
+}
+
+function fmtMs(ms: number): string {
+  const s = Math.round(ms / 1000);
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+const CHART_COLORS = ["#818cf8", "#34d399", "#f87171", "#fbbf24", "#a78bfa", "#60a5fa", "#fb923c", "#e879f9"];
+
+function svgPieChart(slices: { value: number; color: string }[], size = 120): string {
+  const total = slices.reduce((s, x) => s + x.value, 0);
+  if (total === 0) return "";
+  const cx = size / 2, cy = size / 2, r = size / 2 - 4;
+  let angle = -Math.PI / 2;
+  const paths = slices.map(({ value, color }) => {
+    const sweep = (value / total) * 2 * Math.PI;
+    const x1 = cx + r * Math.cos(angle), y1 = cy + r * Math.sin(angle);
+    angle += sweep;
+    const x2 = cx + r * Math.cos(angle), y2 = cy + r * Math.sin(angle);
+    const large = sweep > Math.PI ? 1 : 0;
+    return `<path d="M${cx},${cy} L${x1.toFixed(1)},${y1.toFixed(1)} A${r},${r} 0 ${large},1 ${x2.toFixed(1)},${y2.toFixed(1)} Z" fill="${color}"/>`;
+  }).join("");
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${paths}</svg>`;
+}
+
 // ── HTML templates ───────────────────────────────────────────────────────────
 
 const CSS = `
@@ -192,10 +236,29 @@ const CSS = `
   .issue-snippet{font-size:.88rem;line-height:1.6;color:#cbd5e1}
   .toc{background:#1e293b;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:1rem;font-size:.875rem}
   .toc-title{color:#94a3b8;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.4rem}
-  .toc-list{list-style:none;padding:0;line-height:1.9}
-  .toc-list li a{color:#818cf8}
-  .toc-list li a:hover{text-decoration:underline}
+  .toc-table{width:100%;border-collapse:collapse;font-size:.83rem}
+  .toc-table th{color:#64748b;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;padding:.3rem .5rem;text-align:left;border-bottom:1px solid #334155}
+  .toc-table td{padding:.3rem .5rem;border-bottom:1px solid #2d3748;vertical-align:top}
+  .toc-table tr:hover td{background:#334155}
+  .toc-table td:last-child{color:#94a3b8;white-space:nowrap;text-align:right}
   .toc-general{color:#64748b;font-size:.8rem;margin-left:.4rem}
+
+  /* Speaker distribution */
+  .speaker-row{display:flex;align-items:center;gap:1.5rem;background:#1e293b;border-radius:.5rem;padding:1rem;flex-wrap:wrap}
+  .speaker-legend{display:flex;flex-direction:column;gap:.35rem;min-width:160px}
+  .speaker-legend-item{display:flex;align-items:center;gap:.5rem;font-size:.85rem}
+  .speaker-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+  .speaker-name{color:#e2e8f0;flex:1}
+  .speaker-count{color:#64748b;white-space:nowrap}
+
+  /* Top 3 issues */
+  .top-issues{display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap}
+  .top-issue-card{background:#1e293b;border:1px solid #334155;border-radius:.5rem;padding:.75rem 1rem;flex:1;min-width:160px}
+  .top-issue-rank{color:#64748b;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.25rem}
+  .top-issue-num{color:#818cf8;font-size:.95rem;font-weight:700;text-decoration:none;display:block}
+  .top-issue-num:hover{text-decoration:underline}
+  .top-issue-title{color:#cbd5e1;font-size:.82rem;margin:.2rem 0 .4rem;line-height:1.4}
+  .top-issue-time{color:#4ade80;font-size:.85rem;font-weight:600}
 `;
 
 function page(title: string, body: string) {
@@ -280,8 +343,37 @@ function detailPage(r: Row, segments: SegmentRow[]) {
   }).join("\n");
 
   // Issue-aware transcript sections (if segments exist)
+  let speakerChartHtml = "";
   let issueTranscriptHtml = "";
+
   if (segments.length > 0) {
+    // ── Speaker distribution pie chart ──────────────────────────────────────
+    const speakerCounts = new Map<string, number>();
+    for (const seg of segments) {
+      speakerCounts.set(seg.speaker, (speakerCounts.get(seg.speaker) ?? 0) + 1);
+    }
+    if (speakerCounts.size >= 2) {
+      const sorted = [...speakerCounts.entries()].sort((a, b) => b[1] - a[1]);
+      const total = segments.length;
+      const slices = sorted.map(([, count], i) => ({ value: count, color: CHART_COLORS[i % CHART_COLORS.length] }));
+      const legend = sorted.map(([name, count], i) => {
+        const pct = Math.round(count / total * 100);
+        return `<div class="speaker-legend-item">
+          <span class="speaker-dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>
+          <span class="speaker-name">${esc(name)}</span>
+          <span class="speaker-count">${count} utterances (${pct}%)</span>
+        </div>`;
+      }).join("");
+      speakerChartHtml = `
+        <h2>Speaker Distribution</h2>
+        <div class="speaker-row">
+          ${svgPieChart(slices)}
+          <div class="speaker-legend">${legend}</div>
+        </div>
+      `;
+    }
+
+    // ── Build byIssue map (preserving transcript order) ─────────────────────
     const byIssue = new Map<number | null, SegmentRow[]>();
     for (const seg of segments) {
       const key = seg.issue_number;
@@ -289,22 +381,70 @@ function detailPage(r: Row, segments: SegmentRow[]) {
       byIssue.get(key)!.push(seg);
     }
 
-    // Build ToC entries and section HTML together
-    const tocItems: string[] = [];
+    const issueTimes = computeIssueTimes(segments);
+
+    // ── Top 3 issues by time (excluding general discussion) ─────────────────
+    const rankedIssues = [...byIssue.entries()]
+      .filter(([k]) => k !== null)
+      .sort((a, b) => (issueTimes.get(b[0]) ?? 0) - (issueTimes.get(a[0]) ?? 0));
+
+    const top3Html = rankedIssues.slice(0, 3).map(([issueNum, segs], rank) => {
+      const ms = issueTimes.get(issueNum) ?? 0;
+      const title = segs[0]?.issue_title ?? null;
+      const medals = ["🥇", "🥈", "🥉"];
+      return `<div class="top-issue-card">
+        <div class="top-issue-rank">${medals[rank]} #${rank + 1} by time</div>
+        <a class="top-issue-num" href="#issue-${issueNum}">#${issueNum}</a>
+        <div class="top-issue-title">${title ? esc(title) : "—"}</div>
+        <div class="top-issue-time">${fmtMs(ms)}</div>
+      </div>`;
+    }).join("");
+
+    // ── ToC as table, sorted by time descending ──────────────────────────────
+    const tocRows = [...byIssue.entries()]
+      .sort((a, b) => (issueTimes.get(b[0]) ?? 0) - (issueTimes.get(a[0]) ?? 0))
+      .map(([issueNum, segs]) => {
+        const ms = issueTimes.get(issueNum);
+        const timeStr = ms !== undefined ? fmtMs(ms) : "—";
+        if (issueNum === null) {
+          const speakers = [...new Set(segs.map(s => s.speaker))].join(", ");
+          return `<tr><td colspan="2"><a href="#general-discussion">General Discussion</a> <span class="toc-general">${esc(speakers)}</span></td><td>${timeStr}</td></tr>`;
+        }
+        const title = segs[0]?.issue_title ?? "";
+        return `<tr>
+          <td style="white-space:nowrap"><a href="#issue-${issueNum}">#${issueNum}</a></td>
+          <td>${esc(title)}</td>
+          <td>${timeStr}</td>
+        </tr>`;
+      }).join("");
+
+    const toc = `<div class="toc">
+      <div class="toc-title">Contents</div>
+      <table class="toc-table">
+        <thead><tr><th>#</th><th>Issue</th><th>Time</th></tr></thead>
+        <tbody>${tocRows}</tbody>
+      </table>
+    </div>`;
+
+    // ── Issue sections (in transcript order) ────────────────────────────────
     const issueSections: string[] = [];
 
     for (const [issueNum, segs] of byIssue) {
-      const repo = segs[0]?.issue_repo ?? "";
+      const segRepo = segs[0]?.issue_repo ?? "";
       const issueTitle = segs[0]?.issue_title ?? null;
       const issueState = segs[0]?.issue_state ?? "open";
       const speakers = [...new Set(segs.map(s => s.speaker))].join(", ");
       const snippets = segs.map(s =>
         `<div class="issue-snippet"><strong>${esc(s.speaker)}:</strong> ${esc(s.text)}</div>`
       ).join("\n");
+      const timeSpent = issueTimes.get(issueNum);
+      const timeBadge = timeSpent !== undefined
+        ? `<span style="color:#4ade80;font-size:.8rem;font-weight:600">${fmtMs(timeSpent)}</span>`
+        : "";
 
       if (issueNum) {
         const anchorId = `issue-${issueNum}`;
-        const ghUrl = `https://github.com/${repo}/issues/${issueNum}`;
+        const ghUrl = `https://github.com/${segRepo}/issues/${issueNum}`;
         const stateCls = issueState === "closed" ? "status-closed" : "status-open";
         const stateLabel = issueState === "closed" ? "closed" : "open";
         const titleLine = issueTitle
@@ -312,12 +452,9 @@ function detailPage(r: Row, segments: SegmentRow[]) {
           : "";
         const metaRow = `<div class="issue-meta-row">
           <span class="status-badge ${stateCls}">${stateLabel}</span>
+          ${timeBadge}
           <a class="issue-gh-link" href="${ghUrl}" target="_blank">View on GitHub ↗</a>
         </div>`;
-
-        tocItems.push(
-          `<li><a href="#${anchorId}">#${issueNum}</a>${issueTitle ? ` — ${esc(issueTitle)}` : ""}</li>`
-        );
         issueSections.push(`<div class="issue-section" id="${anchorId}">
           <h3><a href="${ghUrl}" target="_blank">#${issueNum}</a></h3>
           ${titleLine}
@@ -326,22 +463,17 @@ function detailPage(r: Row, segments: SegmentRow[]) {
           ${snippets}
         </div>`);
       } else {
-        tocItems.unshift(`<li><a href="#general-discussion">General Discussion</a> <span class="toc-general">${esc(speakers)}</span></li>`);
         issueSections.unshift(`<div class="issue-section" id="general-discussion">
-          <h3>General Discussion</h3>
+          <h3>General Discussion ${timeBadge}</h3>
           <div class="issue-speakers">${esc(speakers)}</div>
           ${snippets}
         </div>`);
       }
     }
 
-    const toc = `<div class="toc">
-      <div class="toc-title">Contents</div>
-      <ul class="toc-list">${tocItems.join("\n")}</ul>
-    </div>`;
-
     issueTranscriptHtml = `
       <h2>By Issue</h2>
+      ${top3Html ? `<div class="top-issues">${top3Html}</div>` : ""}
       ${toc}
       ${issueSections.join("\n")}
     `;
@@ -354,6 +486,8 @@ function detailPage(r: Row, segments: SegmentRow[]) {
 
     <h2>Summary</h2>
     <div class="summary-box">${esc(r.summary)}</div>
+
+    ${speakerChartHtml}
 
     <h2>Per Participant</h2>
     ${participantBlocks || '<p class="empty">No participant data.</p>'}

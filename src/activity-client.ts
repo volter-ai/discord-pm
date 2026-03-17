@@ -200,13 +200,22 @@ async function refreshIssues() {
     participants = data.participants;
     repo = data.repo;
     detailCache.clear();
+    if (btn) btn.classList.remove("spinning");
+    render();
   } catch (e: any) {
     console.error("Refresh error:", e);
-  } finally {
-    if (btn) btn.classList.remove("spinning");
+    if (btn) {
+      btn.classList.remove("spinning");
+      btn.textContent = "!";
+      btn.title = "Refresh failed — click to retry";
+      btn.style.color = "#f87171";
+      setTimeout(() => {
+        btn.textContent = "↻";
+        btn.title = "Refresh issues";
+        btn.style.color = "";
+      }, 3000);
+    }
   }
-
-  render();
 }
 
 // ── WebSocket ───────────────────────────────────────────────────────────────
