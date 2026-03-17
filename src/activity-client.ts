@@ -189,6 +189,26 @@ async function loadStandup(key: string) {
   render();
 }
 
+async function refreshIssues() {
+  const btn = document.getElementById("btn-refresh");
+  if (btn) btn.classList.add("spinning");
+
+  try {
+    const res = await fetch(`/api/issues?standup=${encodeURIComponent(standupKey)}`);
+    if (!res.ok) throw new Error(`Failed to fetch issues: ${res.status}`);
+    const data: IssuesResponse = await res.json();
+    participants = data.participants;
+    repo = data.repo;
+    detailCache.clear();
+  } catch (e: any) {
+    console.error("Refresh error:", e);
+  } finally {
+    if (btn) btn.classList.remove("spinning");
+  }
+
+  render();
+}
+
 // ── WebSocket ───────────────────────────────────────────────────────────────
 
 function connectWebSocket() {
@@ -309,6 +329,7 @@ function renderHeader(): string {
       <div class="header-left">
         <span class="header-title">Standup — ${escapeHtml(standupKey)}</span>
         <span id="sync-badge">${syncBadge}</span>
+        <button class="refresh-btn" id="btn-refresh" title="Refresh issues">↻</button>
       </div>
       <div class="header-right">
         ${discussedBadge}
@@ -360,7 +381,7 @@ function renderBoard(): string {
         <div class="issue-card ${focused} ${closedClass}" data-issue="${issue.number}" data-url="${escapeHtml(issue.url)}" data-title="${escapeHtml(issue.title)}" data-state="${escapeHtml(issue.state)}">
           <div class="issue-header">
             <span class="issue-number" data-detail="${issue.number}">#${issue.number}</span>
-            <span class="issue-title">${escapeHtml(truncate(issue.title, 50))}</span>
+            <span class="issue-title">${escapeHtml(issue.title)}</span>
           </div>
           <div class="issue-badges">${timer}${age}${prio}${bug}</div>
         </div>
@@ -565,6 +586,11 @@ document.addEventListener("click", (e) => {
   }
   if (target.id === "btn-sync") {
     snapToSync();
+    return;
+  }
+
+  if (target.id === "btn-refresh") {
+    refreshIssues();
     return;
   }
 

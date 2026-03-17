@@ -39,15 +39,29 @@ function parseIssues(raw: any[]): GitHubIssue[] {
 }
 
 /**
- * Fetch issues for an assignee updated within the last `sinceHours` hours.
- * Returns both open and closed issues, sorted by most recently updated.
+ * Returns midnight UTC of the most recent business day.
+ * Monday → Friday, Sat/Sun → Friday, Tue–Fri → yesterday.
+ */
+function sinceLastBusinessDayStart(): string {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Sun,1=Mon,...,6=Sat
+  // Mon=1 → back 3 days to Fri; Sun=0 → back 2 days to Fri; Sat=6 → back 1 day to Fri; else → back 1 day
+  const daysBack = day === 1 ? 3 : day === 0 ? 2 : 1;
+  const since = new Date(now);
+  since.setUTCDate(since.getUTCDate() - daysBack);
+  since.setUTCHours(0, 0, 0, 0);
+  return since.toISOString();
+}
+
+/**
+ * Fetch issues for an assignee updated since the start of the last business day.
+ * Monday standups automatically look back to Friday; all other days look back to yesterday.
  */
 export async function fetchRecentlyUpdated(
   repo: string,
   assignee: string,
-  sinceHours = 24,
+  since = sinceLastBusinessDayStart(),
 ): Promise<GitHubIssue[]> {
-  const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000).toISOString();
   const params = new URLSearchParams({
     assignee,
     state: "all",

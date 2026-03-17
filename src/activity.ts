@@ -101,6 +101,10 @@ const ACTIVITY_CSS = `
   .header-left{display:flex;align-items:center;gap:.5rem}
   .header-title{color:#818cf8;font-weight:600;font-size:1rem}
   .header-right{display:flex;align-items:center;gap:.75rem;color:#94a3b8;font-size:.85rem}
+  .refresh-btn{background:none;border:none;color:#64748b;cursor:pointer;font-size:.85rem;padding:.2rem .4rem;border-radius:.25rem;transition:color .15s}
+  .refresh-btn:hover{color:#e2e8f0}
+  .refresh-btn.spinning{animation:spin .7s linear infinite}
+  @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
   .rec-dot{width:10px;height:10px;border-radius:50%;background:#ef4444;animation:pulse 1.5s infinite}
   .speaking-active{border-bottom-color:#818cf8}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
@@ -126,13 +130,13 @@ const ACTIVITY_CSS = `
   .stage-header{color:#94a3b8;font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.35rem;padding-left:.25rem}
 
   /* Issue Cards */
-  .issue-card{display:flex;align-items:center;justify-content:space-between;background:#1e293b;border:1px solid #334155;border-radius:.375rem;padding:.5rem .75rem;cursor:pointer;transition:all .15s;margin-bottom:.25rem}
+  .issue-card{display:flex;align-items:flex-start;justify-content:space-between;background:#1e293b;border:1px solid #334155;border-radius:.375rem;padding:.5rem .75rem;cursor:pointer;transition:all .15s;margin-bottom:.25rem;gap:.5rem}
   .issue-card:hover{background:#334155}
   .issue-focused{border-color:#818cf8;background:#1e1b4b;box-shadow:0 0 0 1px rgba(129,140,248,.3)}
-  .issue-header{display:flex;align-items:center;gap:.5rem;min-width:0;flex:1}
-  .issue-number{color:#818cf8;font-size:.82rem;font-weight:600;flex-shrink:0}
-  .issue-title{color:#cbd5e1;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .issue-badges{display:flex;gap:.25rem;flex-shrink:0}
+  .issue-header{display:flex;align-items:flex-start;gap:.5rem;min-width:0;flex:1}
+  .issue-number{color:#818cf8;font-size:.82rem;font-weight:600;flex-shrink:0;padding-top:.05rem}
+  .issue-title{color:#cbd5e1;font-size:.85rem;word-break:break-word;line-height:1.4}
+  .issue-badges{display:flex;gap:.25rem;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;padding-top:.05rem}
   .badge{font-size:.7rem;padding:.1rem .35rem;border-radius:.25rem;font-weight:600}
   .badge-p0{background:#450a0a;color:#fca5a5}
   .badge-p1{background:#431407;color:#fdba74}

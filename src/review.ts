@@ -73,17 +73,17 @@ export interface StageInfo {
   order: number;
 }
 
-// Order: most active first — In Progress → In Review → QA → Ready → Draft → Done → Released
+// Order: most complete first — Released → Done → QA → In Review → In Progress → Ready → Draft
 export const STAGE_MAP: Record<string, StageInfo> = {
-  "stage:in-progress": { emoji: "🔨", name: "In Progress", order: 1 },
-  "stage:in-review":   { emoji: "👀", name: "In Review", order: 2 },
+  "stage:released":    { emoji: "🚀", name: "Released", order: 1 },
+  "stage:done":        { emoji: "✅", name: "Done", order: 2 },
   "stage:qa":          { emoji: "🧪", name: "QA", order: 3 },
-  "stage:ready":       { emoji: "📋", name: "Ready", order: 4 },
-  "stage: ready":      { emoji: "📋", name: "Ready", order: 4 },
-  "ready-for-testing": { emoji: "📋", name: "Ready", order: 4 },
-  "stage: draft":      { emoji: "📝", name: "Draft", order: 5 },
-  "stage:done":        { emoji: "✅", name: "Done", order: 6 },
-  "stage:released":    { emoji: "🚀", name: "Released", order: 7 },
+  "stage:in-review":   { emoji: "👀", name: "In Review", order: 4 },
+  "stage:in-progress": { emoji: "🔨", name: "In Progress", order: 5 },
+  "stage:ready":       { emoji: "📋", name: "Ready", order: 6 },
+  "stage: ready":      { emoji: "📋", name: "Ready", order: 6 },
+  "ready-for-testing": { emoji: "📋", name: "Ready", order: 6 },
+  "stage: draft":      { emoji: "📝", name: "Draft", order: 7 },
 };
 
 export function getStage(labels: string[]): StageInfo | null {
