@@ -66,7 +66,9 @@ let repo = "";
 let timerInterval: ReturnType<typeof setInterval> | null = null;
 let issueTimers = new Map<number, number>(); // issue# → accumulated ms
 let focusStartTime: number | null = null;
+const DETAIL_CACHE_MAX = 30;
 let detailCache = new Map<string, any>(); // "repo/number" → detail
+let detailFetchInFlight = false;
 
 // ── Sync / Freestyle state ──────────────────────────────────────────────────
 /** Whether this client is following the presenter (synced mode). Default true. */
@@ -187,6 +189,7 @@ async function loadStandup(key: string) {
 
   connectWebSocket();
   render();
+  startTimer();
 }
 
 async function refreshIssues() {
@@ -323,8 +326,6 @@ function render() {
     ${boardHtml}
     ${liveHtml}
   `;
-
-  startTimer();
 }
 
 function renderHeader(): string {
@@ -677,8 +678,9 @@ function startTimer() {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
+  const clamped = Math.max(0, seconds);
+  const m = Math.floor(clamped / 60);
+  const s = clamped % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
@@ -732,10 +734,14 @@ function flushFocusTimer() {
 // ── Issue Detail Panel ─────────────────────────────────────────────────────
 
 async function openDetailPanel(issueNumber: number) {
+  if (detailFetchInFlight) return;
+
   const cacheKey = `${repo}/${issueNumber}`;
   let detail = detailCache.get(cacheKey);
 
   if (!detail) {
+    detailFetchInFlight = true;
+
     // Show loading overlay
     const overlay = document.createElement("div");
     overlay.className = "detail-overlay";
@@ -746,13 +752,19 @@ async function openDetailPanel(issueNumber: number) {
       const res = await fetch(`/api/issues/${encodeURIComponent(repo)}/${issueNumber}`);
       if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
       detail = await res.json();
+      // LRU-style eviction: drop oldest entry when over cap
+      if (detailCache.size >= DETAIL_CACHE_MAX) {
+        detailCache.delete(detailCache.keys().next().value);
+      }
       detailCache.set(cacheKey, detail);
     } catch (e: any) {
       overlay.remove();
+      detailFetchInFlight = false;
       console.error("Detail fetch error:", e);
       return;
     }
     overlay.remove();
+    detailFetchInFlight = false;
   }
 
   renderDetailOverlay(detail);

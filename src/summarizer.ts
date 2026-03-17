@@ -133,7 +133,7 @@ export class Summarizer {
       throw new Error(`No JSON object found in summarizer response: ${text.slice(0, 200)}`);
     }
     const parsed = JSON.parse(stripped.slice(start, end + 1));
-    if (!Array.isArray(parsed.participants) || typeof parsed.summary_text !== "string") {
+    if (!Array.isArray(parsed.issues) || !Array.isArray(parsed.participants) || typeof parsed.summary_text !== "string") {
       throw new Error(`Summarizer response missing required fields: ${JSON.stringify(parsed).slice(0, 200)}`);
     }
     return parsed as IssueSummaryResult;

@@ -171,8 +171,8 @@ export class Recorder {
             console.log("[recorder] Reconnected successfully.");
             reconnected = true;
             break;
-          } catch {
-            console.warn(`[recorder] Reconnection attempt ${attempt} failed.`);
+          } catch (e) {
+            console.warn(`[recorder] Reconnection attempt ${attempt} failed:`, e);
           }
         }
         if (!reconnected && this.connection) {

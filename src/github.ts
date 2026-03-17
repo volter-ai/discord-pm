@@ -72,6 +72,7 @@ export async function fetchRecentlyUpdated(
   });
   const res = await fetch(`${GITHUB_API}/repos/${repo}/issues?${params}`, {
     headers: headers(),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
   const raw = await res.json();
@@ -92,6 +93,7 @@ export async function fetchUserAvatar(username: string): Promise<string> {
   try {
     const res = await fetch(`${GITHUB_API}/users/${username}`, {
       headers: headers(),
+      signal: AbortSignal.timeout(5_000),
     });
     if (res.ok) {
       const data = await res.json();
@@ -115,9 +117,10 @@ export async function fetchIssueDetail(
   repo: string,
   number: number,
 ): Promise<GitHubIssueDetail> {
+  const timeout = AbortSignal.timeout(10_000);
   const [issueRes, commentsRes] = await Promise.all([
-    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}`, { headers: headers() }),
-    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=20&direction=desc`, { headers: headers() }),
+    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}`, { headers: headers(), signal: timeout }),
+    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=20&direction=desc`, { headers: headers(), signal: timeout }),
   ]);
 
   if (!issueRes.ok) throw new Error(`GitHub API ${issueRes.status}: ${await issueRes.text()}`);
@@ -147,12 +150,17 @@ export async function fetchOpenNonBacklog(
   backlogLabel: string,
 ): Promise<GitHubIssue[]> {
   const assigneePart = assignee ? `assignee:${assignee}` : "no:assignee";
-  const q = `is:issue repo:${repo} is:open ${assigneePart} -label:"${backlogLabel}"`;
+  const escapedLabel = backlogLabel.replace(/"/g, '\\"');
+  const q = `is:issue repo:${repo} is:open ${assigneePart} -label:"${escapedLabel}"`;
   const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "100" });
   const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
     headers: headers(),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
-  const { items } = await res.json();
+  const { items, total_count } = await res.json();
+  if (total_count > items.length) {
+    console.warn(`[github] fetchOpenNonBacklog: got ${items.length}/${total_count} issues for ${repo} — results truncated`);
+  }
   return parseIssues(items);
 }
