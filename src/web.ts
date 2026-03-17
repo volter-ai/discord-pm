@@ -547,10 +547,10 @@ function detailPage(r: Row, segments: SegmentRow[]) {
         const metaRow = `<div class="issue-meta-row">
           <span class="status-badge ${stateCls}">${stateLabel}</span>
           ${timeBadge}
-          <a class="issue-gh-link" href="${ghUrl}" target="_blank">View on GitHub ↗</a>
+          <a class="issue-gh-link" href="${esc(ghUrl)}" target="_blank">View on GitHub ↗</a>
         </div>`;
         issueSections.push(`<div class="issue-section" id="${anchorId}">
-          <h3><a href="${ghUrl}" target="_blank">#${issueNum}</a></h3>
+          <h3><a href="${esc(ghUrl)}" target="_blank">#${issueNum}</a></h3>
           ${titleLine}
           ${metaRow}
           <div class="issue-speakers">${esc(speakers)}</div>

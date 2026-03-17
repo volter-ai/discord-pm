@@ -194,6 +194,10 @@ export class StandupBot {
     const closed: any[] = [];
 
     for (const ws of session.activityClients) {
+      if (ws.readyState !== undefined && ws.readyState !== 1 /* OPEN */) {
+        closed.push(ws);
+        continue;
+      }
       try {
         ws.send(json);
       } catch {

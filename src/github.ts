@@ -93,7 +93,7 @@ export async function fetchUserAvatar(username: string): Promise<string> {
   try {
     const res = await fetch(`${GITHUB_API}/users/${username}`, {
       headers: headers(),
-      signal: AbortSignal.timeout(5_000),
+      signal: AbortSignal.timeout(10_000),
     });
     if (res.ok) {
       const data = await res.json();

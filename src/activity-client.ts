@@ -73,6 +73,13 @@ const DETAIL_CACHE_MAX = 30;
 let detailCache = new Map<string, any>(); // "repo/number" → detail
 let detailFetchInFlight = false;
 
+function cacheDetail(key: string, value: any) {
+  if (detailCache.size >= DETAIL_CACHE_MAX) {
+    detailCache.delete(detailCache.keys().next().value!);
+  }
+  detailCache.set(key, value);
+}
+
 // ── Sync / Freestyle state ──────────────────────────────────────────────────
 /** Whether this client is following the presenter (synced mode). Default true. */
 let syncMode = true;
@@ -781,16 +788,14 @@ async function openDetailPanel(issueNumber: number) {
       const res = await fetch(`/api/issues/${encodeURIComponent(repo)}/${issueNumber}`);
       if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
       detail = await res.json();
-      // LRU-style eviction: drop oldest entry when over cap
-      if (detailCache.size >= DETAIL_CACHE_MAX) {
-        detailCache.delete(detailCache.keys().next().value);
-      }
-      detailCache.set(cacheKey, detail);
+      cacheDetail(cacheKey, detail);
     } catch (e: any) {
       overlay.remove();
       detailFetchInFlight = false;
       console.error("Detail fetch error:", e);
       return;
+    } finally {
+      detailFetchInFlight = false;
     }
     overlay.remove();
     detailFetchInFlight = false;
