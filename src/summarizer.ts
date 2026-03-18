@@ -121,7 +121,7 @@ export class Summarizer {
   ): Promise<IssueSummaryResult> {
     const response = await this.client.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 4096,
+      max_tokens: 8192,
       system: ISSUE_SYSTEM_PROMPT,
       messages: [
         {
@@ -134,6 +134,9 @@ export class Summarizer {
     const block = response.content.find((b) => b.type === "text");
     if (!block || block.type !== "text") {
       throw new Error("Summarizer: no text block in response");
+    }
+    if (response.stop_reason === "max_tokens") {
+      throw new Error(`Summarizer: response truncated at max_tokens (${response.usage?.output_tokens} tokens) — increase max_tokens`);
     }
     const text = block.text;
     const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
