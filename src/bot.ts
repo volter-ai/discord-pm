@@ -697,6 +697,25 @@ export class StandupBot {
         raw_transcript: transcript,
         summary_text: "(Summarization failed)",
       });
+      // Still save utterance segments so the issue-grouped web view renders correctly
+      if (hasIssueData) {
+        const segments: UtteranceSegment[] = session.lines
+          .filter(l => l.text.trim())
+          .map(l => {
+            const meta = l.issueNumber != null ? session.issueMeta.get(l.issueNumber) : null;
+            return {
+              speaker: l.speaker,
+              user_id: l.userId,
+              issue_number: l.issueNumber,
+              issue_repo: session.issueRepo,
+              issue_title: meta?.title ?? null,
+              issue_state: meta?.state ?? null,
+              text: l.text,
+              started_at: l.startedAt,
+            };
+          });
+        this.store.saveSegments(recordId, segments);
+      }
       try {
         await interaction.followUp?.(
           `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
