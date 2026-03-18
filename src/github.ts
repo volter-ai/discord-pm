@@ -161,6 +161,20 @@ export async function createIssue(
   return { number: data.number, url: data.html_url };
 }
 
+export async function assignIssue(
+  repo: string,
+  issueNumber: number,
+  assignees: string[],
+): Promise<void> {
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues/${issueNumber}`, {
+    method: "PATCH",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ assignees }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub assignIssue ${res.status}: ${await res.text()}`);
+}
+
 export async function createComment(
   repo: string,
   issueNumber: number,

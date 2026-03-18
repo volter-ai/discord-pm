@@ -24,6 +24,7 @@ import {
   fetchOpenNonBacklog,
   fetchUserAvatar,
   fetchIssueDetail,
+  assignIssue,
   type GitHubIssue,
 } from "./github";
 import type { StandupBot } from "./bot";
@@ -200,11 +201,21 @@ const ACTIVITY_CSS = `
   .issue-card-closed{opacity:.7}
   .issue-card-closed .issue-title{text-decoration:line-through;text-decoration-color:#64748b}
 
+  /* Reassign section in detail panel */
+  .detail-reassign{display:flex;gap:.5rem;align-items:center;margin-top:.75rem;padding-top:.75rem;border-top:1px solid #334155}
+  .detail-reassign-label{color:#94a3b8;font-size:.78rem;white-space:nowrap}
+  .assign-select{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:.375rem;padding:.35rem .5rem;font-size:.82rem;flex:1;min-width:0}
+  .assign-select option{background:#0f172a}
+  .btn-assign{background:#4f46e5;color:white;border:none;padding:.35rem .75rem;border-radius:.375rem;cursor:pointer;font-size:.82rem;flex-shrink:0;transition:background .15s}
+  .btn-assign:hover:not(:disabled){background:#4338ca}
+  .btn-assign:disabled{opacity:.5;cursor:not-allowed}
+
   /* Sync / Freestyle badge */
   .sync-badge{font-size:.72rem;padding:.15rem .45rem;border-radius:.25rem;font-weight:600;margin-left:.5rem}
   .sync-badge-presenter{background:#1e3a1e;color:#4ade80}
   .sync-badge-synced{background:#3b0000;color:#fca5a5}
-  .sync-badge-freestyle{background:#1c1917;color:#a8a29e}
+  .sync-badge-freestyle{background:#1c1917;color:#a8a29e;cursor:pointer}
+  .sync-badge-freestyle:hover{background:#292524}
 
   /* Nav center button variants */
   .nav-btn-presenter{background:#1e3a1e;color:#4ade80;border-color:#166534;opacity:.9}
@@ -376,11 +387,30 @@ export function createActivityApp(
     }
   });
 
+  // Reassign issue to a different contributor
+  app.post("/api/issues/:repo/:number/assign", async (c) => {
+    const repo = decodeURIComponent(c.req.param("repo"));
+    const number = parseInt(c.req.param("number"));
+    if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
+
+    const { assignee } = await c.req.json();
+    if (!assignee || typeof assignee !== "string") return c.json({ error: "Missing assignee" }, 400);
+
+    try {
+      await assignIssue(repo, number, [assignee]);
+      return c.json({ ok: true });
+    } catch (e: any) {
+      console.error("[activity] Assign issue error:", e.message);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
   // WebSocket for real-time session state
   app.get(
     "/ws",
     upgradeWebSocket((c) => {
       let guildId: string | null = null;
+      let clientUserId: string | null = null;
 
       return {
         onOpen(_event, ws) {
@@ -392,6 +422,7 @@ export function createActivityApp(
             const msg = JSON.parse(typeof event.data === "string" ? event.data : "{}");
 
             if (msg.type === "ready") {
+              if (msg.userId) clientUserId = msg.userId;
               // Client is ready — register with bot and send current state
               // For now, register to the first active session we can find
               const session = bot.getFirstActiveSession();
@@ -438,6 +469,7 @@ export function createActivityApp(
 
         onClose() {
           if (guildId) {
+            bot.clearPresenterIfDisconnected(guildId, clientUserId);
             bot.removeActivityClient(guildId);
           }
           console.log("[activity] WebSocket client disconnected");

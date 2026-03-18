@@ -25,6 +25,7 @@ import { createBunWebSocket } from "hono/bun";
 import { StandupBot } from "./bot";
 import { createWebApp } from "./web";
 import { createActivityApp } from "./activity";
+import { createTestsApp } from "./tests";
 
 const PORT = parseInt(process.env.WEB_PORT ?? "8080");
 
@@ -59,6 +60,9 @@ app.get("/activity/", async (c) => {
   console.log("[activity] Handling trailing-slash request");
   return activityApp.request("/", { headers: c.req.raw.headers });
 });
+
+// QA test pages (no auth — open to testers)
+app.route("/tests", createTestsApp());
 
 // Transcript web UI + JSON API (with Basic Auth)
 app.route("/", createWebApp());

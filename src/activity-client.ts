@@ -238,7 +238,7 @@ function connectWebSocket() {
   ws = new WebSocket(`${protocol}//${location.host}/ws`);
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: "ready", standupKey }));
+    ws!.send(JSON.stringify({ type: "ready", standupKey, userId: currentUser?.id ?? null }));
   };
 
   ws.onmessage = (event) => {
@@ -377,7 +377,7 @@ function renderSyncBadge(): string {
     return `<span class="sync-badge sync-badge-synced">🔴 Live</span>`;
   }
   if (!syncMode) {
-    return `<span class="sync-badge sync-badge-freestyle">🔓 Freestyle</span>`;
+    return `<span class="sync-badge sync-badge-freestyle" id="btn-sync-badge" title="Click to sync back to presenter">🔓 Freestyle</span>`;
   }
   return ""; // no presenter, no badge needed
 }
@@ -477,8 +477,8 @@ function renderNavCenterButton(): string {
     return `<button class="nav-btn nav-btn-synced" id="btn-freestyle">🔓 Go Freestyle</button>`;
   }
   if (!syncMode && presenterUserId) {
-    // In freestyle while presenter exists — offer to sync back
-    return `<button class="nav-btn nav-btn-sync" id="btn-sync">↩ Sync</button>`;
+    // In freestyle while presenter exists — offer to take control
+    return `<button class="nav-btn nav-btn-primary" id="btn-controls">Take Control</button>`;
   }
   // No presenter — collaborative navigation, offer to take controls
   return `<button class="nav-btn nav-btn-primary" id="btn-controls">Take Controls</button>`;
@@ -617,6 +617,9 @@ document.addEventListener("click", (e) => {
     return;
   }
   if (target.id === "btn-controls" && currentUser) {
+    // If taking control from freestyle, snap to server state first so we
+    // start from the same position the previous presenter left off.
+    if (!syncMode) snapToSync();
     sendWs({ type: "controls", userId: currentUser.id });
     return;
   }
@@ -624,13 +627,57 @@ document.addEventListener("click", (e) => {
     enterFreestyle();
     return;
   }
-  if (target.id === "btn-sync") {
+  if (target.id === "btn-sync-badge") {
     snapToSync();
     return;
   }
 
   if (target.id === "btn-refresh") {
     refreshIssues();
+    return;
+  }
+
+  if (target.id === "btn-assign") {
+    const assignRepo = (target as HTMLElement).dataset.repo!;
+    const assignIssueNum = (target as HTMLElement).dataset.issue!;
+    const select = document.getElementById("assign-select") as HTMLSelectElement | null;
+    const assignee = select?.value;
+    if (!assignee) return;
+
+    const btn = target as HTMLButtonElement;
+    btn.textContent = "Assigning...";
+    btn.disabled = true;
+
+    fetch(`/api/issues/${encodeURIComponent(assignRepo)}/${assignIssueNum}/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ assignee }),
+    }).then(async (res) => {
+      if (res.ok) {
+        btn.textContent = "✓ Assigned";
+        // Invalidate cached detail so next open shows fresh assignees
+        detailCache.delete(`${assignRepo}/${assignIssueNum}`);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        btn.textContent = "Failed";
+        btn.style.color = "#f87171";
+        console.error("[assign] Error:", data.error);
+        setTimeout(() => {
+          btn.textContent = "Assign";
+          btn.style.color = "";
+          btn.disabled = false;
+        }, 3000);
+      }
+    }).catch((err) => {
+      console.error("[assign] Fetch error:", err);
+      btn.textContent = "Failed";
+      btn.style.color = "#f87171";
+      setTimeout(() => {
+        btn.textContent = "Assign";
+        btn.style.color = "";
+        btn.disabled = false;
+      }, 3000);
+    });
     return;
   }
 
@@ -817,6 +864,19 @@ function renderDetailOverlay(detail: any) {
     </div>
   `).join("");
 
+  // Build reassign dropdown from participants with a GitHub user
+  const assignable = participants.filter(p => p.githubUser !== null);
+  const reassignHtml = assignable.length > 0 ? `
+    <div class="detail-reassign">
+      <span class="detail-reassign-label">Reassign to:</span>
+      <select id="assign-select" class="assign-select">
+        <option value="">Select contributor...</option>
+        ${assignable.map(p => `<option value="${escapeHtml(p.githubUser!)}">${escapeHtml(p.name)} (@${escapeHtml(p.githubUser!)})</option>`).join("")}
+      </select>
+      <button class="btn-assign" id="btn-assign" data-repo="${escapeHtml(repo)}" data-issue="${detail.number}">Assign</button>
+    </div>
+  ` : "";
+
   const overlay = document.createElement("div");
   overlay.className = "detail-overlay";
   overlay.innerHTML = `
@@ -830,6 +890,7 @@ function renderDetailOverlay(detail: any) {
       <div class="detail-body">${bodyHtml}</div>
       ${commentsHtml ? `<div class="detail-comments-header">Comments (${detail.comments?.length ?? 0})</div>${commentsHtml}` : ""}
       <a class="detail-link" href="${escapeHtml(detail.url)}" target="_blank">View on GitHub</a>
+      ${reassignHtml}
     </div>
   `;
   document.body.appendChild(overlay);

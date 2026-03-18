@@ -161,6 +161,16 @@ export class StandupBot {
     }
   }
 
+  /** Clear the presenter if the disconnecting client was the one holding the role. */
+  clearPresenterIfDisconnected(guildId: string, userId: string | null) {
+    const session = this.activeSessions.get(guildId);
+    if (session && userId && session.presenter === userId) {
+      session.presenter = null;
+      this.broadcastActivityState(guildId);
+      console.log(`[bot] Presenter ${userId} disconnected — presenter role cleared`);
+    }
+  }
+
   /** Set the current presenter from Activity. Broadcasts state so all clients learn the new presenter. */
   setPresenter(guildId: string, userId: string) {
     const session = this.activeSessions.get(guildId);
