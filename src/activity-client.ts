@@ -427,7 +427,13 @@ function renderTabs(): string {
     return `<button class="tab ${active} ${speakingClass}" data-index="${i}"><span class="tab-name">${escapeHtml(p.name)}</span><span class="tab-time" id="tab-time-${i}"></span></button>`;
   }).join("");
 
-  return `<div class="tabs" id="tabs">${tabs}</div>`;
+  const allPRCount = participants.reduce((n, p) => n + (p.prs?.length ?? 0), 0);
+  const prTabIdx = participants.length;
+  const prTab = allPRCount > 0
+    ? `<button class="tab tab-pr ${activeTabIndex === prTabIdx ? "tab-active" : ""}" data-index="${prTabIdx}"><span class="tab-name">🔀 PRs</span><span class="tab-time">${allPRCount}</span></button>`
+    : "";
+
+  return `<div class="tabs" id="tabs">${tabs}${prTab}</div>`;
 }
 
 function updateTabTimes() {
@@ -443,6 +449,9 @@ function updateTabTimes() {
 }
 
 function renderBoard(): string {
+  // Virtual "All PRs" tab
+  if (activeTabIndex === participants.length) return renderAllPRsBoard();
+
   const participant = participants[activeTabIndex];
   if (!participant) return `<div class="empty-board">No participants found</div>`;
 
@@ -477,8 +486,11 @@ function renderBoard(): string {
 
   const prevIdx = activeTabIndex - 1;
   const nextIdx = activeTabIndex + 1;
+  const allPRCount = participants.reduce((n, p) => n + (p.prs?.length ?? 0), 0);
   const prevName = prevIdx >= 0 ? participants[prevIdx].name : null;
-  const nextName = nextIdx < participants.length ? participants[nextIdx].name : null;
+  const nextName = nextIdx < participants.length
+    ? participants[nextIdx].name
+    : (nextIdx === participants.length && allPRCount > 0 ? "🔀 PRs" : null);
 
   const centerBtn = renderNavCenterButton();
   const navHtml = `
@@ -674,18 +686,22 @@ document.addEventListener("click", (e) => {
     render();
     return;
   }
-  if (target.id === "btn-next" && activeTabIndex < participants.length - 1) {
-    if (syncMode && !isPresenter() && presenterUserId) enterFreestyle();
-    activeTabIndex++;
-    flushFocusTimer();
-    focusedIssue = null;
-    focusStartTime = null;
-    if (isPresenter() || !presenterUserId) {
-      sendWs({ type: "tab", participantIndex: activeTabIndex });
-      sendWs({ type: "focus", issueNumber: null });
+  if (target.id === "btn-next") {
+    const allPRCount = participants.reduce((n, p) => n + (p.prs?.length ?? 0), 0);
+    const maxIdx = participants.length - 1 + (allPRCount > 0 ? 1 : 0);
+    if (activeTabIndex < maxIdx) {
+      if (syncMode && !isPresenter() && presenterUserId) enterFreestyle();
+      activeTabIndex++;
+      flushFocusTimer();
+      focusedIssue = null;
+      focusStartTime = null;
+      if (isPresenter() || !presenterUserId) {
+        sendWs({ type: "tab", participantIndex: activeTabIndex });
+        sendWs({ type: "focus", issueNumber: null });
+      }
+      render();
+      return;
     }
-    render();
-    return;
   }
   if (target.id === "btn-controls" && currentUser) {
     // If taking control from freestyle, snap to server state first so we
@@ -865,6 +881,75 @@ function freshnessClass(iso: string): string {
   if (hours < 24) return "fresh-today";
   if (hours < 168) return "fresh-week";
   return "fresh-stale";
+}
+
+function getAllPRs(): { pr: PR; author: string }[] {
+  const result: { pr: PR; author: string }[] = [];
+  for (const p of participants) {
+    for (const pr of (p.prs ?? [])) {
+      result.push({ pr, author: p.name });
+    }
+  }
+  return result.sort((a, b) => new Date(b.pr.updatedAt).getTime() - new Date(a.pr.updatedAt).getTime());
+}
+
+function renderAllPRsBoard(): string {
+  const allPRs = getAllPRs();
+
+  if (allPRs.length === 0) {
+    return `<div class="board" id="board"><div class="empty-board">No open pull requests</div></div>`;
+  }
+
+  // Group by participant name, preserving participant order
+  const byAuthor = new Map<string, PR[]>();
+  for (const p of participants) {
+    const prs = allPRs.filter(e => e.author === p.name).map(e => e.pr);
+    if (prs.length > 0) byAuthor.set(p.name, prs);
+  }
+
+  const groupsHtml = [...byAuthor.entries()].map(([author, prs]) => {
+    const prCards = prs.map(pr => {
+      const draftClass = pr.isDraft ? " pr-card-draft" : "";
+      const draftBadge = pr.isDraft ? `<span class="badge badge-draft">draft</span>` : "";
+      const age = `<span class="issue-age ${freshnessClass(pr.updatedAt)}">${relativeTime(pr.updatedAt)}</span>`;
+      const ghLink = `<a class="gh-link" href="${escapeHtml(pr.url)}" target="_blank" title="Open PR on GitHub">↗</a>`;
+      return `
+        <div class="pr-card${draftClass}">
+          <div class="issue-header">
+            <span class="issue-number">#${pr.number}</span>
+            <span class="issue-title">${escapeHtml(pr.title)}</span>
+          </div>
+          <div class="issue-badges">${age}${draftBadge}${ghLink}</div>
+        </div>
+      `;
+    }).join("");
+    return `
+      <div class="stage-group">
+        <div class="stage-header">👤 ${escapeHtml(author)} (${prs.length})</div>
+        ${prCards}
+      </div>
+    `;
+  }).join("");
+
+  const prevName = participants.length > 0 ? participants[participants.length - 1].name : null;
+  const navHtml = `
+    <div class="board-nav">
+      <button class="nav-btn" id="btn-prev" ${!prevName ? "disabled" : ""}>${prevName ? `← ${escapeHtml(prevName)}` : "←"}</button>
+      <button class="nav-btn" disabled>🔀 All PRs</button>
+      <button class="nav-btn" id="btn-next" disabled>→</button>
+    </div>
+  `;
+
+  return `
+    <div class="board" id="board">
+      <div class="board-participant">
+        <span class="board-name">🔀 Pull Requests</span>
+        <span class="board-extra-badge">${allPRs.length} open</span>
+      </div>
+      <div class="stages">${groupsHtml}</div>
+      ${navHtml}
+    </div>
+  `;
 }
 
 function findIssue(num: number): Issue | null {

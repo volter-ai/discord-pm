@@ -239,6 +239,9 @@ const ACTIVITY_CSS = `
 
   /* Extra (unlisted) participant badge on board header */
   .board-extra-badge{font-size:.7rem;padding:.15rem .4rem;background:#292524;color:#a8a29e;border-radius:.25rem;margin-left:.5rem}
+  /* All-PRs tab distinct styling */
+  .tab-pr{border-left:1px solid #334155;margin-left:.25rem}
+  .tab-pr.tab-active{background:#1e1b4b;color:#a5b4fc;border-bottom-color:#6366f1}
 `;
 
 // ── Issue data helpers ──────────────────────────────────────────────────────
