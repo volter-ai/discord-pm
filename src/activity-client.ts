@@ -20,6 +20,15 @@ interface Issue {
   url: string;
 }
 
+interface PR {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  updatedAt: string;
+  url: string;
+  isDraft: boolean;
+}
+
 interface StageGroup {
   emoji: string;
   name: string;
@@ -31,6 +40,7 @@ interface Participant {
   githubUser: string | null;
   avatarUrl: string;
   stages: StageGroup[];
+  prs: PR[];
 }
 
 interface IssuesResponse {
@@ -72,6 +82,28 @@ let focusStartTime: number | null = null;
 const DETAIL_CACHE_MAX = 30;
 let detailCache = new Map<string, any>(); // "repo/number" → detail
 let detailFetchInFlight = false;
+
+// ── Speaker name resolver ────────────────────────────────────────────────────
+// Discord display names may not exactly match config names (e.g. "Brennan Volter" vs "Brennan").
+// This resolves a Discord display name to the canonical config participant name.
+const nameResolverCache = new Map<string, string>();
+
+function resolveParticipantName(discordName: string): string {
+  const cached = nameResolverCache.get(discordName);
+  if (cached !== undefined) return cached;
+  // 1. Exact match
+  let match = participants.find(p => p.name === discordName);
+  // 2. Case-insensitive
+  if (!match) match = participants.find(p => p.name.toLowerCase() === discordName.toLowerCase());
+  // 3. First word (handles "Brennan Volter" → "Brennan", "oliver-io" → "Oliver" etc.)
+  if (!match) {
+    const first = discordName.split(/[\s_-]+/)[0];
+    match = participants.find(p => p.name.toLowerCase() === first.toLowerCase());
+  }
+  const resolved = match ? match.name : discordName;
+  nameResolverCache.set(discordName, resolved);
+  return resolved;
+}
 
 function cacheDetail(key: string, value: any) {
   if (detailCache.size >= DETAIL_CACHE_MAX) {
@@ -198,6 +230,7 @@ async function loadStandup(key: string) {
   participants = data.participants;
   repo = data.repo;
   activeTabIndex = 0;
+  nameResolverCache.clear();
 
   connectWebSocket();
   render();
@@ -215,6 +248,7 @@ async function refreshIssues() {
     participants = data.participants;
     repo = data.repo;
     detailCache.clear();
+    nameResolverCache.clear();
     if (btn) btn.classList.remove("spinning");
     render();
   } catch (e: any) {
@@ -266,22 +300,24 @@ function sendWs(msg: object) {
 
 function handleServerMessage(msg: ServerMessage) {
   switch (msg.type) {
-    case "speaker":
+    case "speaker": {
+      const resolvedName = resolveParticipantName(msg.name);
       if (msg.speaking) {
         speakingUsers.add(msg.userId);
-        speakingNames.add(msg.name);
-        speakerStartTimes.set(msg.name, Date.now());
+        speakingNames.add(resolvedName);
+        speakerStartTimes.set(resolvedName, Date.now());
       } else {
         speakingUsers.delete(msg.userId);
-        speakingNames.delete(msg.name);
-        const start = speakerStartTimes.get(msg.name);
+        speakingNames.delete(resolvedName);
+        const start = speakerStartTimes.get(resolvedName);
         if (start !== undefined) {
-          participantTimers.set(msg.name, (participantTimers.get(msg.name) ?? 0) + (Date.now() - start));
-          speakerStartTimes.delete(msg.name);
+          participantTimers.set(resolvedName, (participantTimers.get(resolvedName) ?? 0) + (Date.now() - start));
+          speakerStartTimes.delete(resolvedName);
         }
       }
       updateSpeakerIndicators();
       break;
+    }
 
     case "utterance":
       utteranceCount++;
@@ -419,13 +455,14 @@ function renderBoard(): string {
       const bug = issue.labels.some(l => l.toLowerCase() === "bug") ? `<span class="badge badge-bug">bug</span>` : "";
       const age = `<span class="issue-age ${freshnessClass(issue.updatedAt)}">${relativeTime(issue.updatedAt)}</span>`;
       const timer = focusedIssue === issue.number ? `<span class="issue-timer" id="issue-timer-${issue.number}">${formatTime(Math.floor((issueTimers.get(issue.number) ?? 0) / 1000))}</span>` : "";
+      const ghLink = `<a class="gh-link" href="${escapeHtml(issue.url)}" target="_blank" title="Open on GitHub">↗</a>`;
       return `
         <div class="issue-card ${focused} ${closedClass}" data-issue="${issue.number}" data-url="${escapeHtml(issue.url)}" data-title="${escapeHtml(issue.title)}" data-state="${escapeHtml(issue.state)}">
           <div class="issue-header">
             <span class="issue-number" data-detail="${issue.number}">#${issue.number}</span>
             <span class="issue-title">${escapeHtml(issue.title)}</span>
           </div>
-          <div class="issue-badges">${timer}${age}${prio}${bug}</div>
+          <div class="issue-badges">${timer}${age}${prio}${bug}${ghLink}</div>
         </div>
       `;
     }).join("");
@@ -452,13 +489,42 @@ function renderBoard(): string {
     </div>
   `;
 
+  // ── PR section ──────────────────────────────────────────────────────────
+  const prsHtml = participant.prs?.length > 0 ? (() => {
+    const prCards = participant.prs.map(pr => {
+      const draftClass = pr.isDraft ? " pr-card-draft" : "";
+      const draftBadge = pr.isDraft ? `<span class="badge badge-draft">draft</span>` : "";
+      const age = `<span class="issue-age ${freshnessClass(pr.updatedAt)}">${relativeTime(pr.updatedAt)}</span>`;
+      const ghLink = `<a class="gh-link" href="${escapeHtml(pr.url)}" target="_blank" title="Open PR on GitHub">↗</a>`;
+      return `
+        <div class="pr-card${draftClass}">
+          <div class="issue-header">
+            <span class="issue-number">#${pr.number}</span>
+            <span class="issue-title">${escapeHtml(pr.title)}</span>
+          </div>
+          <div class="issue-badges">${age}${draftBadge}${ghLink}</div>
+        </div>
+      `;
+    }).join("");
+    return `
+      <div class="stage-group">
+        <div class="stage-header">🔀 Pull Requests (${participant.prs.length})</div>
+        ${prCards}
+      </div>
+    `;
+  })() : "";
+
+  // Mark participants discovered dynamically (their name equals their GitHub username)
+  const extraBadge = participant.githubUser && participant.name === participant.githubUser
+    ? `<span class="board-extra-badge">unlisted</span>` : "";
+
   return `
     <div class="board" id="board">
       <div class="board-participant">
         ${participant.avatarUrl ? `<img class="board-avatar" src="${escapeHtml(participant.avatarUrl)}" alt="">` : ""}
-        <span class="board-name">${escapeHtml(participant.name)}</span>
+        <span class="board-name">${escapeHtml(participant.name)}</span>${extraBadge}
       </div>
-      <div class="stages">${stagesHtml}</div>
+      <div class="stages">${stagesHtml}${prsHtml}</div>
       ${navHtml}
     </div>
   `;
@@ -534,6 +600,9 @@ function updateNavCenter() {
 
 document.addEventListener("click", (e) => {
   const target = e.target as HTMLElement;
+
+  // Direct GitHub link — let the browser handle it natively, don't toggle focus
+  if (target.closest(".gh-link")) return;
 
   // Tab click
   const tab = target.closest(".tab") as HTMLElement | null;

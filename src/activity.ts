@@ -25,7 +25,10 @@ import {
   fetchUserAvatar,
   fetchIssueDetail,
   assignIssue,
+  fetchOpenPRsByAuthor,
+  fetchAllOpenAssigned,
   type GitHubIssue,
+  type GitHubPR,
 } from "./github";
 import type { StandupBot } from "./bot";
 
@@ -223,6 +226,19 @@ const ACTIVITY_CSS = `
   .nav-btn-synced:hover{background:#450a0a;color:#fca5a5}
   .nav-btn-sync{background:#1e1b4b;color:#a5b4fc;border-color:#3730a3}
   .nav-btn-sync:hover{background:#2e27a0;color:#c7d2fe}
+
+  /* Direct GitHub link icon on cards */
+  .gh-link{color:#475569;font-size:.78rem;text-decoration:none;padding:.05rem .25rem;border-radius:.2rem;flex-shrink:0;transition:color .15s;line-height:1;align-self:center}
+  .gh-link:hover{color:#818cf8}
+
+  /* PR cards */
+  .pr-card{display:flex;align-items:flex-start;justify-content:space-between;background:#1e293b;border:1px solid #334155;border-radius:.375rem;padding:.5rem .75rem;margin-bottom:.25rem;gap:.5rem;cursor:default}
+  .pr-card-draft{opacity:.65;border-style:dashed}
+  .badge-draft{background:#292524;color:#a8a29e}
+  .badge-merged{background:#2d1b69;color:#a78bfa}
+
+  /* Extra (unlisted) participant badge on board header */
+  .board-extra-badge{font-size:.7rem;padding:.15rem .4rem;background:#292524;color:#a8a29e;border-radius:.25rem;margin-left:.5rem}
 `;
 
 // ── Issue data helpers ──────────────────────────────────────────────────────
@@ -251,19 +267,23 @@ function groupByStage(issues: GitHubIssue[]): StageGroupOutput[] {
 }
 
 async function fetchParticipantData(config: StandupConfig) {
-  return Promise.all(config.steps.map(async (step) => {
+  // ── Config-based participants ──────────────────────────────────────────────
+  const configParticipants = await Promise.all(config.steps.map(async (step) => {
     let allOpen: GitHubIssue[] = [];
     let recentClosed: GitHubIssue[] = [];
     let avatarUrl = "";
+    let prs: GitHubPR[] = [];
 
     if (step.type === "assignee") {
-      // Fetch recent, open issues, and avatar in parallel
-      const [recent, open, avatar] = await Promise.all([
+      // Fetch recent issues, open issues, avatar, and PRs in parallel
+      const [recent, open, avatar, fetchedPRs] = await Promise.all([
         fetchRecentlyUpdated(config.repo, step.user),
         fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel),
         fetchUserAvatar(step.user),
+        fetchOpenPRsByAuthor(config.repo, step.user),
       ]);
       avatarUrl = avatar;
+      prs = fetchedPRs;
       const recentNums = new Set(recent.map(i => i.number));
       const recentOpen = recent.filter(i => i.state === "open");
       recentClosed = recent.filter(i => i.state === "closed");
@@ -285,8 +305,52 @@ async function fetchParticipantData(config: StandupConfig) {
       githubUser: step.type === "assignee" ? step.user : null,
       avatarUrl,
       stages,
+      prs,
     };
   }));
+
+  // ── Discover extra participants not in config ──────────────────────────────
+  const configGitHubUsers = new Set<string>();
+  for (const step of config.steps) {
+    if (step.type === "assignee") configGitHubUsers.add(step.user.toLowerCase());
+  }
+
+  let allAssigned: GitHubIssue[] = [];
+  try {
+    allAssigned = await fetchAllOpenAssigned(config.repo, config.backlogLabel);
+  } catch (e: any) {
+    console.warn("[activity] fetchAllOpenAssigned failed:", e.message);
+  }
+
+  // Group issues by assignee, keeping only those not in the config
+  const extraAssigneeIssues = new Map<string, GitHubIssue[]>();
+  for (const issue of allAssigned) {
+    for (const assignee of issue.assignees) {
+      if (!configGitHubUsers.has(assignee.toLowerCase())) {
+        if (!extraAssigneeIssues.has(assignee)) extraAssigneeIssues.set(assignee, []);
+        extraAssigneeIssues.get(assignee)!.push(issue);
+      }
+    }
+  }
+
+  // Build extra participant entries
+  const extraParticipants = await Promise.all(
+    [...extraAssigneeIssues.entries()].map(async ([user, issues]) => {
+      const [avatar, prs] = await Promise.all([
+        fetchUserAvatar(user),
+        fetchOpenPRsByAuthor(config.repo, user),
+      ]);
+      return {
+        name: user,
+        githubUser: user,
+        avatarUrl: avatar,
+        stages: groupByStage(issues),
+        prs,
+      };
+    })
+  );
+
+  return [...configParticipants, ...extraParticipants];
 }
 
 // ── App factory ─────────────────────────────────────────────────────────────

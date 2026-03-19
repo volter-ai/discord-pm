@@ -360,28 +360,31 @@ function suggestionsSection(id: number): string {
   return `
     <div class="suggest-section" id="suggest-box" data-id="${id}">
       <h2>AI Suggested GitHub Actions</h2>
-      <button class="suggest-btn" id="btn-suggest" onclick="window._generateSuggestions()">Generate Suggestions</button>
+      <button class="suggest-btn" id="btn-suggest">Generate Suggestions</button>
       <div id="suggestion-list" style="margin-top:1rem"></div>
     </div>
     <script>
 (function() {
   var transcriptId = '${id}';
   var _sugg = [];
-  function h(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-  window._generateSuggestions = async function() {
+  function h(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/\x3c/g,'&lt;').replace(/\x3e/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function generateSuggestions() {
     var btn = document.getElementById('btn-suggest');
     btn.disabled = true; btn.textContent = 'Generating\u2026 (10\u201315s)';
-    try {
-      var res = await fetch('/transcripts/' + transcriptId + '/suggestions');
+    fetch('/transcripts/' + transcriptId + '/suggestions').then(function(res) {
       if (!res.ok) throw new Error('Server error: ' + res.status);
-      _sugg = await res.json();
+      return res.json();
+    }).then(function(data) {
+      _sugg = data;
       var list = document.getElementById('suggestion-list');
       btn.style.display = 'none';
       if (!_sugg.length) { list.innerHTML = '<p class="sug-empty">No suggestions generated.</p>'; return; }
       list.innerHTML = _sugg.map(function(s,i) {
-        var type = s.type === 'new_issue'
-          ? '&#128221; New Issue'
-          : '&#128172; Comment on <a href="https://github.com/' + h(s.repo) + '/issues/' + s.issueNumber + '" target="_blank" style="color:#818cf8">#' + s.issueNumber + (s.issueTitle ? ' \u2014 ' + h(s.issueTitle) : '') + '</a>';
+        var ghLink = 'https://github.com/' + h(s.repo) + '/issues/' + s.issueNumber;
+        var issueAnchor = '<a href="' + ghLink + '" target="_blank" style="color:#818cf8">#' + s.issueNumber + (s.issueTitle ? ' \u2014 ' + h(s.issueTitle) : '') + '</a>';
+        var type = s.type === 'new_issue' ? '&#128221; New Issue' : '&#128172; Comment on ' + issueAnchor;
         var titleRow = s.title ? '<div class="sug-title">' + h(s.title) + '</div>' : '';
         return '<div class="suggestion-card" id="sug-'+i+'">'+
           '<div class="sug-type">'+type+'</div>'+
@@ -389,32 +392,38 @@ function suggestionsSection(id: number): string {
           '<pre class="sug-body">'+h(s.body)+'</pre>'+
           '<div class="sug-reasoning">'+h(s.reasoning)+'</div>'+
           '<div class="sug-actions">'+
-            '<button class="sug-btn sug-apply" onclick="window._applySugg('+i+')">&#10003; Apply to GitHub</button> '+
-            '<button class="sug-btn sug-dismiss" onclick="document.getElementById(\'sug-'+i+'\').remove()">&#10007; Dismiss</button>'+
+            '<button class="sug-btn sug-apply" data-idx="'+i+'">&#10003; Apply to GitHub</button> '+
+            '<button class="sug-btn sug-dismiss" data-idx="'+i+'">&#10007; Dismiss</button>'+
           '</div>'+
         '</div>';
       }).join('');
-    } catch(e) { btn.textContent = '! Failed \u2014 retry'; btn.disabled = false; }
-  };
-  window._applySugg = async function(i) {
+    }).catch(function() { btn.textContent = '! Failed \u2014 retry'; btn.disabled = false; });
+  }
+  function applySugg(i) {
     var s = _sugg[i];
     var card = document.getElementById('sug-'+i);
     var btn = card.querySelector('.sug-apply');
     btn.disabled = true; btn.textContent = 'Applying\u2026';
-    try {
-      var res = await fetch('/transcripts/' + transcriptId + '/suggestions/apply', {
-        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(s)
-      });
+    fetch('/transcripts/' + transcriptId + '/suggestions/apply', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(s)
+    }).then(function(res) {
       if (!res.ok) throw new Error('Error: ' + res.status);
-      var result = await res.json();
+      return res.json();
+    }).then(function(result) {
       btn.textContent = '&#10003; Applied'; btn.style.background='#14532d'; btn.style.color='#86efac';
       if (result.url) {
         var a = document.createElement('a'); a.href=result.url; a.target='_blank';
         a.style.cssText='color:#818cf8;font-size:.8rem;margin-left:.5rem'; a.textContent='View on GitHub \u2197';
         btn.parentNode.insertBefore(a, btn.nextSibling);
       }
-    } catch(e) { btn.textContent='! Failed'; btn.disabled=false; btn.style.background='#450a0a'; }
-  };
+    }).catch(function() { btn.textContent='! Failed'; btn.disabled=false; btn.style.background='#450a0a'; });
+  }
+  document.getElementById('btn-suggest').addEventListener('click', generateSuggestions);
+  document.getElementById('suggestion-list').addEventListener('click', function(e) {
+    var t = e.target;
+    if (t.classList.contains('sug-apply')) { applySugg(parseInt(t.dataset.idx)); }
+    if (t.classList.contains('sug-dismiss')) { document.getElementById('sug-'+t.dataset.idx).remove(); }
+  });
 })();
     </script>
   `;

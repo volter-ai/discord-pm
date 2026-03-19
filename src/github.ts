@@ -13,6 +13,16 @@ export interface GitHubIssue {
   labels: string[];
   updatedAt: string;
   url: string;
+  assignees: string[];
+}
+
+export interface GitHubPR {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  updatedAt: string;
+  url: string;
+  isDraft: boolean;
 }
 
 function headers(): Record<string, string> {
@@ -35,6 +45,7 @@ function parseIssues(raw: any[]): GitHubIssue[] {
       labels: (i.labels ?? []).map((l: any) => l.name),
       updatedAt: i.updated_at,
       url: i.html_url,
+      assignees: (i.assignees ?? []).map((a: any) => a.login as string),
     }));
 }
 
@@ -135,6 +146,7 @@ export async function fetchIssueDetail(
     labels: (issue.labels ?? []).map((l: any) => l.name),
     updatedAt: issue.updated_at,
     url: issue.html_url,
+    assignees: (issue.assignees ?? []).map((a: any) => a.login as string),
     body: issue.body ?? "",
     comments: rawComments.reverse().map((c: any) => ({
       user: c.user?.login ?? "unknown",
@@ -206,6 +218,48 @@ export async function fetchOpenNonBacklog(
   const { items, total_count } = await res.json();
   if (total_count > items.length) {
     console.warn(`[github] fetchOpenNonBacklog: got ${items.length}/${total_count} issues for ${repo} — results truncated`);
+  }
+  return parseIssues(items);
+}
+
+/**
+ * Fetch open PRs authored by a GitHub user in a repo.
+ */
+export async function fetchOpenPRsByAuthor(repo: string, author: string): Promise<GitHubPR[]> {
+  const q = `is:pr repo:${repo} is:open author:${author}`;
+  const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "30" });
+  const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
+    headers: headers(),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+  const { items } = await res.json();
+  return (items ?? []).map((i: any) => ({
+    number: i.number,
+    title: i.title,
+    state: i.state as "open" | "closed",
+    updatedAt: i.updated_at,
+    url: i.html_url,
+    isDraft: i.draft ?? false,
+  }));
+}
+
+/**
+ * Fetch ALL open assigned issues for a repo (no assignee filter),
+ * used to discover participants not listed in the standup config.
+ */
+export async function fetchAllOpenAssigned(repo: string, backlogLabel: string): Promise<GitHubIssue[]> {
+  const escapedLabel = backlogLabel.replace(/"/g, '\\"');
+  const q = `is:issue repo:${repo} is:open is:assigned -label:"${escapedLabel}"`;
+  const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "100" });
+  const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
+    headers: headers(),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+  const { items, total_count } = await res.json();
+  if (total_count > items.length) {
+    console.warn(`[github] fetchAllOpenAssigned: got ${items.length}/${total_count} — results truncated`);
   }
   return parseIssues(items);
 }
