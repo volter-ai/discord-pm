@@ -251,15 +251,19 @@ function groupByStage(issues: GitHubIssue[]): StageGroupOutput[] {
 }
 
 async function fetchParticipantData(config: StandupConfig) {
-  const results = [];
-
-  for (const step of config.steps) {
+  return Promise.all(config.steps.map(async (step) => {
     let allOpen: GitHubIssue[] = [];
     let recentClosed: GitHubIssue[] = [];
+    let avatarUrl = "";
 
     if (step.type === "assignee") {
-      const recent = await fetchRecentlyUpdated(config.repo, step.user);
-      const open = await fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel);
+      // Fetch recent, open issues, and avatar in parallel
+      const [recent, open, avatar] = await Promise.all([
+        fetchRecentlyUpdated(config.repo, step.user),
+        fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel),
+        fetchUserAvatar(step.user),
+      ]);
+      avatarUrl = avatar;
       const recentNums = new Set(recent.map(i => i.number));
       const recentOpen = recent.filter(i => i.state === "open");
       recentClosed = recent.filter(i => i.state === "closed");
@@ -269,10 +273,6 @@ async function fetchParticipantData(config: StandupConfig) {
       allOpen = await fetchOpenNonBacklog(config.repo, null, config.backlogLabel);
     }
 
-    const avatarUrl = step.type === "assignee"
-      ? await fetchUserAvatar(step.user)
-      : "";
-
     // Build stage groups: recently closed first, then open by stage
     const stages: StageGroupOutput[] = [];
     if (recentClosed.length > 0) {
@@ -280,15 +280,13 @@ async function fetchParticipantData(config: StandupConfig) {
     }
     stages.push(...groupByStage(allOpen));
 
-    results.push({
+    return {
       name: step.name,
       githubUser: step.type === "assignee" ? step.user : null,
       avatarUrl,
       stages,
-    });
-  }
-
-  return results;
+    };
+  }));
 }
 
 // ── App factory ─────────────────────────────────────────────────────────────
@@ -360,7 +358,10 @@ export function createActivityApp(
 
     const config = STANDUPS[standupKey];
     try {
-      const participants = await fetchParticipantData(config);
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Issues fetch timed out after 25s")), 25_000)
+      );
+      const participants = await Promise.race([fetchParticipantData(config), timeout]);
       return c.json({
         standupKey,
         repo: config.repo,

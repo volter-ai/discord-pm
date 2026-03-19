@@ -189,7 +189,9 @@ function renderStandupPicker() {
 async function loadStandup(key: string) {
   app.innerHTML = `<div class="loading">Loading issues for ${escapeHtml(key)}...</div>`;
 
-  const res = await fetch(`/api/issues?standup=${encodeURIComponent(key)}`);
+  const res = await fetch(`/api/issues?standup=${encodeURIComponent(key)}`, {
+    signal: AbortSignal.timeout(30_000),
+  });
   if (!res.ok) throw new Error(`Failed to fetch issues: ${res.status}`);
 
   const data: IssuesResponse = await res.json();
