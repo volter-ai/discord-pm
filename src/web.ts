@@ -44,7 +44,12 @@ function checkAuth(req: Request): boolean {
   if (!PASSWORD) return false; // block all if no password configured
   const auth = req.headers.get("Authorization");
   if (!auth?.startsWith("Basic ")) return false;
-  const decoded = atob(auth.slice(6));
+  let decoded: string;
+  try {
+    decoded = atob(auth.slice(6));
+  } catch {
+    return false; // malformed Base64 → 401 not 500
+  }
   const colon = decoded.indexOf(":");
   const pass = colon >= 0 ? decoded.slice(colon + 1) : decoded;
   return pass === PASSWORD;
@@ -365,7 +370,7 @@ function suggestionsSection(id: number): string {
     </div>
     <script>
 (function() {
-  var transcriptId = '${id}';
+  var transcriptId = ${JSON.stringify(Number(id))};
   var _sugg = [];
   function h(s) {
     return String(s||'').replace(/&/g,'&amp;').replace(/\x3c/g,'&lt;').replace(/\x3e/g,'&gt;').replace(/"/g,'&quot;');
@@ -587,7 +592,7 @@ function detailPage(r: Row, segments: SegmentRow[]) {
   return page(`#${r.id}`, `
     <a class="back" href="/">← All transcripts</a>
     <h1>Standup #${r.id}</h1>
-    <p class="meta">${fmtDate(r.started_at)} &nbsp;·&nbsp; ${fmtDuration(r.started_at, r.ended_at)} &nbsp;·&nbsp; Channel ${r.channel_id}</p>
+    <p class="meta">${fmtDate(r.started_at)} &nbsp;·&nbsp; ${fmtDuration(r.started_at, r.ended_at)} &nbsp;·&nbsp; Channel ${esc(r.channel_id)}</p>
 
     <h2>Summary</h2>
     <div class="summary-box">${esc(r.summary)}</div>
@@ -607,7 +612,12 @@ function detailPage(r: Row, segments: SegmentRow[]) {
 }
 
 function esc(s: string) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // ── App factory ─────────────────────────────────────────────────────────────
@@ -713,12 +723,19 @@ export function createWebApp(): Hono {
       return c.json(suggestions);
     } catch (e: any) {
       console.error("[web] suggestGitHubActions error:", e.message);
-      return c.json({ error: e.message }, 500);
+      return c.json({ error: "Internal server error" }, 500);
     }
   });
 
   // Apply a suggestion to GitHub
   app.post("/transcripts/:id/suggestions/apply", async (c) => {
+    // CSRF: reject cross-origin requests.
+    const origin = c.req.header("origin");
+    const host = c.req.header("host");
+    if (origin && host && new URL(origin).host !== host) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+
     const id = parseInt(c.req.param("id"));
     if (isNaN(id)) return c.json({ error: "invalid id" }, 400);
 
@@ -739,7 +756,7 @@ export function createWebApp(): Hono {
       return c.json({ error: "Unknown type" }, 400);
     } catch (e: any) {
       console.error("[web] apply suggestion error:", e.message);
-      return c.json({ error: e.message }, 500);
+      return c.json({ error: "Internal server error" }, 500);
     }
   });
 

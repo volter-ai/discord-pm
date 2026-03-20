@@ -25,6 +25,13 @@ const CHANNELS = 2;
 /** Default auto-stop after 60 minutes to prevent runaway memory usage. */
 const DEFAULT_MAX_DURATION_MS = 60 * 60 * 1000;
 
+/**
+ * Max Opus packets per utterance before auto-flushing (~30s at 50 packets/sec).
+ * Prevents unbounded memory if speaking.end never fires (abrupt disconnect, OS mute).
+ * Also keeps Whisper segments short enough for good transcription accuracy.
+ */
+const MAX_UTTERANCE_CHUNKS = 50 * 30; // 1500 chunks ≈ 30 seconds
+
 /** Max reconnection attempts before giving up. */
 const MAX_RECONNECT_ATTEMPTS = 3;
 
@@ -249,6 +256,12 @@ export class Recorder {
           utterance.startedAt = Date.now();
         }
         utterance.pcmSamples.push(float32);
+        // Auto-flush long utterances to prevent OOM if speaking.end never fires.
+        if (utterance.pcmSamples.length >= MAX_UTTERANCE_CHUNKS) {
+          this.callbacks?.onUtterance(utterance);
+          const m = this.memberCache.get(userId) ?? member;
+          this.activeUtterances.set(userId, { userId, member: m, pcmSamples: [], startedAt: Date.now() });
+        }
       } catch (e: any) {
         decodeErrors++;
         if (decodeErrors <= 3) {
@@ -335,7 +348,13 @@ export class Recorder {
     const mono = new Float32Array(monoLen);
     for (let i = 0; i < monoLen; i++) {
       const base = i * CHANNELS * 3;
-      mono[i] = (stereo[base] + stereo[base + 1]) / 2;
+      // Box filter: average 3 consecutive stereo frames into 1 mono sample.
+      // This eliminates aliasing from naive point-sampling (sibilants, high harmonics)
+      // and significantly improves Whisper transcription quality.
+      const s0 = (stereo[base]     + stereo[base + 1]) / 2;
+      const s1 = (stereo[base + 2] + stereo[base + 3]) / 2;
+      const s2 = (stereo[base + 4] + stereo[base + 5]) / 2;
+      mono[i] = (s0 + s1 + s2) / 3;
     }
     return mono;
   }

@@ -45,6 +45,8 @@ interface SessionMeta {
   type: "standup" | "meeting";
   startedAt: Date;
   channelId: string;
+  /** Text channel ID stored at start — used to post results when interaction token expires. */
+  textChannelId: string;
   /** Lines transcribed incrementally during the meeting. */
   lines: TranscribedLine[];
   /** Number of transcriptions currently in-flight. */
@@ -72,6 +74,9 @@ interface SessionMeta {
   issueMeta: Map<number, { title: string; state: string }>;
 }
 
+/** Drain timeout: 5 minutes max wait for transcriptions after stop. */
+const DRAIN_TIMEOUT_MS = 300_000;
+
 export class StandupBot {
   private client: Client;
   private recorder = new Recorder();
@@ -79,6 +84,8 @@ export class StandupBot {
   private summarizer: Summarizer;
   private store = new StandupStore();
   private activeSessions = new Map<string, SessionMeta>();
+  /** Guards against concurrent finishRecording calls for the same guild. */
+  private stoppingGuilds = new Set<string>();
 
   constructor() {
     this.summarizer = new Summarizer(process.env.ANTHROPIC_API_KEY!);
@@ -123,20 +130,11 @@ export class StandupBot {
     }
   }
 
-  /** Remove an Activity WebSocket client. */
-  removeActivityClient(guildId: string) {
+  /** Remove a specific Activity WebSocket client by reference. */
+  removeActivityClient(guildId: string, ws: any) {
     const session = this.activeSessions.get(guildId);
     if (session) {
-      // Remove any closed connections
-      for (const ws of session.activityClients) {
-        try {
-          if (ws.readyState !== undefined && ws.readyState > 1) {
-            session.activityClients.delete(ws);
-          }
-        } catch {
-          session.activityClients.delete(ws);
-        }
-      }
+      session.activityClients.delete(ws);
     }
   }
 
@@ -430,6 +428,7 @@ export class StandupBot {
       type: "standup",
       startedAt: new Date(),
       channelId: voiceChannel.id,
+      textChannelId: interaction.channelId,
       lines: [],
       inflight: 0,
       queue: [],
@@ -500,7 +499,7 @@ export class StandupBot {
 
   /** Auto-stop triggered by timeout or disconnect — posts results to the original channel. */
   private async autoStop(interaction: any, guildId: string) {
-    if (!this.recorder.isRecording) return;
+    if (!this.activeSessions.has(guildId)) return;
 
     try {
       const channel = interaction.channel;
@@ -516,17 +515,17 @@ export class StandupBot {
   private async handleStop(interaction: any) {
     await interaction.deferReply();
 
-    if (!this.recorder.isRecording) {
+    const guildId = interaction.guildId!;
+    const session = this.activeSessions.get(guildId);
+    if (!session) {
       return interaction.followUp("No active recording found.");
     }
-
-    const session = this.activeSessions.get(interaction.guildId!);
-    if (session?.type === "meeting") {
+    if (session.type === "meeting") {
       return interaction.followUp("A meeting is being recorded. Use `/meeting stop` to stop it.");
     }
 
     await interaction.followUp("Recording stopped — processing…");
-    await this.finishRecording(interaction, interaction.guildId!);
+    await this.finishRecording(interaction, guildId);
   }
 
   // ── /meeting start ────────────────────────────────────────────────────
@@ -550,6 +549,7 @@ export class StandupBot {
       type: "meeting",
       startedAt: new Date(),
       channelId: voiceChannel.id,
+      textChannelId: interaction.channelId,
       lines: [],
       inflight: 0,
       queue: [],
@@ -602,21 +602,33 @@ export class StandupBot {
   private async handleMeetingStop(interaction: any) {
     await interaction.deferReply();
 
-    if (!this.recorder.isRecording) {
+    const guildId = interaction.guildId!;
+    const session = this.activeSessions.get(guildId);
+    if (!session) {
       return interaction.followUp("No active recording found.");
     }
-
-    const session = this.activeSessions.get(interaction.guildId!);
-    if (session?.type === "standup") {
+    if (session.type === "standup") {
       return interaction.followUp("A standup is being recorded. Use `/standup stop` to stop it.");
     }
 
     await interaction.followUp("Recording stopped — processing…");
-    await this.finishRecording(interaction, interaction.guildId!);
+    await this.finishRecording(interaction, guildId);
   }
 
   /** Shared stop logic: drain transcription queue, summarize, post results. */
   private async finishRecording(interaction: any, guildId: string) {
+    // Prevent concurrent stop calls for the same guild.
+    if (this.stoppingGuilds.has(guildId)) return;
+    this.stoppingGuilds.add(guildId);
+
+    try {
+      await this._finishRecordingInner(interaction, guildId);
+    } finally {
+      this.stoppingGuilds.delete(guildId);
+    }
+  }
+
+  private async _finishRecordingInner(interaction: any, guildId: string) {
     const session = this.activeSessions.get(guildId);
     const endedAt = new Date();
     const startedAt = session?.startedAt ?? endedAt;
@@ -637,7 +649,16 @@ export class StandupBot {
         await interaction.followUp?.(`Finishing ${totalPending} remaining transcription(s)…`);
       } catch { /* interaction may be expired */ }
     }
-    await this.waitForDrain(guildId);
+    try {
+      await Promise.race([
+        this.waitForDrain(guildId),
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error("Drain timed out")), DRAIN_TIMEOUT_MS)
+        ),
+      ]);
+    } catch (e: any) {
+      console.error(`[bot] ${e.message} — proceeding with available transcriptions.`);
+    }
 
     // Close Activity WebSocket clients
     if (session) {
@@ -716,14 +737,14 @@ export class StandupBot {
           });
         this.store.saveSegments(recordId, segments);
       }
+      const failMsg = `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`;
       try {
-        await interaction.followUp?.(
-          `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
-        );
+        await interaction.followUp?.(failMsg);
       } catch {
-        await interaction.channel?.send(
-          `Summarization failed — transcript saved. View at: ${webUrl}/transcripts/${recordId}`
-        );
+        const channel = session.textChannelId
+          ? this.client.channels.cache.get(session.textChannelId)
+          : interaction.channel;
+        if (channel && "send" in channel) await (channel as any).send(failMsg);
       }
       return;
     }
@@ -759,7 +780,7 @@ export class StandupBot {
     }
 
     const label = session.type === "meeting" ? "Meeting" : "Standup";
-    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, webUrl, label);
+    await this.postSummaryEmbed(interaction, summaryResult, startedAt, endedAt, recordId, webUrl, label, session.textChannelId);
   }
 
   /** Build an issue-organized transcript string for the issue-aware summarizer. */
@@ -789,7 +810,8 @@ export class StandupBot {
     endedAt: Date,
     recordId: number,
     webUrl: string,
-    label = "Standup"
+    label = "Standup",
+    textChannelId?: string,
   ) {
     const duration = Math.round((endedAt.getTime() - startedAt.getTime()) / 1000);
     const min = Math.floor(duration / 60);
@@ -804,17 +826,20 @@ export class StandupBot {
       .setFooter({ text: `${names}  •  ${min}m ${sec}s  •  #${recordId}` })
       .setTimestamp(endedAt);
 
+    const content = `Full transcript: ${webUrl}/transcripts/${recordId}`;
+
     try {
-      await interaction.followUp({
-        content: `Full transcript: ${webUrl}/transcripts/${recordId}`,
-        embeds: [embed],
-      });
+      await interaction.followUp({ content, embeds: [embed] });
     } catch {
-      // Interaction expired (auto-stop after long meeting) — send to channel directly.
-      await interaction.channel?.send({
-        content: `Full transcript: ${webUrl}/transcripts/${recordId}`,
-        embeds: [embed],
-      });
+      // Interaction token expired (long meeting) — send directly via stored channel ID.
+      const channel = textChannelId
+        ? this.client.channels.cache.get(textChannelId)
+        : interaction.channel;
+      if (channel && "send" in channel) {
+        await (channel as any).send({ content, embeds: [embed] });
+      } else {
+        console.error("[bot] Could not find text channel to post summary.");
+      }
     }
   }
 

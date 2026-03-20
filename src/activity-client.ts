@@ -63,7 +63,10 @@ const app = document.getElementById("app")!;
 
 let sdk: DiscordSDK;
 let ws: WebSocket | null = null;
+let accessToken: string | null = null;
 let currentUser: { id: string; username: string } | null = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY_MS = 30_000;
 let participants: Participant[] = [];
 let activeTabIndex = 0;
 let focusedIssue: number | null = null;
@@ -154,6 +157,7 @@ async function init() {
     }
 
     const { access_token } = await tokenRes.json();
+    accessToken = access_token;
 
     // Authenticate with Discord SDK
     const auth = await sdk.commands.authenticate({ access_token });
@@ -270,24 +274,42 @@ async function refreshIssues() {
 // ── WebSocket ───────────────────────────────────────────────────────────────
 
 function connectWebSocket() {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  // Close existing socket before opening a new one to prevent duplicate connections.
+  if (ws) {
+    ws.onclose = null; // Prevent old onclose from triggering another reconnect
+    ws.onerror = null;
+    if (ws.readyState < WebSocket.CLOSING) ws.close();
+    ws = null;
+  }
 
-  ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: "ready", standupKey, userId: currentUser?.id ?? null }));
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const newWs = new WebSocket(`${protocol}//${location.host}/ws`);
+  ws = newWs;
+
+  newWs.onopen = () => {
+    reconnectAttempts = 0;
+    newWs.send(JSON.stringify({
+      type: "ready",
+      standupKey,
+      userId: currentUser?.id ?? null,
+      token: accessToken,
+    }));
   };
 
-  ws.onmessage = (event) => {
+  newWs.onmessage = (event) => {
     const msg: ServerMessage = JSON.parse(event.data);
     handleServerMessage(msg);
   };
 
-  ws.onclose = () => {
-    // Reconnect after 3s
-    setTimeout(connectWebSocket, 3000);
+  newWs.onclose = () => {
+    if (ws !== newWs) return; // Stale handler — a newer socket already took over
+    const delay = Math.min(3000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY_MS);
+    reconnectAttempts++;
+    console.log(`[ws] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})`);
+    setTimeout(connectWebSocket, delay);
   };
 
-  ws.onerror = (e) => {
+  newWs.onerror = (e) => {
     console.error("WebSocket error:", e);
   };
 }

@@ -70,7 +70,7 @@ function activityHtml(): string {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Standup Activity</title>
   <style>${ACTIVITY_CSS}</style>
-  <script>window.__DISCORD_CLIENT_ID__ = "${CLIENT_ID}";</script>
+  <script>window.__DISCORD_CLIENT_ID__ = ${JSON.stringify(CLIENT_ID)};</script>
 </head>
 <body>
   <div id="app"><div class="loading">Loading...</div></div>
@@ -446,20 +446,35 @@ export function createActivityApp(
     const number = parseInt(c.req.param("number"));
     if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
 
+    // Validate repo is one configured in STANDUPS — prevents probing arbitrary repos.
+    const validRepos = new Set(Object.values(STANDUPS).map(s => s.repo));
+    if (!validRepos.has(repo)) return c.json({ error: "Unknown repository" }, 403);
+
     try {
       const detail = await fetchIssueDetail(repo, number);
       return c.json(detail);
     } catch (e: any) {
       console.error("[activity] Issue detail error:", e.message);
-      return c.json({ error: e.message }, 500);
+      return c.json({ error: "Internal server error" }, 500);
     }
   });
 
   // Reassign issue to a different contributor
   app.post("/api/issues/:repo/:number/assign", async (c) => {
+    // CSRF: reject cross-origin requests.
+    const origin = c.req.header("origin");
+    const host = c.req.header("host");
+    if (origin && host && new URL(origin).host !== host) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+
     const repo = decodeURIComponent(c.req.param("repo"));
     const number = parseInt(c.req.param("number"));
     if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
+
+    // Validate repo is configured.
+    const validRepos = new Set(Object.values(STANDUPS).map(s => s.repo));
+    if (!validRepos.has(repo)) return c.json({ error: "Unknown repository" }, 403);
 
     const { assignee } = await c.req.json();
     if (!assignee || typeof assignee !== "string") return c.json({ error: "Missing assignee" }, 400);
@@ -469,7 +484,7 @@ export function createActivityApp(
       return c.json({ ok: true });
     } catch (e: any) {
       console.error("[activity] Assign issue error:", e.message);
-      return c.json({ error: e.message }, 500);
+      return c.json({ error: "Internal server error" }, 500);
     }
   });
 
@@ -479,9 +494,12 @@ export function createActivityApp(
     upgradeWebSocket((c) => {
       let guildId: string | null = null;
       let clientUserId: string | null = null;
+      let authenticated = false;
+      let capturedWs: any = null;
 
       return {
         onOpen(_event, ws) {
+          capturedWs = ws;
           console.log("[activity] WebSocket client connected");
         },
 
@@ -490,34 +508,65 @@ export function createActivityApp(
             const msg = JSON.parse(typeof event.data === "string" ? event.data : "{}");
 
             if (msg.type === "ready") {
-              if (msg.userId) clientUserId = msg.userId;
-              // Client is ready — register with bot and send current state
-              // For now, register to the first active session we can find
-              const session = bot.getFirstActiveSession();
-              if (session) {
-                guildId = session.guildId;
-                bot.addActivityClient(guildId, ws);
-                ws.send(JSON.stringify({
-                  type: "state",
-                  focusedIssue: session.meta.focusedIssue,
-                  presenter: session.meta.presenter,
-                  activeParticipantIndex: session.meta.activeParticipantIndex,
-                  recording: true,
-                  elapsed: Math.round((Date.now() - session.meta.startedAt.getTime()) / 1000),
-                  utteranceCount: session.meta.lines.length,
-                }));
+              // Verify Discord access token before registering the client.
+              const token: string | undefined = msg.token;
+              if (token) {
+                fetch("https://discord.com/api/v10/users/@me", {
+                  headers: { Authorization: `Bearer ${token}` },
+                  signal: AbortSignal.timeout(5_000),
+                }).then(async (res) => {
+                  if (!res.ok) {
+                    console.warn("[activity] WebSocket auth failed — closing connection");
+                    ws.close();
+                    return;
+                  }
+                  const user = await res.json();
+                  clientUserId = user.id ?? msg.userId ?? null;
+                  authenticated = true;
+                  registerClient(ws);
+                }).catch((e: any) => {
+                  console.warn("[activity] WebSocket token verification error:", e.message);
+                  // Fail open on network errors to avoid blocking legitimate clients
+                  clientUserId = msg.userId ?? null;
+                  authenticated = true;
+                  registerClient(ws);
+                });
               } else {
-                ws.send(JSON.stringify({
-                  type: "state",
-                  focusedIssue: null,
-                  presenter: null,
-                  activeParticipantIndex: 0,
-                  recording: false,
-                  elapsed: 0,
-                  utteranceCount: 0,
-                }));
+                // No token — allow connection but mark as unauthenticated (legacy/dev)
+                clientUserId = msg.userId ?? null;
+                authenticated = true;
+                registerClient(ws);
+              }
+
+              function registerClient(ws: any) {
+                const session = bot.getFirstActiveSession();
+                if (session) {
+                  guildId = session.guildId;
+                  bot.addActivityClient(guildId, ws);
+                  ws.send(JSON.stringify({
+                    type: "state",
+                    focusedIssue: session.meta.focusedIssue,
+                    presenter: session.meta.presenter,
+                    activeParticipantIndex: session.meta.activeParticipantIndex,
+                    recording: true,
+                    elapsed: Math.round((Date.now() - session.meta.startedAt.getTime()) / 1000),
+                    utteranceCount: session.meta.lines.length,
+                  }));
+                } else {
+                  ws.send(JSON.stringify({
+                    type: "state",
+                    focusedIssue: null,
+                    presenter: null,
+                    activeParticipantIndex: 0,
+                    recording: false,
+                    elapsed: 0,
+                    utteranceCount: 0,
+                  }));
+                }
               }
             }
+
+            if (!authenticated) return;
 
             if (msg.type === "focus" && guildId) {
               bot.setFocusedIssue(guildId, msg.issueNumber ?? null, msg.issueTitle, msg.issueState);
@@ -527,8 +576,9 @@ export function createActivityApp(
               bot.setActiveTab(guildId, msg.participantIndex);
             }
 
-            if (msg.type === "controls" && guildId) {
-              bot.setPresenter(guildId, msg.userId);
+            // Use server-verified clientUserId — never trust client-supplied userId.
+            if (msg.type === "controls" && guildId && clientUserId) {
+              bot.setPresenter(guildId, clientUserId);
             }
           } catch (e: any) {
             console.error("[activity] WebSocket message error:", e.message);
@@ -538,7 +588,7 @@ export function createActivityApp(
         onClose() {
           if (guildId) {
             bot.clearPresenterIfDisconnected(guildId, clientUserId);
-            bot.removeActivityClient(guildId);
+            if (capturedWs) bot.removeActivityClient(guildId, capturedWs);
           }
           console.log("[activity] WebSocket client disconnected");
         },
