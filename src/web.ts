@@ -739,7 +739,11 @@ export function createWebApp(): Hono {
     // CSRF: reject cross-origin requests.
     const origin = c.req.header("origin");
     const host = c.req.header("host");
-    if (origin && host && new URL(origin).host !== host) {
+    try {
+      if (origin && host && new URL(origin).host !== host) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+    } catch {
       return c.json({ error: "Forbidden" }, 403);
     }
 

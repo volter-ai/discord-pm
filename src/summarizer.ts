@@ -257,6 +257,9 @@ Guidelines:
     if (!block || block.type !== "text") {
       throw new Error("Summarizer: no text block in response");
     }
+    if (response.stop_reason === "max_tokens") {
+      throw new Error(`Summarizer: response truncated at max_tokens (${response.usage?.output_tokens} tokens) — transcript may be too long`);
+    }
     const text = block.text;
 
     // Strip markdown fences if present, then find the outermost JSON object

@@ -109,6 +109,9 @@ export class Transcriber {
       });
       prediction = await poll.json();
     }
+    if (prediction.status === "failed" || prediction.status === "canceled") {
+      throw new Error(`Replicate prediction ${prediction.status}: ${prediction.error ?? "unknown error"}`);
+    }
     return (prediction.output?.text ?? prediction.output?.transcription ?? "").trim();
   }
 }

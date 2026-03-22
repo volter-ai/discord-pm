@@ -39,7 +39,7 @@ const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET ?? "";
 
 let clientBundle = "console.error('Bundle not built yet');";
 
-async function buildClientBundle() {
+async function buildClientBundle(): Promise<void> {
   try {
     const result = await Bun.build({
       entrypoints: ["./src/activity-client.ts"],
@@ -57,8 +57,8 @@ async function buildClientBundle() {
   }
 }
 
-// Build immediately
-buildClientBundle();
+// Build immediately — store promise so /bundle.js can await it on cold start
+const bundleReady = buildClientBundle();
 
 // ── Activity HTML shell ─────────────────────────────────────────────────────
 
@@ -372,8 +372,9 @@ export function createActivityApp(
     return c.html(activityHtml());
   });
 
-  // Serve bundled client JS
-  app.get("/bundle.js", (c) => {
+  // Serve bundled client JS — await build completion on cold starts
+  app.get("/bundle.js", async (c) => {
+    await bundleReady;
     console.log(`[activity] Serving bundle.js (${clientBundle.length} bytes)`);
     return new Response(clientBundle, {
       headers: { "Content-Type": "application/javascript; charset=utf-8" },
@@ -494,7 +495,11 @@ export function createActivityApp(
     // CSRF: reject cross-origin requests.
     const origin = c.req.header("origin");
     const host = c.req.header("host");
-    if (origin && host && new URL(origin).host !== host) {
+    try {
+      if (origin && host && new URL(origin).host !== host) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+    } catch {
       return c.json({ error: "Forbidden" }, 403);
     }
 

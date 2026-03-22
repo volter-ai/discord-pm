@@ -209,7 +209,13 @@ function renderStandupPicker() {
         btn.textContent = name;
         btn.onclick = () => {
           standupKey = name;
-          loadStandup(name);
+          loadStandup(name).catch((e: any) => {
+            app.innerHTML = `<div class="error">
+              <h2>Failed to load standup</h2>
+              <p>${escapeHtml(e.message)}</p>
+              <button onclick="location.reload()">Retry</button>
+            </div>`;
+          });
         };
         container.appendChild(btn);
       }

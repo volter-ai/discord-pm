@@ -182,7 +182,7 @@ export class Recorder {
         // Attempt reconnection with exponential backoff.
         let reconnected = false;
         for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
-          if (!this.connection) break; // stop() called concurrently
+          if (this.stopping || !this.connection) break; // stop() called concurrently
           console.warn(`[recorder] Disconnected — reconnection attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS}`);
           try {
             await entersState(this.connection, VoiceConnectionStatus.Connecting, 5_000);
@@ -199,7 +199,7 @@ export class Recorder {
             }
           }
         }
-        if (!reconnected && this.connection) {
+        if (!reconnected && !this.stopping && this.connection) {
           console.error("[recorder] All reconnection attempts failed.");
           callbacks.onDisconnect("Voice connection lost after 3 reconnection attempts.");
         }
