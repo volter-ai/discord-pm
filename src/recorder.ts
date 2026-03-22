@@ -117,6 +117,7 @@ export class Recorder {
 
     // speaking.start: open a new utterance for this user.
     this.connection.receiver.speaking.on("start", (userId) => {
+      if (this.stopping) return;
       const member = channel.guild.members.cache.get(userId);
       console.log(`[recorder] speaking.start for userId=${userId} member=${member?.displayName ?? "(not cached)"}`);
       if (member?.user.bot) return;
@@ -127,6 +128,15 @@ export class Recorder {
       } as any);
 
       this.memberCache.set(userId, effectiveMember);
+
+      // Flush any in-progress utterance before starting a new one.
+      // Discord can fire rapid speaking.start events (DAVE protocol transitions)
+      // without intervening speaking.end — discarding accumulated PCM without this guard.
+      const existing = this.activeUtterances.get(userId);
+      if (existing && existing.pcmSamples.length > 0) {
+        console.log(`[recorder] speaking.start for ${effectiveMember.displayName} — flushing ${existing.pcmSamples.length}-chunk in-progress utterance`);
+        callbacks.onUtterance(existing);
+      }
 
       this.activeUtterances.set(userId, {
         userId,
@@ -151,6 +161,7 @@ export class Recorder {
 
     // speaking.end: deliver the completed utterance via callback.
     this.connection.receiver.speaking.on("end", (userId) => {
+      if (this.stopping) return;
       const utterance = this.activeUtterances.get(userId);
       const member = this.memberCache.get(userId);
       callbacks.onSpeakingChange?.(userId, member?.displayName ?? `User-${userId.slice(-4)}`, false);
@@ -168,18 +179,24 @@ export class Recorder {
       console.log(`[recorder] connection state: ${oldState.status} → ${newState.status}`);
 
       if (newState.status === VoiceConnectionStatus.Disconnected) {
-        // Attempt reconnection
+        // Attempt reconnection with exponential backoff.
         let reconnected = false;
         for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+          if (!this.connection) break; // stop() called concurrently
           console.warn(`[recorder] Disconnected — reconnection attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS}`);
           try {
-            await entersState(this.connection!, VoiceConnectionStatus.Connecting, 5_000);
-            await entersState(this.connection!, VoiceConnectionStatus.Ready, 10_000);
+            await entersState(this.connection, VoiceConnectionStatus.Connecting, 5_000);
+            if (!this.connection) break;
+            await entersState(this.connection, VoiceConnectionStatus.Ready, 10_000);
             console.log("[recorder] Reconnected successfully.");
             reconnected = true;
             break;
           } catch (e) {
             console.warn(`[recorder] Reconnection attempt ${attempt} failed:`, e);
+            if (attempt < MAX_RECONNECT_ATTEMPTS) {
+              const backoff = 1_000 * Math.pow(2, attempt - 1); // 1s, 2s
+              await new Promise(r => setTimeout(r, backoff));
+            }
           }
         }
         if (!reconnected && this.connection) {
@@ -315,6 +332,9 @@ export class Recorder {
     this.decoders.clear();
 
     if (this.connection) {
+      // Remove speaking listeners before destroying to prevent post-stop events
+      // from firing callbacks into an already-torn-down session.
+      try { this.connection.receiver.speaking.removeAllListeners(); } catch { /* ignore */ }
       this.connection.destroy();
       this.connection = null;
     }

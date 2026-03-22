@@ -96,7 +96,8 @@ function listStandups(limit = 50, offset = 0): Row[] {
     return db
       .query(`SELECT * FROM standups ORDER BY started_at DESC LIMIT ? OFFSET ?`)
       .all(limit, offset) as Row[];
-  } catch {
+  } catch (e: any) {
+    console.error("[web] listStandups error:", e.message);
     return [];
   } finally {
     db.close();
@@ -109,7 +110,8 @@ function countStandups(): number {
   try {
     const row = db.query(`SELECT COUNT(*) as n FROM standups`).get() as { n: number } | null;
     return row?.n ?? 0;
-  } catch {
+  } catch (e: any) {
+    console.error("[web] countStandups error:", e.message);
     return 0;
   } finally {
     db.close();
@@ -121,7 +123,8 @@ function getStandup(id: number): Row | null {
   if (!db) return null;
   try {
     return (db.query(`SELECT * FROM standups WHERE id = ?`).get(id) as Row) ?? null;
-  } catch {
+  } catch (e: any) {
+    console.error("[web] getStandup error:", e.message);
     return null;
   } finally {
     db.close();
@@ -135,7 +138,8 @@ function getSegments(standupId: number): SegmentRow[] {
     return db
       .query(`SELECT * FROM utterance_segments WHERE standup_id = ? ORDER BY started_at`)
       .all(standupId) as SegmentRow[];
-  } catch {
+  } catch (e: any) {
+    console.error("[web] getSegments error:", e.message);
     return [];
   } finally {
     db.close();
@@ -310,7 +314,10 @@ function page(title: string, body: string) {
 }
 
 function listPage(rows: Row[], limit: number, offset: number, total: number) {
-  const dbMissing = openDb() === null;
+  // Probe for DB existence without leaking the handle.
+  const _probe = openDb();
+  const dbMissing = _probe === null;
+  _probe?.close();
   const warning = dbMissing
     ? `<div class="warn">Database not found at <code>${DB_PATH}</code>. Run the bot first to generate transcripts.</div>`
     : "";

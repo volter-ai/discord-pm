@@ -244,6 +244,12 @@ const ACTIVITY_CSS = `
   .tab-pr.tab-active{background:#1e1b4b;color:#a5b4fc;border-bottom-color:#6366f1}
 `;
 
+// ── Issues TTL cache ────────────────────────────────────────────────────────
+
+/** Cache /api/issues responses per standup key for 2 minutes to avoid hammering GitHub. */
+const issuesCache = new Map<string, { data: object; expiresAt: number }>();
+const ISSUES_CACHE_TTL_MS = 2 * 60 * 1_000;
+
 // ── Issue data helpers ──────────────────────────────────────────────────────
 
 interface StageGroupOutput {
@@ -419,17 +425,23 @@ export function createActivityApp(
       return c.json({ error: `Unknown standup. Choose from: ${STANDUP_NAMES.join(", ")}` }, 400);
     }
 
+    // Serve cached response if still fresh — prevents hammering GitHub Search API
+    // when multiple Activity clients load simultaneously.
+    const cached = issuesCache.get(standupKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      console.log(`[activity] /api/issues cache hit for "${standupKey}"`);
+      return c.json(cached.data);
+    }
+
     const config = STANDUPS[standupKey];
     try {
       const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Issues fetch timed out after 25s")), 25_000)
       );
       const participants = await Promise.race([fetchParticipantData(config), timeout]);
-      return c.json({
-        standupKey,
-        repo: config.repo,
-        participants,
-      });
+      const responseData = { standupKey, repo: config.repo, participants };
+      issuesCache.set(standupKey, { data: responseData, expiresAt: Date.now() + ISSUES_CACHE_TTL_MS });
+      return c.json(responseData);
     } catch (e: any) {
       console.error("[activity] Issues fetch error:", e.message);
       return c.json({ error: e.message }, 500);

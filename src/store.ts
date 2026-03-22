@@ -44,6 +44,9 @@ export class StandupStore {
     mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
 
     this.db = new Database(DB_PATH);
+    // WAL mode: allows concurrent reads during writes (web server + bot share the file).
+    this.db.run("PRAGMA journal_mode=WAL");
+    this.db.run("PRAGMA foreign_keys=ON");
     this.db.run(`
       CREATE TABLE IF NOT EXISTS standups (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,

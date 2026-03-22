@@ -6,6 +6,24 @@
 
 const GITHUB_API = "https://api.github.com";
 
+/**
+ * Retry a GitHub API call up to maxAttempts times with exponential backoff.
+ * Retries on network errors and 5xx/429 responses.
+ */
+async function withRetry<T>(label: string, fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      if (attempt === maxAttempts) throw e;
+      const delay = 1_000 * Math.pow(2, attempt - 1); // 1s, 2s
+      console.warn(`[github] ${label} attempt ${attempt}/${maxAttempts} failed: ${e.message}. Retrying in ${delay}ms…`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error("unreachable");
+}
+
 export interface GitHubIssue {
   number: number;
   title: string;
@@ -81,22 +99,24 @@ export async function fetchRecentlyUpdated(
     since,
     per_page: "50",
   });
-  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues?${params}`, {
-    headers: headers(),
-    signal: AbortSignal.timeout(10_000),
+  return withRetry("fetchRecentlyUpdated", async () => {
+    const res = await fetch(`${GITHUB_API}/repos/${repo}/issues?${params}`, {
+      headers: headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+    const raw = await res.json();
+    return parseIssues(raw);
   });
-  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
-  const raw = await res.json();
-  // The `since` param filters by updated_at >= since, which is exactly what we want.
-  return parseIssues(raw);
 }
 
 /**
  * Fetch open issues for an assignee (or unassigned if assignee is null)
  * that do NOT have the given backlog label.
  */
-/** Cache avatars so we don't re-fetch on every step. */
+/** Cache avatars so we don't re-fetch on every step. Capped to prevent unbounded growth. */
 const avatarCache = new Map<string, string>();
+const AVATAR_CACHE_MAX = 200;
 
 export async function fetchUserAvatar(username: string): Promise<string> {
   const cached = avatarCache.get(username);
@@ -109,6 +129,11 @@ export async function fetchUserAvatar(username: string): Promise<string> {
     if (res.ok) {
       const data = await res.json();
       const url = data.avatar_url as string;
+      // Evict oldest entry when at capacity (Map preserves insertion order).
+      if (avatarCache.size >= AVATAR_CACHE_MAX) {
+        const oldest = avatarCache.keys().next().value;
+        if (oldest !== undefined) avatarCache.delete(oldest);
+      }
       avatarCache.set(username, url);
       return url;
     }
@@ -128,10 +153,11 @@ export async function fetchIssueDetail(
   repo: string,
   number: number,
 ): Promise<GitHubIssueDetail> {
-  const timeout = AbortSignal.timeout(10_000);
+  // Each request gets its own timeout signal — sharing one signal means
+  // a slow first request consumes the second request's timeout budget.
   const [issueRes, commentsRes] = await Promise.all([
-    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}`, { headers: headers(), signal: timeout }),
-    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=20&direction=desc`, { headers: headers(), signal: timeout }),
+    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}`, { headers: headers(), signal: AbortSignal.timeout(10_000) }),
+    fetch(`${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=20&direction=desc`, { headers: headers(), signal: AbortSignal.timeout(10_000) }),
   ]);
 
   if (!issueRes.ok) throw new Error(`GitHub API ${issueRes.status}: ${await issueRes.text()}`);
@@ -210,16 +236,18 @@ export async function fetchOpenNonBacklog(
   const escapedLabel = backlogLabel.replace(/"/g, '\\"');
   const q = `is:issue repo:${repo} is:open ${assigneePart} -label:"${escapedLabel}"`;
   const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "100" });
-  const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
-    headers: headers(),
-    signal: AbortSignal.timeout(10_000),
+  return withRetry("fetchOpenNonBacklog", async () => {
+    const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
+      headers: headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+    const { items, total_count } = await res.json();
+    if (total_count > items.length) {
+      console.warn(`[github] fetchOpenNonBacklog: got ${items.length}/${total_count} issues for ${repo} — results truncated`);
+    }
+    return parseIssues(items);
   });
-  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
-  const { items, total_count } = await res.json();
-  if (total_count > items.length) {
-    console.warn(`[github] fetchOpenNonBacklog: got ${items.length}/${total_count} issues for ${repo} — results truncated`);
-  }
-  return parseIssues(items);
 }
 
 /**
@@ -252,14 +280,16 @@ export async function fetchAllOpenAssigned(repo: string, backlogLabel: string): 
   const escapedLabel = backlogLabel.replace(/"/g, '\\"');
   const q = `is:issue repo:${repo} is:open is:assigned -label:"${escapedLabel}"`;
   const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "100" });
-  const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
-    headers: headers(),
-    signal: AbortSignal.timeout(10_000),
+  return withRetry("fetchAllOpenAssigned", async () => {
+    const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {
+      headers: headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
+    const { items, total_count } = await res.json();
+    if (total_count > items.length) {
+      console.warn(`[github] fetchAllOpenAssigned: got ${items.length}/${total_count} — results truncated`);
+    }
+    return parseIssues(items);
   });
-  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
-  const { items, total_count } = await res.json();
-  if (total_count > items.length) {
-    console.warn(`[github] fetchAllOpenAssigned: got ${items.length}/${total_count} — results truncated`);
-  }
-  return parseIssues(items);
 }

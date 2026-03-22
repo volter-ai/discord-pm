@@ -297,6 +297,19 @@ export class StandupBot {
   }
 
   private async handleInteraction(interaction: Interaction) {
+    try {
+      await this._handleInteractionInner(interaction);
+    } catch (e: any) {
+      console.error("[bot] Unhandled interaction error:", e);
+      try {
+        if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: "An internal error occurred.", ephemeral: true });
+        }
+      } catch { /* best-effort */ }
+    }
+  }
+
+  private async _handleInteractionInner(interaction: Interaction) {
     // Button interactions (review:next, review:done)
     if (interaction.isButton()) {
       const id = interaction.customId;
@@ -307,6 +320,12 @@ export class StandupBot {
     }
 
     if (!interaction.isChatInputCommand()) return;
+
+    // Guard: guild-only commands (guildId is always present for guild commands, but be defensive)
+    if (!interaction.guildId) {
+      await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+      return;
+    }
 
     if (interaction.commandName === "standup") {
       const sub = interaction.options.getSubcommand();

@@ -168,18 +168,28 @@ export async function buildStepEmbed(
   stepIndex: number,
 ): Promise<{ embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> }> {
   const config = STANDUPS[standupKey];
+  if (!config) throw new Error(`Unknown standup key: ${standupKey}`);
   const step = config.steps[stepIndex];
+  if (!step) throw new Error(`Step ${stepIndex} out of bounds for standup "${standupKey}" (${config.steps.length} steps)`);
+
   const repoUrl = `https://github.com/${config.repo}/issues`;
 
   let recentIssues: GitHubIssue[] = [];
   let openIssues: GitHubIssue[] = [];
+  let resolvedAvatarUrl = "";
 
   if (step.type === "assignee") {
-    recentIssues = await fetchRecentlyUpdated(config.repo, step.user);
-    openIssues = await fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel);
+    // Parallelize all independent API calls — was sequential (up to 30s worst-case).
+    const [recent, open, avatar] = await Promise.all([
+      fetchRecentlyUpdated(config.repo, step.user),
+      fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel),
+      fetchUserAvatar(step.user),
+    ]);
+    recentIssues = recent;
+    resolvedAvatarUrl = avatar;
     // Dedupe: remove from openIssues any that already appear in recent
     const recentNums = new Set(recentIssues.map((i) => i.number));
-    openIssues = openIssues.filter((i) => !recentNums.has(i.number));
+    openIssues = open.filter((i) => !recentNums.has(i.number));
   } else {
     openIssues = await fetchOpenNonBacklog(config.repo, null, config.backlogLabel);
   }
@@ -206,12 +216,11 @@ export async function buildStepEmbed(
   const totalSteps = config.steps.length;
   const embed = new EmbedBuilder().setColor(embedColor(allOpen));
 
-  // Author with avatar for assignee steps
+  // Author with avatar for assignee steps (avatar already fetched in parallel above)
   if (step.type === "assignee") {
-    const avatarUrl = await fetchUserAvatar(step.user);
     embed.setAuthor({
       name: `${step.name}  —  ${standupKey}`,
-      iconURL: avatarUrl,
+      iconURL: resolvedAvatarUrl,
       url: `${repoUrl}?q=assignee:${step.user}+sort:updated-desc`,
     });
   } else {
