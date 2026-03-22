@@ -35,6 +35,25 @@ Extract a structured summary. Respond ONLY with valid JSON in this exact schema:
 
 If something is unclear, make a reasonable inference. Never include markdown fences.`;
 
+const MEETING_SYSTEM_PROMPT = `You are a technical project manager summarizing a meeting transcript.
+The transcript shows each speaker's contributions labeled as "[Name]: ...".
+This is a general meeting (not a standup), so do NOT use standup-style DID/WILL DO/BLOCKERS framing.
+
+Extract a structured summary. Respond ONLY with valid JSON in this exact schema:
+{
+  "participants": [
+    {
+      "name": "string",
+      "did": ["string (key point this person raised or discussed)"],
+      "will_do": ["string (action item this person owns)"],
+      "blockers": ["string (open question or blocker this person raised)"]
+    }
+  ],
+  "summary_text": "string (1-2 sentence overall meeting summary)"
+}
+
+If something is unclear, make a reasonable inference. Never include markdown fences.`;
+
 const ISSUE_SYSTEM_PROMPT = `You are a technical project manager summarizing a standup meeting.
 The transcript is organized by GitHub issue — each section shows what was discussed about that issue.
 Some utterances may be "general discussion" (not tied to a specific issue).
@@ -105,6 +124,22 @@ export class Summarizer {
         {
           role: "user",
           content: `Standup transcript:\n\n${transcript}`,
+        },
+      ],
+    });
+
+    return this.parseResponse(response);
+  }
+
+  async summarizeMeeting(transcript: string): Promise<SummaryResult> {
+    const response = await this.client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 4096,
+      system: MEETING_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: `Meeting transcript:\n\n${transcript}`,
         },
       ],
     });

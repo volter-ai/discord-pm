@@ -278,14 +278,13 @@ async function fetchParticipantData(config: StandupConfig) {
     let prs: GitHubPR[] = [];
 
     if (step.type === "assignee") {
-      // Fetch recent issues, open issues, avatar, and PRs in parallel
-      const [recent, open, avatar, fetchedPRs] = await Promise.all([
+      // Fetch recent issues, open issues, and PRs in parallel (avatar proxied server-side)
+      const [recent, open, fetchedPRs] = await Promise.all([
         fetchRecentlyUpdated(config.repo, step.user),
         fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel),
-        fetchUserAvatar(step.user),
         fetchOpenPRsByAuthor(config.repo, step.user),
       ]);
-      avatarUrl = avatar;
+      avatarUrl = `/activity/avatar?user=${encodeURIComponent(step.user)}`;
       prs = fetchedPRs;
       const recentNums = new Set(recent.map(i => i.number));
       const recentOpen = recent.filter(i => i.state === "open");
@@ -339,14 +338,11 @@ async function fetchParticipantData(config: StandupConfig) {
   // Build extra participant entries
   const extraParticipants = await Promise.all(
     [...extraAssigneeIssues.entries()].map(async ([user, issues]) => {
-      const [avatar, prs] = await Promise.all([
-        fetchUserAvatar(user),
-        fetchOpenPRsByAuthor(config.repo, user),
-      ]);
+      const prs = await fetchOpenPRsByAuthor(config.repo, user);
       return {
         name: user,
         githubUser: user,
-        avatarUrl: avatar,
+        avatarUrl: `/activity/avatar?user=${encodeURIComponent(user)}`,
         stages: groupByStage(issues),
         prs,
       };
@@ -437,6 +433,28 @@ export function createActivityApp(
     } catch (e: any) {
       console.error("[activity] Issues fetch error:", e.message);
       return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // Proxy GitHub avatars to avoid CORS/CSP issues inside Discord's Activity sandbox
+  app.get("/avatar", async (c) => {
+    const user = c.req.query("user") ?? "";
+    if (!user || !/^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$/.test(user)) {
+      return c.json({ error: "Invalid user" }, 400);
+    }
+    try {
+      const avatarUrl = await fetchUserAvatar(user);
+      const res = await fetch(avatarUrl, { signal: AbortSignal.timeout(8_000) });
+      if (!res.ok) return c.json({ error: "Avatar fetch failed" }, 502);
+      return new Response(res.body, {
+        headers: {
+          "Content-Type": res.headers.get("Content-Type") ?? "image/png",
+          "Cache-Control": "public, max-age=86400",
+        },
+      });
+    } catch (e: any) {
+      console.error("[activity] Avatar proxy error:", e.message);
+      return c.json({ error: "Avatar unavailable" }, 502);
     }
   });
 

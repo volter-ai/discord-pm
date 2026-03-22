@@ -704,6 +704,8 @@ export class StandupBot {
         // Build issue-organized transcript for the summarizer
         const issueTranscript = this.buildIssueTranscript(session.lines);
         summaryResult = await this.summarizer.summarizeByIssue(issueTranscript);
+      } else if (session.type === "meeting") {
+        summaryResult = await this.summarizer.summarizeMeeting(transcript);
       } else {
         summaryResult = await this.summarizer.summarize(transcript);
       }
