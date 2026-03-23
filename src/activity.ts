@@ -188,6 +188,13 @@ const ACTIVITY_CSS = `
   .detail-title{color:#e2e8f0;font-size:1rem;font-weight:600;flex:1}
   .detail-close{background:none;border:none;color:#64748b;cursor:pointer;font-size:1rem;padding:.25rem .5rem;margin-left:auto;flex-shrink:0}
   .detail-close:hover{color:#e2e8f0}
+  /* Issue meta (creator / assignees / state) */
+  .detail-meta{display:flex;align-items:center;flex-wrap:wrap;gap:.35rem .5rem;margin-bottom:.6rem;font-size:.78rem;color:#94a3b8}
+  .detail-meta strong{color:#c7d2fe}
+  .detail-meta-sep{color:#475569}
+  .detail-meta-state-open{color:#4ade80}
+  .detail-meta-state-closed{color:#94a3b8}
+
   .detail-labels{display:flex;gap:.25rem;flex-wrap:wrap;margin-bottom:.75rem}
   .detail-label{font-size:.72rem;padding:.15rem .4rem;background:#0f172a;color:#94a3b8;border-radius:.25rem}
   .detail-body{font-size:.85rem;line-height:1.6;color:#cbd5e1;border-top:1px solid #334155;padding-top:.75rem;margin-bottom:.75rem;word-break:break-word}
@@ -492,12 +499,18 @@ export function createActivityApp(
 
   // Reassign issue to a different contributor
   app.post("/api/issues/:repo/:number/assign", async (c) => {
-    // CSRF: reject cross-origin requests.
+    // CSRF: reject cross-origin requests that are not from our server or Discord's Activity proxy.
     const origin = c.req.header("origin");
     const host = c.req.header("host");
     try {
-      if (origin && host && new URL(origin).host !== host) {
-        return c.json({ error: "Forbidden" }, 403);
+      if (origin && host) {
+        const originHost = new URL(origin).host;
+        const isSameOrigin = originHost === host;
+        // Discord Activity iframes run on *.discordsays.com — allow those origins.
+        const isDiscordActivity = originHost.endsWith(".discordsays.com");
+        if (!isSameOrigin && !isDiscordActivity) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
       }
     } catch {
       return c.json({ error: "Forbidden" }, 403);
@@ -529,6 +542,7 @@ export function createActivityApp(
     upgradeWebSocket((c) => {
       let guildId: string | null = null;
       let clientUserId: string | null = null;
+      let clientUsername: string | null = null;
       let authenticated = false;
       let capturedWs: any = null;
 
@@ -557,12 +571,14 @@ export function createActivityApp(
                   }
                   const user = await res.json();
                   clientUserId = user.id ?? msg.userId ?? null;
+                  clientUsername = user.global_name ?? user.username ?? msg.username ?? null;
                   authenticated = true;
                   registerClient(ws);
                 }).catch((e: any) => {
                   console.warn("[activity] WebSocket token verification error:", e.message);
                   // Fail open on network errors to avoid blocking legitimate clients
                   clientUserId = msg.userId ?? null;
+                  clientUsername = msg.username ?? null;
                   authenticated = true;
                   registerClient(ws);
                 });
@@ -577,11 +593,22 @@ export function createActivityApp(
                 const session = bot.getFirstActiveSession();
                 if (session) {
                   guildId = session.guildId;
-                  bot.addActivityClient(guildId, ws);
+                  bot.addActivityClient(guildId, ws, clientUserId, clientUsername);
+                  // addActivityClient already broadcasts updated state; send a personal
+                  // initial state so the client has all fields before the broadcast arrives.
+                  const presenterName = session.meta.presenter
+                    ? (session.meta.connectedUsers.get(session.meta.presenter) ?? null)
+                    : null;
+                  const watcherNames = [...session.meta.connectedUsers.entries()]
+                    .filter(([uid]) => uid !== session.meta.presenter)
+                    .map(([, name]) => name);
                   ws.send(JSON.stringify({
                     type: "state",
                     focusedIssue: session.meta.focusedIssue,
+                    focusedDetailIssue: session.meta.focusedDetailIssue,
                     presenter: session.meta.presenter,
+                    presenterName,
+                    watcherNames,
                     activeParticipantIndex: session.meta.activeParticipantIndex,
                     recording: true,
                     elapsed: Math.round((Date.now() - session.meta.startedAt.getTime()) / 1000),
@@ -591,7 +618,10 @@ export function createActivityApp(
                   ws.send(JSON.stringify({
                     type: "state",
                     focusedIssue: null,
+                    focusedDetailIssue: null,
                     presenter: null,
+                    presenterName: null,
+                    watcherNames: [],
                     activeParticipantIndex: 0,
                     recording: false,
                     elapsed: 0,
@@ -611,6 +641,10 @@ export function createActivityApp(
               bot.setActiveTab(guildId, msg.participantIndex);
             }
 
+            if (msg.type === "detail" && guildId) {
+              bot.setDetailPanel(guildId, msg.issueNumber ?? null);
+            }
+
             // Use server-verified clientUserId — never trust client-supplied userId.
             if (msg.type === "controls" && guildId && clientUserId) {
               bot.setPresenter(guildId, clientUserId);
@@ -624,6 +658,7 @@ export function createActivityApp(
           if (guildId) {
             bot.clearPresenterIfDisconnected(guildId, clientUserId);
             if (capturedWs) bot.removeActivityClient(guildId, capturedWs);
+            if (clientUserId) bot.removeActivityUser(guildId, clientUserId);
           }
           console.log("[activity] WebSocket client disconnected");
         },

@@ -142,6 +142,7 @@ export async function fetchUserAvatar(username: string): Promise<string> {
 }
 
 export interface GitHubIssueDetail extends GitHubIssue {
+  creator: string;
   body: string;
   comments: { user: string; body: string; createdAt: string }[];
 }
@@ -173,6 +174,7 @@ export async function fetchIssueDetail(
     updatedAt: issue.updated_at,
     url: issue.html_url,
     assignees: (issue.assignees ?? []).map((a: any) => a.login as string),
+    creator: issue.user?.login ?? "unknown",
     body: issue.body ?? "",
     comments: rawComments.reverse().map((c: any) => ({
       user: c.user?.login ?? "unknown",

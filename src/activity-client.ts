@@ -54,7 +54,7 @@ type ServerMessage =
   | { type: "speaker"; userId: string; name: string; speaking: boolean }
   | { type: "utterance"; speaker: string; issueNumber: number | null; text: string; startedAt: number }
   | { type: "session"; recording: boolean; elapsed: number; utteranceCount: number }
-  | { type: "state"; focusedIssue: number | null; presenter: string | null; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number };
+  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number };
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 
@@ -120,10 +120,18 @@ function cacheDetail(key: string, value: any) {
 let syncMode = true;
 /** Discord user ID of the current presenter, or null if nobody has controls. */
 let presenterUserId: string | null = null;
+/** Display name of the current presenter. */
+let presenterName: string | null = null;
+/** Display names of all other connected users (watchers when this client is presenting). */
+let watcherNames: string[] = [];
 /** Server's canonical focused issue (applied to local state when syncing). */
 let serverFocusedIssue: number | null = null;
 /** Server's canonical active participant tab index. */
 let serverActiveTabIndex = 0;
+/** Server's canonical detail panel issue (applied when syncing). */
+let serverFocusedDetailIssue: number | null = null;
+/** Issue number currently shown in the local detail panel, or null. */
+let currentDetailIssue: number | null = null;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -298,6 +306,7 @@ function connectWebSocket() {
       type: "ready",
       standupKey,
       userId: currentUser?.id ?? null,
+      username: currentUser?.username ?? null,
       token: accessToken,
     }));
   };
@@ -363,6 +372,8 @@ function handleServerMessage(msg: ServerMessage) {
     case "state": {
       // Track who the presenter is — needed for sync badge + permission checks
       presenterUserId = msg.presenter;
+      presenterName = msg.presenterName ?? null;
+      watcherNames = msg.watcherNames ?? [];
       // Save server's canonical state
       serverFocusedIssue = msg.focusedIssue;
       serverActiveTabIndex = msg.activeParticipantIndex ?? 0;
@@ -370,12 +381,26 @@ function handleServerMessage(msg: ServerMessage) {
       elapsedSeconds = msg.elapsed;
       utteranceCount = msg.utteranceCount;
 
+      // Track detail panel state changes for sync
+      const prevServerDetail = serverFocusedDetailIssue;
+      serverFocusedDetailIssue = msg.focusedDetailIssue ?? null;
+
       if (syncMode) {
         // Apply server state to local view
         const tabChanged = activeTabIndex !== serverActiveTabIndex;
         const focusChanged = focusedIssue !== serverFocusedIssue;
         activeTabIndex = serverActiveTabIndex;
         focusedIssue = serverFocusedIssue;
+
+        // Sync detail panel to presenter if watching (not the presenter)
+        if (!isPresenter() && serverFocusedDetailIssue !== prevServerDetail) {
+          if (serverFocusedDetailIssue !== null) {
+            openDetailPanel(serverFocusedDetailIssue);
+          } else {
+            closeDetailPanel();
+          }
+        }
+
         if (tabChanged) {
           render();
         } else if (focusChanged) {
@@ -437,10 +462,14 @@ function renderHeader(): string {
 
 function renderSyncBadge(): string {
   if (isPresenter()) {
-    return `<span class="sync-badge sync-badge-presenter">🎤 Presenting</span>`;
+    const watcherInfo = watcherNames.length > 0
+      ? ` · ${watcherNames.length} watching`
+      : "";
+    return `<span class="sync-badge sync-badge-presenter">🎤 Presenting${escapeHtml(watcherInfo)}</span>`;
   }
   if (syncMode && presenterUserId) {
-    return `<span class="sync-badge sync-badge-synced">🔴 Live</span>`;
+    const nameTag = presenterName ? ` · ${escapeHtml(presenterName)}` : "";
+    return `<span class="sync-badge sync-badge-synced">🔴 Live${nameTag}</span>`;
   }
   if (!syncMode) {
     return `<span class="sync-badge sync-badge-freestyle" id="btn-sync-badge" title="Click to sync back to presenter">🔓 Freestyle</span>`;
@@ -578,7 +607,10 @@ function isPresenter(): boolean {
 
 function renderNavCenterButton(): string {
   if (isPresenter()) {
-    return `<button class="nav-btn nav-btn-presenter" id="btn-controls" disabled>🎤 Presenting</button>`;
+    const watcherInfo = watcherNames.length > 0
+      ? ` (${watcherNames.map(n => escapeHtml(n)).join(", ")})`
+      : "";
+    return `<button class="nav-btn nav-btn-presenter" id="btn-controls" disabled>🎤 Presenting${watcherInfo}</button>`;
   }
   if (syncMode && presenterUserId) {
     // Following presenter — offer to go freestyle
@@ -641,8 +673,18 @@ function updateNavCenter() {
 document.addEventListener("click", (e) => {
   const target = e.target as HTMLElement;
 
-  // Direct GitHub link — let the browser handle it natively, don't toggle focus
-  if (target.closest(".gh-link")) return;
+  // GitHub links — must use sdk.openExternalLink inside Discord Activity sandbox
+  const ghLinkEl = target.closest(".gh-link, .detail-link") as HTMLAnchorElement | null;
+  if (ghLinkEl) {
+    e.preventDefault();
+    const url = ghLinkEl.href;
+    if (url && sdk) {
+      sdk.commands.openExternalLink({ url }).catch((err: any) => {
+        console.warn("[gh-link] openExternalLink failed:", err);
+      });
+    }
+    return;
+  }
 
   // Tab click
   const tab = target.closest(".tab") as HTMLElement | null;
@@ -666,12 +708,20 @@ document.addEventListener("click", (e) => {
   if (issueNumEl) {
     const issueNum = parseInt(issueNumEl.dataset.detail!);
     openDetailPanel(issueNum);
+    // Broadcast to watchers if we are presenter (or no presenter — collaborative mode)
+    if (isPresenter() || !presenterUserId) {
+      sendWs({ type: "detail", issueNumber: issueNum });
+    }
     return;
   }
 
   // Detail panel close
   if (target.closest(".detail-close") || target.classList.contains("detail-overlay")) {
     closeDetailPanel();
+    // Broadcast close to watchers
+    if (isPresenter() || !presenterUserId) {
+      sendWs({ type: "detail", issueNumber: null });
+    }
     return;
   }
 
@@ -1001,6 +1051,7 @@ function flushFocusTimer() {
 // ── Issue Detail Panel ─────────────────────────────────────────────────────
 
 async function openDetailPanel(issueNumber: number) {
+  currentDetailIssue = issueNumber;
   if (detailFetchInFlight) return;
 
   const cacheKey = `${repo}/${issueNumber}`;
@@ -1041,6 +1092,22 @@ function renderDetailOverlay(detail: any) {
 
   const labelsHtml = (detail.labels ?? []).map((l: string) => `<span class="detail-label">${escapeHtml(l)}</span>`).join(" ");
   const bodyHtml = detail.body ? formatPlainText(detail.body) : "<em>No description</em>";
+
+  // Creator, assignees, state meta row
+  const stateClass = detail.state === "open" ? "detail-meta-state-open" : "detail-meta-state-closed";
+  const stateText = detail.state === "open" ? "🟢 open" : "⚫ closed";
+  const assigneesText = detail.assignees?.length > 0
+    ? detail.assignees.map((a: string) => `<strong>@${escapeHtml(a)}</strong>`).join(", ")
+    : "<em>unassigned</em>";
+  const metaHtml = `
+    <div class="detail-meta">
+      <span>by <strong>@${escapeHtml(detail.creator ?? "unknown")}</strong></span>
+      <span class="detail-meta-sep">·</span>
+      <span>assigned to ${assigneesText}</span>
+      <span class="detail-meta-sep">·</span>
+      <span class="${stateClass}">${stateText}</span>
+    </div>
+  `;
   const commentsHtml = (detail.comments ?? []).map((c: any) => `
     <div class="detail-comment">
       <div class="comment-meta"><strong>${escapeHtml(c.user)}</strong> <span class="comment-date">${relativeTime(c.createdAt)}</span></div>
@@ -1070,6 +1137,7 @@ function renderDetailOverlay(detail: any) {
         <span class="detail-title">${escapeHtml(detail.title)}</span>
         <button class="detail-close">X</button>
       </div>
+      ${metaHtml}
       <div class="detail-labels">${labelsHtml}</div>
       <div class="detail-body">${bodyHtml}</div>
       ${commentsHtml ? `<div class="detail-comments-header">Comments (${detail.comments?.length ?? 0})</div>${commentsHtml}` : ""}
@@ -1081,6 +1149,7 @@ function renderDetailOverlay(detail: any) {
 }
 
 function closeDetailPanel() {
+  currentDetailIssue = null;
   const overlay = document.querySelector(".detail-overlay");
   if (overlay) overlay.remove();
 }

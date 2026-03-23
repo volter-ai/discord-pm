@@ -66,6 +66,10 @@ interface SessionMeta {
   activeParticipantIndex: number;
   /** Connected Activity WebSocket clients. */
   activityClients: Set<any>;
+  /** Map of connected userId → display name for presence info. */
+  connectedUsers: Map<string, string>;
+  /** Issue number currently open in the detail panel, or null. */
+  focusedDetailIssue: number | null;
   /** Repo string for issue-aware transcripts (e.g. "volter-ai/runhuman"). */
   issueRepo: string | null;
   /** Whether an Activity client was ever connected during this session. */
@@ -121,12 +125,32 @@ export class StandupBot {
   }
 
   /** Register an Activity WebSocket client for a guild session. */
-  addActivityClient(guildId: string, ws: any) {
+  addActivityClient(guildId: string, ws: any, userId: string | null, username: string | null) {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.activityClients.add(ws);
+      if (userId && username) session.connectedUsers.set(userId, username);
       session.hadActivity = true;
       console.log(`[bot] Activity client added (${session.activityClients.size} total)`);
+      this.broadcastActivityState(guildId);
+    }
+  }
+
+  /** Remove a connected user from presence tracking. */
+  removeActivityUser(guildId: string, userId: string) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      session.connectedUsers.delete(userId);
+      this.broadcastActivityState(guildId);
+    }
+  }
+
+  /** Set the detail panel issue from Activity. Broadcasts state to all clients. */
+  setDetailPanel(guildId: string, issueNumber: number | null) {
+    const session = this.activeSessions.get(guildId);
+    if (session) {
+      session.focusedDetailIssue = issueNumber;
+      this.broadcastActivityState(guildId);
     }
   }
 
@@ -182,10 +206,17 @@ export class StandupBot {
   private broadcastActivityState(guildId: string) {
     const session = this.activeSessions.get(guildId);
     if (!session) return;
+    const presenterName = session.presenter ? (session.connectedUsers.get(session.presenter) ?? null) : null;
+    const watcherNames = [...session.connectedUsers.entries()]
+      .filter(([userId]) => userId !== session.presenter)
+      .map(([, name]) => name);
     this.broadcastToActivity(guildId, {
       type: "state",
       focusedIssue: session.focusedIssue,
+      focusedDetailIssue: session.focusedDetailIssue,
       presenter: session.presenter,
+      presenterName,
+      watcherNames,
       activeParticipantIndex: session.activeParticipantIndex,
       recording: true,
       elapsed: Math.round((Date.now() - session.startedAt.getTime()) / 1000),
@@ -457,6 +488,8 @@ export class StandupBot {
       presenter: null,
       activeParticipantIndex: 0,
       activityClients: new Set(),
+      connectedUsers: new Map(),
+      focusedDetailIssue: null,
       issueRepo: null,
       hadActivity: false,
       issueMeta: new Map(),
@@ -578,6 +611,8 @@ export class StandupBot {
       presenter: null,
       activeParticipantIndex: 0,
       activityClients: new Set(),
+      connectedUsers: new Map(),
+      focusedDetailIssue: null,
       issueRepo: null,
       hadActivity: false,
       issueMeta: new Map(),
