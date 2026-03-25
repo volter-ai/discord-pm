@@ -58,7 +58,9 @@ export const STANDUPS: Record<string, StandupConfig> = {
       { type: "unassigned", name: "Unassigned" },
       { type: "assignee", user: "bouscs", name: "Artur" },
       { type: "assignee", user: "brennan-volter", name: "Brennan" },
+      { type: "assignee", user: "christopherreid", name: "Chris" },
       { type: "assignee", user: "edmundmtang", name: "Edmund" },
+      { type: "assignee", user: "mococa", name: "Luiz" },
     ],
   },
 };
