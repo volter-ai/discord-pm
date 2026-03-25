@@ -154,6 +154,11 @@ export class StandupBot {
     }
   }
 
+  /** Relay a scroll position from the presenter to all connected Activity clients. */
+  relayScroll(guildId: string, scrollY: number) {
+    this.broadcastToActivity(guildId, { type: "scroll", scrollY });
+  }
+
   /** Remove a specific Activity WebSocket client by reference. */
   removeActivityClient(guildId: string, ws: any) {
     const session = this.activeSessions.get(guildId);

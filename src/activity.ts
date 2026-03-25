@@ -649,6 +649,10 @@ export function createActivityApp(
             if (msg.type === "controls" && guildId && clientUserId) {
               bot.setPresenter(guildId, clientUserId);
             }
+
+            if (msg.type === "scroll" && guildId && typeof msg.scrollY === "number") {
+              bot.relayScroll(guildId, msg.scrollY);
+            }
           } catch (e: any) {
             console.error("[activity] WebSocket message error:", e.message);
           }

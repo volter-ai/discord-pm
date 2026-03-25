@@ -54,7 +54,8 @@ type ServerMessage =
   | { type: "speaker"; userId: string; name: string; speaking: boolean }
   | { type: "utterance"; speaker: string; issueNumber: number | null; text: string; startedAt: number }
   | { type: "session"; recording: boolean; elapsed: number; utteranceCount: number }
-  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number };
+  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number }
+  | { type: "scroll"; scrollY: number };
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 
@@ -132,6 +133,10 @@ let serverActiveTabIndex = 0;
 let serverFocusedDetailIssue: number | null = null;
 /** Issue number currently shown in the local detail panel, or null. */
 let currentDetailIssue: number | null = null;
+/** Last scroll position broadcast by the presenter (applied when syncing). */
+let serverScrollY = 0;
+/** Throttle timer for outbound scroll messages. */
+let scrollThrottleTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -403,6 +408,8 @@ function handleServerMessage(msg: ServerMessage) {
 
         if (tabChanged) {
           render();
+          // After re-render, apply presenter's scroll position
+          window.scrollTo({ top: serverScrollY, behavior: "instant" });
         } else if (focusChanged) {
           updateFocusHighlight();
           updateHeader();
@@ -415,6 +422,14 @@ function handleServerMessage(msg: ServerMessage) {
         // Not synced — just update timer/counts and the badge
         updateHeader();
         updateSyncBadge();
+      }
+      break;
+    }
+
+    case "scroll": {
+      serverScrollY = msg.scrollY;
+      if (syncMode && !isPresenter()) {
+        window.scrollTo({ top: msg.scrollY, behavior: "instant" });
       }
       break;
     }
@@ -647,6 +662,8 @@ function snapToSync() {
     updateSyncBadge();
     updateNavCenter();
   }
+  // Snap scroll to match presenter's current position
+  window.scrollTo({ top: serverScrollY, behavior: "instant" });
 }
 
 /** Update just the sync badge in the header (without full re-render). */
@@ -1169,6 +1186,19 @@ function priorityBadge(labels: string[]): string {
   }
   return "";
 }
+
+// ── Scroll sync ──────────────────────────────────────────────────────────────
+// When this client is the presenter, broadcast scroll position (throttled) so
+// watchers in sync mode can follow along.
+
+window.addEventListener("scroll", () => {
+  if (!isPresenter()) return;
+  if (scrollThrottleTimer !== null) return;
+  scrollThrottleTimer = setTimeout(() => {
+    scrollThrottleTimer = null;
+    sendWs({ type: "scroll", scrollY: window.scrollY });
+  }, 100);
+}, { passive: true });
 
 // ── Start ───────────────────────────────────────────────────────────────────
 
