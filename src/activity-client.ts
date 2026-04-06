@@ -55,7 +55,8 @@ type ServerMessage =
   | { type: "utterance"; speaker: string; issueNumber: number | null; text: string; startedAt: number }
   | { type: "session"; recording: boolean; elapsed: number; utteranceCount: number }
   | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number }
-  | { type: "scroll"; scrollY: number };
+  | { type: "scroll"; scrollY: number }
+  | { type: "detailScroll"; scrollTop: number };
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 
@@ -137,6 +138,10 @@ let currentDetailIssue: number | null = null;
 let serverScrollY = 0;
 /** Throttle timer for outbound scroll messages. */
 let scrollThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+/** Throttle timer for outbound detail panel scroll messages. */
+let detailScrollThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+/** Last detail panel scroll position from the presenter. */
+let serverDetailScrollTop = 0;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -433,6 +438,15 @@ function handleServerMessage(msg: ServerMessage) {
       }
       break;
     }
+
+    case "detailScroll": {
+      serverDetailScrollTop = msg.scrollTop;
+      if (syncMode && !isPresenter()) {
+        const panel = document.querySelector(".detail-panel");
+        if (panel) panel.scrollTop = msg.scrollTop;
+      }
+      break;
+    }
   }
 }
 
@@ -450,6 +464,7 @@ function render() {
     ${boardHtml}
     ${liveHtml}
   `;
+  updateTabTimes();
 }
 
 function renderHeader(): string {
@@ -516,7 +531,7 @@ function updateTabTimes() {
     const isSpeaking = speakingNames.has(p.name);
     const liveMs = isSpeaking ? (Date.now() - (speakerStartTimes.get(p.name) ?? Date.now())) : 0;
     const totalSec = Math.floor((totalMs + liveMs) / 1000);
-    el.textContent = totalSec > 0 ? formatTime(totalSec) : "";
+    el.textContent = formatTime(totalSec);
   });
 }
 
@@ -581,7 +596,7 @@ function renderBoard(): string {
       const age = `<span class="issue-age ${freshnessClass(pr.updatedAt)}">${relativeTime(pr.updatedAt)}</span>`;
       const ghLink = `<a class="gh-link" href="${escapeHtml(pr.url)}" target="_blank" title="Open PR on GitHub">↗</a>`;
       return `
-        <div class="pr-card${draftClass}">
+        <div class="pr-card${draftClass}" data-pr="${pr.number}" data-url="${escapeHtml(pr.url)}">
           <div class="issue-header">
             <span class="issue-number">#${pr.number}</span>
             <span class="issue-title">${escapeHtml(pr.title)}</span>
@@ -764,6 +779,15 @@ document.addEventListener("click", (e) => {
     }
     updateFocusHighlight();
     updateHeader();
+    return;
+  }
+
+  // PR card click → open PR detail modal
+  const prCard = target.closest(".pr-card") as HTMLElement | null;
+  if (prCard && prCard.dataset.pr) {
+    e.preventDefault();
+    const prNum = parseInt(prCard.dataset.pr);
+    openPRDetailPanel(prNum);
     return;
   }
 
@@ -1009,7 +1033,7 @@ function renderAllPRsBoard(): string {
       const age = `<span class="issue-age ${freshnessClass(pr.updatedAt)}">${relativeTime(pr.updatedAt)}</span>`;
       const ghLink = `<a class="gh-link" href="${escapeHtml(pr.url)}" target="_blank" title="Open PR on GitHub">↗</a>`;
       return `
-        <div class="pr-card${draftClass}">
+        <div class="pr-card${draftClass}" data-pr="${pr.number}" data-url="${escapeHtml(pr.url)}">
           <div class="issue-header">
             <span class="issue-number">#${pr.number}</span>
             <span class="issue-title">${escapeHtml(pr.title)}</span>
@@ -1163,12 +1187,148 @@ function renderDetailOverlay(detail: any) {
     </div>
   `;
   document.body.appendChild(overlay);
+
+  // Detail panel scroll sync
+  const panelEl = overlay.querySelector(".detail-panel") as HTMLElement | null;
+  if (panelEl) {
+    if (isPresenter() || !presenterUserId) {
+      // Presenter: broadcast scroll position to watchers
+      panelEl.addEventListener("scroll", () => {
+        if (detailScrollThrottleTimer !== null) return;
+        detailScrollThrottleTimer = setTimeout(() => {
+          detailScrollThrottleTimer = null;
+          sendWs({ type: "detailScroll", scrollTop: panelEl.scrollTop });
+        }, 100);
+      }, { passive: true });
+    } else if (syncMode && serverDetailScrollTop > 0) {
+      // Watcher: apply presenter's current scroll position
+      panelEl.scrollTop = serverDetailScrollTop;
+    }
+  }
 }
 
 function closeDetailPanel() {
   currentDetailIssue = null;
+  serverDetailScrollTop = 0;
   const overlay = document.querySelector(".detail-overlay");
   if (overlay) overlay.remove();
+}
+
+// ── PR Detail Panel ─────────────────────────────────────────────────────
+
+async function openPRDetailPanel(prNumber: number) {
+  const existing = document.querySelector(".detail-overlay");
+  if (existing) existing.remove();
+  serverDetailScrollTop = 0;
+
+  const cacheKey = `pr:${repo}/${prNumber}`;
+  let detail = detailCache.get(cacheKey);
+
+  if (!detail) {
+    const overlay = document.createElement("div");
+    overlay.className = "detail-overlay";
+    overlay.innerHTML = `<div class="detail-panel"><div class="loading" style="min-height:200px">Loading PR #${prNumber}...</div></div>`;
+    document.body.appendChild(overlay);
+
+    try {
+      const res = await fetch(`/api/prs/${encodeURIComponent(repo)}/${prNumber}`);
+      if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
+      detail = await res.json();
+      cacheDetail(cacheKey, detail);
+    } catch (e: any) {
+      overlay.remove();
+      console.error("PR detail fetch error:", e);
+      return;
+    }
+    overlay.remove();
+  }
+
+  renderPRDetailOverlay(detail);
+}
+
+function renderPRDetailOverlay(detail: any) {
+  const existing = document.querySelector(".detail-overlay");
+  if (existing) existing.remove();
+
+  const stateLabel = detail.isDraft ? "📝 draft" : detail.state === "merged" ? "🟣 merged" : "🟢 open";
+  const stateClass = detail.state === "merged" ? "detail-meta-state-merged" : detail.state === "open" ? "detail-meta-state-open" : "detail-meta-state-closed";
+  const branchInfo = detail.headBranch ? `<span class="pr-branch">${escapeHtml(detail.headBranch)}</span> → <span class="pr-branch">${escapeHtml(detail.baseBranch)}</span>` : "";
+
+  const statsHtml = `
+    <div class="pr-stats">
+      <span class="pr-stat pr-stat-add">+${detail.additions}</span>
+      <span class="pr-stat pr-stat-del">-${detail.deletions}</span>
+      <span class="pr-stat pr-stat-files">${detail.changedFiles} file${detail.changedFiles !== 1 ? "s" : ""}</span>
+    </div>
+  `;
+
+  const metaHtml = `
+    <div class="detail-meta">
+      <span>by <strong>@${escapeHtml(detail.creator)}</strong></span>
+      <span class="detail-meta-sep">·</span>
+      <span>${branchInfo}</span>
+      <span class="detail-meta-sep">·</span>
+      <span class="${stateClass}">${stateLabel}</span>
+    </div>
+  `;
+
+  const labelsHtml = (detail.labels ?? []).map((l: string) => `<span class="detail-label">${escapeHtml(l)}</span>`).join(" ");
+  const bodyHtml = detail.body ? formatPlainText(detail.body) : "<em>No description</em>";
+
+  const reviewsHtml = detail.reviewers?.length > 0 ? `
+    <div class="pr-reviews">
+      ${detail.reviewers.map((r: any) => {
+        const icon = r.state === "APPROVED" ? "✅" : r.state === "CHANGES_REQUESTED" ? "❌" : "💬";
+        return `<span class="pr-review">${icon} <strong>@${escapeHtml(r.user)}</strong></span>`;
+      }).join(" ")}
+    </div>
+  ` : "";
+
+  const filesHtml = detail.files?.length > 0 ? `
+    <div class="detail-comments-header">Changed Files (${detail.files.length})</div>
+    <div class="pr-files">
+      ${detail.files.map((f: any) => {
+        const statusIcon = f.status === "added" ? "+" : f.status === "removed" ? "−" : "~";
+        return `<div class="pr-file"><span class="pr-file-status pr-file-${f.status}">${statusIcon}</span><span class="pr-file-name">${escapeHtml(f.filename)}</span><span class="pr-file-diff"><span class="pr-stat-add">+${f.additions}</span> <span class="pr-stat-del">-${f.deletions}</span></span></div>`;
+      }).join("")}
+    </div>
+  ` : "";
+
+  const overlay = document.createElement("div");
+  overlay.className = "detail-overlay";
+  overlay.innerHTML = `
+    <div class="detail-panel">
+      <div class="detail-header">
+        <span class="detail-number">#${detail.number}</span>
+        <span class="detail-title">${escapeHtml(detail.title)}</span>
+        <button class="detail-close">X</button>
+      </div>
+      ${metaHtml}
+      ${statsHtml}
+      ${reviewsHtml}
+      <div class="detail-labels">${labelsHtml}</div>
+      <div class="detail-body">${bodyHtml}</div>
+      ${filesHtml}
+      <a class="detail-link" href="${escapeHtml(detail.url)}" target="_blank">View on GitHub</a>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  // Detail panel scroll sync
+  const panelEl = overlay.querySelector(".detail-panel") as HTMLElement | null;
+  if (panelEl) {
+    if (isPresenter() || !presenterUserId) {
+      panelEl.addEventListener("scroll", () => {
+        if (detailScrollThrottleTimer !== null) return;
+        detailScrollThrottleTimer = setTimeout(() => {
+          detailScrollThrottleTimer = null;
+          sendWs({ type: "detailScroll", scrollTop: panelEl.scrollTop });
+        }, 100);
+      }, { passive: true });
+    } else if (syncMode && serverDetailScrollTop > 0) {
+      panelEl.scrollTop = serverDetailScrollTop;
+    }
+  }
 }
 
 function formatPlainText(text: string): string {

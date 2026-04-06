@@ -159,6 +159,11 @@ export class StandupBot {
     this.broadcastToActivity(guildId, { type: "scroll", scrollY });
   }
 
+  /** Relay a detail panel scroll position from the presenter to all connected Activity clients. */
+  relayDetailScroll(guildId: string, scrollTop: number) {
+    this.broadcastToActivity(guildId, { type: "detailScroll", scrollTop });
+  }
+
   /** Remove a specific Activity WebSocket client by reference. */
   removeActivityClient(guildId: string, ws: any) {
     const session = this.activeSessions.get(guildId);

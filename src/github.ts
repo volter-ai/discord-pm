@@ -278,6 +278,73 @@ export async function fetchOpenPRsByAuthor(repo: string, author: string): Promis
  * Fetch ALL open assigned issues for a repo (no assignee filter),
  * used to discover participants not listed in the standup config.
  */
+export interface GitHubPRDetail {
+  number: number;
+  title: string;
+  state: string;
+  body: string;
+  url: string;
+  isDraft: boolean;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  headBranch: string;
+  baseBranch: string;
+  creator: string;
+  mergedBy: string | null;
+  labels: string[];
+  reviewers: { user: string; state: string }[];
+  files: { filename: string; additions: number; deletions: number; status: string }[];
+}
+
+/**
+ * Fetch a single PR with its body, review statuses, and changed files.
+ */
+export async function fetchPRDetail(repo: string, number: number): Promise<GitHubPRDetail> {
+  const [prRes, reviewsRes, filesRes] = await Promise.all([
+    fetch(`${GITHUB_API}/repos/${repo}/pulls/${number}`, { headers: headers(), signal: AbortSignal.timeout(10_000) }),
+    fetch(`${GITHUB_API}/repos/${repo}/pulls/${number}/reviews`, { headers: headers(), signal: AbortSignal.timeout(10_000) }),
+    fetch(`${GITHUB_API}/repos/${repo}/pulls/${number}/files?per_page=50`, { headers: headers(), signal: AbortSignal.timeout(10_000) }),
+  ]);
+
+  if (!prRes.ok) throw new Error(`GitHub API ${prRes.status}: ${await prRes.text()}`);
+  const pr = await prRes.json();
+  const rawReviews = reviewsRes.ok ? await reviewsRes.json() : [];
+  const rawFiles = filesRes.ok ? await filesRes.json() : [];
+
+  // Deduplicate reviews: keep only the latest per reviewer
+  const reviewMap = new Map<string, string>();
+  for (const r of rawReviews) {
+    if (r.user?.login && r.state !== "COMMENTED") {
+      reviewMap.set(r.user.login, r.state);
+    }
+  }
+
+  return {
+    number: pr.number,
+    title: pr.title,
+    state: pr.merged ? "merged" : pr.state,
+    body: pr.body ?? "",
+    url: pr.html_url,
+    isDraft: pr.draft ?? false,
+    additions: pr.additions ?? 0,
+    deletions: pr.deletions ?? 0,
+    changedFiles: pr.changed_files ?? 0,
+    headBranch: pr.head?.ref ?? "",
+    baseBranch: pr.base?.ref ?? "",
+    creator: pr.user?.login ?? "unknown",
+    mergedBy: pr.merged_by?.login ?? null,
+    labels: (pr.labels ?? []).map((l: any) => l.name),
+    reviewers: [...reviewMap.entries()].map(([user, state]) => ({ user, state })),
+    files: (rawFiles ?? []).map((f: any) => ({
+      filename: f.filename,
+      additions: f.additions ?? 0,
+      deletions: f.deletions ?? 0,
+      status: f.status ?? "modified",
+    })),
+  };
+}
+
 export async function fetchAllOpenAssigned(repo: string, backlogLabel: string): Promise<GitHubIssue[]> {
   const escapedLabel = backlogLabel.replace(/"/g, '\\"');
   const q = `is:issue repo:${repo} is:open is:assigned -label:"${escapedLabel}"`;

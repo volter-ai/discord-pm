@@ -27,6 +27,7 @@ import {
   assignIssue,
   fetchOpenPRsByAuthor,
   fetchAllOpenAssigned,
+  fetchPRDetail,
   type GitHubIssue,
   type GitHubPR,
 } from "./github";
@@ -239,10 +240,32 @@ const ACTIVITY_CSS = `
   .gh-link:hover{color:#818cf8}
 
   /* PR cards */
-  .pr-card{display:flex;align-items:flex-start;justify-content:space-between;background:#1e293b;border:1px solid #334155;border-radius:.375rem;padding:.5rem .75rem;margin-bottom:.25rem;gap:.5rem;cursor:default}
+  .pr-card{display:flex;align-items:flex-start;justify-content:space-between;background:#1e293b;border:1px solid #334155;border-radius:.375rem;padding:.5rem .75rem;margin-bottom:.25rem;gap:.5rem;cursor:pointer;transition:all .15s}
+  .pr-card:hover{background:#334155}
   .pr-card-draft{opacity:.65;border-style:dashed}
   .badge-draft{background:#292524;color:#a8a29e}
   .badge-merged{background:#2d1b69;color:#a78bfa}
+
+  /* PR detail modal */
+  .pr-stats{display:flex;gap:.75rem;align-items:center;margin:.5rem 0;padding:.5rem .75rem;background:#0f172a;border-radius:.375rem}
+  .pr-stat{font-size:.82rem;font-family:monospace;font-weight:600}
+  .pr-stat-add{color:#4ade80}
+  .pr-stat-del{color:#f87171}
+  .pr-stat-files{color:#94a3b8}
+  .pr-branch{font-family:monospace;font-size:.75rem;background:#0f172a;color:#94a3b8;padding:.1rem .35rem;border-radius:.2rem}
+  .pr-reviews{display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0;font-size:.82rem}
+  .pr-review{color:#94a3b8}
+  .pr-review strong{color:#c7d2fe}
+  .pr-files{display:flex;flex-direction:column;gap:.15rem;max-height:200px;overflow-y:auto}
+  .pr-file{display:flex;align-items:center;gap:.5rem;font-size:.78rem;padding:.25rem .5rem;background:#0f172a;border-radius:.25rem}
+  .pr-file-status{font-weight:700;font-family:monospace;width:1rem;text-align:center;flex-shrink:0}
+  .pr-file-added{color:#4ade80}
+  .pr-file-removed{color:#f87171}
+  .pr-file-modified{color:#fbbf24}
+  .pr-file-renamed{color:#818cf8}
+  .pr-file-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd5e1}
+  .pr-file-diff{flex-shrink:0;font-family:monospace;font-size:.72rem}
+  .detail-meta-state-merged{color:#a78bfa}
 
   /* Extra (unlisted) participant badge on board header */
   .board-extra-badge{font-size:.7rem;padding:.15rem .4rem;background:#292524;color:#a8a29e;border-radius:.25rem;margin-left:.5rem}
@@ -497,6 +520,24 @@ export function createActivityApp(
     }
   });
 
+  // Single PR detail (body + reviews + changed files)
+  app.get("/api/prs/:repo/:number", async (c) => {
+    const repo = decodeURIComponent(c.req.param("repo"));
+    const number = parseInt(c.req.param("number"));
+    if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
+
+    const validRepos = new Set(Object.values(STANDUPS).map(s => s.repo));
+    if (!validRepos.has(repo)) return c.json({ error: "Unknown repository" }, 403);
+
+    try {
+      const detail = await fetchPRDetail(repo, number);
+      return c.json(detail);
+    } catch (e: any) {
+      console.error("[activity] PR detail error:", e.message);
+      return c.json({ error: "Internal server error" }, 500);
+    }
+  });
+
   // Reassign issue to a different contributor
   app.post("/api/issues/:repo/:number/assign", async (c) => {
     // CSRF: reject cross-origin requests that are not from our server or Discord's Activity proxy.
@@ -652,6 +693,10 @@ export function createActivityApp(
 
             if (msg.type === "scroll" && guildId && typeof msg.scrollY === "number") {
               bot.relayScroll(guildId, msg.scrollY);
+            }
+
+            if (msg.type === "detailScroll" && guildId && typeof msg.scrollTop === "number") {
+              bot.relayDetailScroll(guildId, msg.scrollTop);
             }
           } catch (e: any) {
             console.error("[activity] WebSocket message error:", e.message);
