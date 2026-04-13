@@ -20,13 +20,13 @@ export interface UserMapping {
 
 /** Keyed by GitHub username (lowercased on lookup). */
 export const USERS: Record<string, UserMapping> = {
-  brunoccpires: { displayName: "Bruno" },
-  "oliver-io": { displayName: "Oliver" },
-  bouscs: { displayName: "Artur" },
-  "brennan-volter": { displayName: "Brennan" },
-  careid: { displayName: "Chris" },
-  edmundmtang: { displayName: "Edmund" },
-  mococa: { displayName: "Luiz" },
+  brunoccpires:     { displayName: "Bruno",   discordId: "1372537476303814746" },
+  "oliver-io":      { displayName: "Oliver",  discordId: "250902773489598465" },
+  bouscs:           { displayName: "Artur",   discordId: "220247560856666112" },
+  "brennan-volter": { displayName: "Brennan", discordId: "509864865435746314" },
+  careid:           { displayName: "Chris",   discordId: "913513159329980447" },
+  edmundmtang:      { displayName: "Edmund",  discordId: "181220726257352704" },
+  mococa:           { displayName: "Luiz" }, // Discord ID not yet known — fuzzy match carries us
 };
 
 export function lookupUser(githubUser: string): UserMapping | undefined {
