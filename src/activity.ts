@@ -15,8 +15,8 @@ import type { UpgradeWebSocket } from "hono/ws";
 import {
   STANDUPS,
   STANDUP_NAMES,
-  STAGE_MAP,
   getStage,
+  deriveSteps,
   type StandupConfig,
 } from "./review";
 import {
@@ -26,7 +26,6 @@ import {
   fetchIssueDetail,
   assignIssue,
   fetchOpenPRsByAuthor,
-  fetchAllOpenAssigned,
   fetchPRDetail,
   type GitHubIssue,
   type GitHubPR,
@@ -124,6 +123,9 @@ const ACTIVITY_CSS = `
   .tab-name{}
   .tab-time{font-size:.7rem;color:#4ade80;font-family:monospace;min-width:2.2rem;text-align:right}
   .tab-active .tab-time{color:#a5f3c8}
+  .tab-not-present{opacity:.45;filter:grayscale(.6)}
+  .tab-not-present:hover{opacity:.7}
+  .tab-absent-tag{font-size:.65rem;color:#94a3b8;font-style:italic;margin-left:.15rem}
 
   /* Board */
   .board{flex:1;overflow-y:auto;padding:1rem}
@@ -306,21 +308,24 @@ function groupByStage(issues: GitHubIssue[]): StageGroupOutput[] {
 }
 
 async function fetchParticipantData(config: StandupConfig) {
-  // ── Config-based participants ──────────────────────────────────────────────
-  const configParticipants = await Promise.all(config.steps.map(async (step) => {
+  // Participants are derived from GitHub: Unassigned first, then every open
+  // assignee (sorted by display name). deriveSteps handles the GitHub fetch
+  // and graceful fallback to just [Unassigned] if the API call fails.
+  const steps = await deriveSteps(config);
+
+  return await Promise.all(steps.map(async (step) => {
     let allOpen: GitHubIssue[] = [];
     let recentClosed: GitHubIssue[] = [];
     let avatarUrl = "";
     let prs: GitHubPR[] = [];
 
     if (step.type === "assignee") {
-      // Fetch recent issues, open issues, and PRs in parallel (avatar proxied server-side)
       const [recent, open, fetchedPRs] = await Promise.all([
-        fetchRecentlyUpdated(config.repo, step.user),
-        fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel),
-        fetchOpenPRsByAuthor(config.repo, step.user),
+        fetchRecentlyUpdated(config.repo, step.githubUser),
+        fetchOpenNonBacklog(config.repo, step.githubUser, config.backlogLabel),
+        fetchOpenPRsByAuthor(config.repo, step.githubUser),
       ]);
-      avatarUrl = `/activity/avatar?user=${encodeURIComponent(step.user)}`;
+      avatarUrl = `/activity/avatar?user=${encodeURIComponent(step.githubUser)}`;
       prs = fetchedPRs;
       const recentNums = new Set(recent.map(i => i.number));
       const recentOpen = recent.filter(i => i.state === "open");
@@ -331,7 +336,6 @@ async function fetchParticipantData(config: StandupConfig) {
       allOpen = await fetchOpenNonBacklog(config.repo, null, config.backlogLabel);
     }
 
-    // Build stage groups: recently closed first, then open by stage
     const stages: StageGroupOutput[] = [];
     if (recentClosed.length > 0) {
       stages.push({ emoji: "🏁", name: "Closed Today", issues: recentClosed });
@@ -339,53 +343,14 @@ async function fetchParticipantData(config: StandupConfig) {
     stages.push(...groupByStage(allOpen));
 
     return {
-      name: step.name,
-      githubUser: step.type === "assignee" ? step.user : null,
+      name: step.displayName,
+      githubUser: step.type === "assignee" ? step.githubUser : null,
+      discordId: step.type === "assignee" ? step.discordId ?? null : null,
       avatarUrl,
       stages,
       prs,
     };
   }));
-
-  // ── Discover extra participants not in config ──────────────────────────────
-  const configGitHubUsers = new Set<string>();
-  for (const step of config.steps) {
-    if (step.type === "assignee") configGitHubUsers.add(step.user.toLowerCase());
-  }
-
-  let allAssigned: GitHubIssue[] = [];
-  try {
-    allAssigned = await fetchAllOpenAssigned(config.repo, config.backlogLabel);
-  } catch (e: any) {
-    console.warn("[activity] fetchAllOpenAssigned failed:", e.message);
-  }
-
-  // Group issues by assignee, keeping only those not in the config
-  const extraAssigneeIssues = new Map<string, GitHubIssue[]>();
-  for (const issue of allAssigned) {
-    for (const assignee of issue.assignees) {
-      if (!configGitHubUsers.has(assignee.toLowerCase())) {
-        if (!extraAssigneeIssues.has(assignee)) extraAssigneeIssues.set(assignee, []);
-        extraAssigneeIssues.get(assignee)!.push(issue);
-      }
-    }
-  }
-
-  // Build extra participant entries
-  const extraParticipants = await Promise.all(
-    [...extraAssigneeIssues.entries()].map(async ([user, issues]) => {
-      const prs = await fetchOpenPRsByAuthor(config.repo, user);
-      return {
-        name: user,
-        githubUser: user,
-        avatarUrl: `/activity/avatar?user=${encodeURIComponent(user)}`,
-        stages: groupByStage(issues),
-        prs,
-      };
-    })
-  );
-
-  return [...configParticipants, ...extraParticipants];
 }
 
 // ── App factory ─────────────────────────────────────────────────────────────
@@ -643,6 +608,7 @@ export function createActivityApp(
                   const watcherNames = [...session.meta.connectedUsers.entries()]
                     .filter(([uid]) => uid !== session.meta.presenter)
                     .map(([, name]) => name);
+                  const voiceMembers = [...session.meta.voiceMembers.entries()].map(([id, name]) => ({ id, name }));
                   ws.send(JSON.stringify({
                     type: "state",
                     focusedIssue: session.meta.focusedIssue,
@@ -650,6 +616,7 @@ export function createActivityApp(
                     presenter: session.meta.presenter,
                     presenterName,
                     watcherNames,
+                    voiceMembers,
                     activeParticipantIndex: session.meta.activeParticipantIndex,
                     recording: true,
                     elapsed: Math.round((Date.now() - session.meta.startedAt.getTime()) / 1000),
@@ -663,6 +630,7 @@ export function createActivityApp(
                     presenter: null,
                     presenterName: null,
                     watcherNames: [],
+                    voiceMembers: [],
                     activeParticipantIndex: 0,
                     recording: false,
                     elapsed: 0,

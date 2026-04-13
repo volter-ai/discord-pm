@@ -68,6 +68,13 @@ interface SessionMeta {
   activityClients: Set<any>;
   /** Map of connected userId → display name for presence info. */
   connectedUsers: Map<string, string>;
+  /**
+   * Map of Discord user IDs → display names for everyone currently in the
+   * voice channel. Seeded at session start from voiceChannel.members,
+   * kept fresh via voiceStateUpdate. Used by the Activity to mark
+   * GitHub-assigned people "not present" if they never joined the call.
+   */
+  voiceMembers: Map<string, string>;
   /** Issue number currently open in the detail panel, or null. */
   focusedDetailIssue: number | null;
   /** Repo string for issue-aware transcripts (e.g. "volter-ai/runhuman"). */
@@ -108,6 +115,50 @@ export class StandupBot {
     });
 
     this.client.on("interactionCreate", (i) => this.handleInteraction(i));
+    this.client.on("voiceStateUpdate", (oldState, newState) => {
+      this.handleVoiceStateUpdate(oldState, newState);
+    });
+  }
+
+  /**
+   * Keep each active session's voiceMembers map in sync with the voice channel.
+   * Broadcasts the updated state so Activity tabs can re-evaluate "not present".
+   */
+  private handleVoiceStateUpdate(oldState: any, newState: any) {
+    const guildId = newState.guild?.id ?? oldState.guild?.id;
+    if (!guildId) return;
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+
+    const userId: string | undefined = newState.id ?? oldState.id;
+    if (!userId) return;
+
+    const joinedThisChannel = newState.channelId === session.channelId;
+    const leftThisChannel =
+      oldState.channelId === session.channelId && newState.channelId !== session.channelId;
+
+    let changed = false;
+    if (joinedThisChannel) {
+      const name =
+        newState.member?.displayName ?? newState.member?.user?.username ?? userId;
+      if (session.voiceMembers.get(userId) !== name) {
+        session.voiceMembers.set(userId, name);
+        changed = true;
+      }
+    } else if (leftThisChannel) {
+      if (session.voiceMembers.delete(userId)) changed = true;
+    }
+
+    if (changed) this.broadcastActivityState(guildId);
+  }
+
+  /** Seed voiceMembers from the current voice channel membership. */
+  private snapshotVoiceMembers(session: SessionMeta, voiceChannel: VoiceChannel) {
+    session.voiceMembers.clear();
+    for (const [id, member] of voiceChannel.members) {
+      if (member.user.bot) continue;
+      session.voiceMembers.set(id, member.displayName ?? member.user.username ?? id);
+    }
   }
 
   async start(token: string) {
@@ -220,6 +271,7 @@ export class StandupBot {
     const watcherNames = [...session.connectedUsers.entries()]
       .filter(([userId]) => userId !== session.presenter)
       .map(([, name]) => name);
+    const voiceMembers = [...session.voiceMembers.entries()].map(([id, name]) => ({ id, name }));
     this.broadcastToActivity(guildId, {
       type: "state",
       focusedIssue: session.focusedIssue,
@@ -227,6 +279,7 @@ export class StandupBot {
       presenter: session.presenter,
       presenterName,
       watcherNames,
+      voiceMembers,
       activeParticipantIndex: session.activeParticipantIndex,
       recording: true,
       elapsed: Math.round((Date.now() - session.startedAt.getTime()) / 1000),
@@ -499,12 +552,14 @@ export class StandupBot {
       activeParticipantIndex: 0,
       activityClients: new Set(),
       connectedUsers: new Map(),
+      voiceMembers: new Map(),
       focusedDetailIssue: null,
       issueRepo: null,
       hadActivity: false,
       issueMeta: new Map(),
     };
     this.activeSessions.set(guildId, session);
+    this.snapshotVoiceMembers(session, voiceChannel);
 
     try {
       await this.recorder.start(voiceChannel, {
@@ -622,12 +677,14 @@ export class StandupBot {
       activeParticipantIndex: 0,
       activityClients: new Set(),
       connectedUsers: new Map(),
+      voiceMembers: new Map(),
       focusedDetailIssue: null,
       issueRepo: null,
       hadActivity: false,
       issueMeta: new Map(),
     };
     this.activeSessions.set(guildId, session);
+    this.snapshotVoiceMembers(session, voiceChannel);
 
     try {
       await this.recorder.start(voiceChannel, {

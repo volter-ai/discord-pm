@@ -38,10 +38,14 @@ interface StageGroup {
 interface Participant {
   name: string;
   githubUser: string | null;
+  /** Discord user ID from the USERS registry, used to match against voice-channel presence. Null for Unassigned and for contributors without a registry entry. */
+  discordId: string | null;
   avatarUrl: string;
   stages: StageGroup[];
   prs: PR[];
 }
+
+interface VoiceMember { id: string; name: string }
 
 interface IssuesResponse {
   standupKey: string;
@@ -54,7 +58,7 @@ type ServerMessage =
   | { type: "speaker"; userId: string; name: string; speaking: boolean }
   | { type: "utterance"; speaker: string; issueNumber: number | null; text: string; startedAt: number }
   | { type: "session"; recording: boolean; elapsed: number; utteranceCount: number }
-  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number }
+  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; voiceMembers: VoiceMember[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number }
   | { type: "scroll"; scrollY: number }
   | { type: "detailScroll"; scrollTop: number };
 
@@ -79,6 +83,8 @@ let speakingUsers = new Set<string>();
 let speakingNames = new Set<string>();
 let participantTimers = new Map<string, number>(); // name → accumulated ms
 let speakerStartTimes = new Map<string, number>();  // name → start timestamp
+/** Voice-channel members from the server (discord_id + display name). */
+let voiceMembers: VoiceMember[] = [];
 let standupKey = "";
 let repo = "";
 let timerInterval: ReturnType<typeof setInterval> | null = null;
@@ -108,6 +114,30 @@ function resolveParticipantName(discordName: string): string {
   const resolved = match ? match.name : discordName;
   nameResolverCache.set(discordName, resolved);
   return resolved;
+}
+
+/**
+ * Is this participant in (or was in) the voice call?
+ *
+ * Unassigned and participants without any identifying info are always "present"
+ * (no sensible way to be absent). For assignees:
+ *   - exact match by discordId against voiceMembers wins
+ *   - else fuzzy display-name match against voiceMembers (exact → ci → first word)
+ *   - else check if they've spoken at some point (participantTimers has an entry)
+ */
+function isParticipantPresent(p: Participant): boolean {
+  if (p.githubUser === null) return true; // Unassigned
+  if (p.discordId && voiceMembers.some(m => m.id === p.discordId)) return true;
+  const lower = p.name.toLowerCase();
+  const first = p.name.split(/[\s_-]+/)[0].toLowerCase();
+  for (const m of voiceMembers) {
+    const mLower = m.name.toLowerCase();
+    if (mLower === lower) return true;
+    const mFirst = m.name.split(/[\s_-]+/)[0].toLowerCase();
+    if (mFirst === first) return true;
+  }
+  if ((participantTimers.get(p.name) ?? 0) > 0) return true;
+  return false;
 }
 
 function cacheDetail(key: string, value: any) {
@@ -384,6 +414,13 @@ function handleServerMessage(msg: ServerMessage) {
       presenterUserId = msg.presenter;
       presenterName = msg.presenterName ?? null;
       watcherNames = msg.watcherNames ?? [];
+      // Track voice-channel membership — drives "not present" tab styling.
+      // Diff against previous so we only re-render tabs when it actually changes.
+      const incomingVM = msg.voiceMembers ?? [];
+      const voiceChanged =
+        incomingVM.length !== voiceMembers.length ||
+        incomingVM.some((m, i) => voiceMembers[i]?.id !== m.id || voiceMembers[i]?.name !== m.name);
+      voiceMembers = incomingVM;
       // Save server's canonical state
       serverFocusedIssue = msg.focusedIssue;
       serverActiveTabIndex = msg.activeParticipantIndex ?? 0;
@@ -415,6 +452,8 @@ function handleServerMessage(msg: ServerMessage) {
           render();
           // After re-render, apply presenter's scroll position
           window.scrollTo({ top: serverScrollY, behavior: "instant" });
+        } else if (voiceChanged && participants.length > 0) {
+          render();
         } else if (focusChanged) {
           updateFocusHighlight();
           updateHeader();
@@ -425,8 +464,11 @@ function handleServerMessage(msg: ServerMessage) {
         }
       } else {
         // Not synced — just update timer/counts and the badge
-        updateHeader();
-        updateSyncBadge();
+        if (voiceChanged && participants.length > 0) render();
+        else {
+          updateHeader();
+          updateSyncBadge();
+        }
       }
       break;
     }
@@ -511,7 +553,10 @@ function renderTabs(): string {
   const tabs = participants.map((p, i) => {
     const active = i === activeTabIndex ? "tab-active" : "";
     const speakingClass = speakingNames.has(p.name) ? "tab-speaking" : "";
-    return `<button class="tab ${active} ${speakingClass}" data-index="${i}"><span class="tab-name">${escapeHtml(p.name)}</span><span class="tab-time" id="tab-time-${i}"></span></button>`;
+    const present = isParticipantPresent(p);
+    const absentClass = present ? "" : "tab-not-present";
+    const absentSuffix = present ? "" : `<span class="tab-absent-tag">(not present)</span>`;
+    return `<button class="tab ${active} ${speakingClass} ${absentClass}" data-index="${i}"><span class="tab-name">${escapeHtml(p.name)}</span>${absentSuffix}<span class="tab-time" id="tab-time-${i}"></span></button>`;
   }).join("");
 
   const allPRCount = participants.reduce((n, p) => n + (p.prs?.length ?? 0), 0);

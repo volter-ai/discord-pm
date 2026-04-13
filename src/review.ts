@@ -1,10 +1,9 @@
 /**
  * Issue review session for standups — dashboard-style embeds.
  *
- * Each standup has an ordered list of "steps" (assignee reviews or
- * unassigned triage). The bot posts one embed per step, with Next/Done
- * buttons to navigate. Issues are grouped by stage label into
- * kanban-style inline fields.
+ * Participants are derived from GitHub: every open assignee (minus the
+ * configured backlog label) gets a step, sorted alphabetically by display
+ * name, with an "Unassigned" step always prepended.
  */
 
 import {
@@ -18,54 +17,83 @@ import {
   fetchRecentlyUpdated,
   fetchOpenNonBacklog,
   fetchUserAvatar,
+  fetchAllOpenAssigned,
   type GitHubIssue,
 } from "./github";
+import { lookupUser, resolveDisplayName } from "./users";
 
 // ── Standup configuration ────────────────────────────────────────────────────
-
-interface StepAssignee {
-  type: "assignee";
-  user: string;
-  name: string;
-}
-
-interface StepUnassigned {
-  type: "unassigned";
-  name: string;
-}
-
-type Step = StepAssignee | StepUnassigned;
 
 export interface StandupConfig {
   repo: string;
   backlogLabel: string;
-  steps: Step[];
 }
 
 export const STANDUPS: Record<string, StandupConfig> = {
   portable: {
     repo: "volter-ai/mobile-vgit",
     backlogLabel: "stage:backlogged",
-    steps: [
-      { type: "assignee", user: "BrunoCCPires", name: "Bruno" },
-      { type: "assignee", user: "oliver-io", name: "Oliver" },
-    ],
   },
   runhuman: {
     repo: "volter-ai/runhuman",
     backlogLabel: "stage: Backlog",
-    steps: [
-      { type: "unassigned", name: "Unassigned" },
-      { type: "assignee", user: "bouscs", name: "Artur" },
-      { type: "assignee", user: "brennan-volter", name: "Brennan" },
-      { type: "assignee", user: "careid", name: "Chris" },
-      { type: "assignee", user: "edmundmtang", name: "Edmund" },
-      { type: "assignee", user: "mococa", name: "Luiz" },
-    ],
   },
 };
 
 export const STANDUP_NAMES = Object.keys(STANDUPS);
+
+// ── Derived participant steps ────────────────────────────────────────────────
+
+export interface AssigneeStep {
+  type: "assignee";
+  githubUser: string;
+  displayName: string;
+  discordId?: string;
+}
+
+export interface UnassignedStep {
+  type: "unassigned";
+  displayName: "Unassigned";
+}
+
+export type DerivedStep = AssigneeStep | UnassignedStep;
+
+/**
+ * Build the ordered participant list for a standup from live GitHub data.
+ *
+ * Unassigned is always first. Assignees follow alphabetically by display
+ * name (case-insensitive). Returns just `[Unassigned]` if the GitHub fetch
+ * fails, so the embed/Activity still renders something useful.
+ */
+export async function deriveSteps(config: StandupConfig): Promise<DerivedStep[]> {
+  let assignees = new Set<string>();
+  try {
+    const issues = await fetchAllOpenAssigned(config.repo, config.backlogLabel);
+    for (const issue of issues) {
+      for (const assignee of issue.assignees) {
+        assignees.add(assignee);
+      }
+    }
+  } catch (e: any) {
+    console.warn("[review] deriveSteps: fetchAllOpenAssigned failed:", e.message);
+  }
+
+  const assigneeSteps: AssigneeStep[] = [...assignees].map((ghUser) => {
+    const mapping = lookupUser(ghUser);
+    return {
+      type: "assignee",
+      githubUser: ghUser,
+      displayName: mapping?.displayName ?? ghUser,
+      discordId: mapping?.discordId,
+    };
+  });
+
+  assigneeSteps.sort((a, b) =>
+    a.displayName.toLowerCase().localeCompare(b.displayName.toLowerCase()),
+  );
+
+  return [{ type: "unassigned", displayName: "Unassigned" }, ...assigneeSteps];
+}
 
 // ── Stage labels → display ───────────────────────────────────────────────────
 
@@ -165,14 +193,24 @@ function embedColor(issues: GitHubIssue[]): number {
 
 // ── Embed building ───────────────────────────────────────────────────────────
 
+/**
+ * Build the review embed for one step. Derives the ordered step list from
+ * live GitHub data when `steps` isn't supplied (e.g. initial /review call).
+ * Pass `steps` to reuse a list you already derived.
+ */
 export async function buildStepEmbed(
   standupKey: string,
   stepIndex: number,
+  steps?: DerivedStep[],
 ): Promise<{ embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> }> {
   const config = STANDUPS[standupKey];
   if (!config) throw new Error(`Unknown standup key: ${standupKey}`);
-  const step = config.steps[stepIndex];
-  if (!step) throw new Error(`Step ${stepIndex} out of bounds for standup "${standupKey}" (${config.steps.length} steps)`);
+
+  const resolvedSteps = steps ?? (await deriveSteps(config));
+  // Clamp: if the assignee list shifted between clicks, don't crash.
+  const safeIndex = Math.max(0, Math.min(stepIndex, resolvedSteps.length - 1));
+  const step = resolvedSteps[safeIndex];
+  if (!step) throw new Error(`No steps available for standup "${standupKey}"`);
 
   const repoUrl = `https://github.com/${config.repo}/issues`;
 
@@ -183,9 +221,9 @@ export async function buildStepEmbed(
   if (step.type === "assignee") {
     // Parallelize all independent API calls — was sequential (up to 30s worst-case).
     const [recent, open, avatar] = await Promise.all([
-      fetchRecentlyUpdated(config.repo, step.user),
-      fetchOpenNonBacklog(config.repo, step.user, config.backlogLabel),
-      fetchUserAvatar(step.user),
+      fetchRecentlyUpdated(config.repo, step.githubUser),
+      fetchOpenNonBacklog(config.repo, step.githubUser, config.backlogLabel),
+      fetchUserAvatar(step.githubUser),
     ]);
     recentIssues = recent;
     resolvedAvatarUrl = avatar;
@@ -215,15 +253,15 @@ export async function buildStepEmbed(
   const statsLine = stats.join("  ·  ");
 
   // ── Build embed ──
-  const totalSteps = config.steps.length;
+  const totalSteps = resolvedSteps.length;
   const embed = new EmbedBuilder().setColor(embedColor(allOpen));
 
   // Author with avatar for assignee steps (avatar already fetched in parallel above)
   if (step.type === "assignee") {
     embed.setAuthor({
-      name: `${step.name}  —  ${standupKey}`,
+      name: `${step.displayName}  —  ${standupKey}`,
       iconURL: resolvedAvatarUrl,
-      url: `${repoUrl}?q=assignee:${step.user}+sort:updated-desc`,
+      url: `${repoUrl}?q=assignee:${step.githubUser}+sort:updated-desc`,
     });
   } else {
     embed.setAuthor({
@@ -274,17 +312,22 @@ export async function buildStepEmbed(
   }
 
   embed.setFooter({
-    text: `Step ${stepIndex + 1}/${totalSteps}  ·  ${config.repo}`,
+    text: `Step ${safeIndex + 1}/${totalSteps}  ·  ${config.repo}`,
   });
 
   // ── Buttons ──
-  const isLast = stepIndex >= totalSteps - 1;
-  const nextStep = config.steps[stepIndex + 1];
+  const isLast = safeIndex >= totalSteps - 1;
+  const nextStep = resolvedSteps[safeIndex + 1];
+
+  const assigneeQuery =
+    step.type === "assignee"
+      ? `${repoUrl}?q=assignee:${step.githubUser}+sort:updated-desc`
+      : `${repoUrl}?q=no:assignee+is:open`;
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`review:next:${standupKey}:${stepIndex + 1}`)
-      .setLabel(isLast ? "Next" : `${nextStep.name} →`)
+      .setCustomId(`review:next:${standupKey}:${safeIndex + 1}`)
+      .setLabel(isLast ? "Next" : `${nextStep.displayName} →`)
       .setStyle(ButtonStyle.Primary)
       .setDisabled(isLast),
     new ButtonBuilder()
@@ -294,11 +337,7 @@ export async function buildStepEmbed(
     new ButtonBuilder()
       .setLabel("Open on GitHub")
       .setStyle(ButtonStyle.Link)
-      .setURL(
-        step.type === "assignee"
-          ? `${repoUrl}?q=assignee:${step.user}+sort:updated-desc`
-          : `${repoUrl}?q=no:assignee+is:open`,
-      ),
+      .setURL(assigneeQuery),
   );
 
   return { embed, row };
