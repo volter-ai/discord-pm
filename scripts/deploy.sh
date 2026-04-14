@@ -14,6 +14,17 @@
 
 set -euo pipefail
 
+# Load WEB_PASSWORD (and any other vars) from .env at repo root if present, so
+# the preflight works without the caller having to export it manually.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../.env"
+if [[ -z "${WEB_PASSWORD:-}" && -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 FORCE=0
 FLY_ARGS=()
 for arg in "$@"; do
@@ -50,4 +61,4 @@ if [[ $FORCE -eq 0 ]]; then
   echo "[deploy] No active sessions. Proceeding with fly deploy."
 fi
 
-exec fly deploy "${FLY_ARGS[@]}"
+exec fly deploy ${FLY_ARGS[@]+"${FLY_ARGS[@]}"}
