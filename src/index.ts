@@ -69,6 +69,9 @@ const server = Bun.serve({
   hostname: "0.0.0.0",
   fetch: app.fetch,
   websocket,
+  // Brief generation (GitHub fetch + Claude summarization) can take >10s;
+  // Bun's 10s default cuts the connection and the fly proxy surfaces a 502.
+  idleTimeout: 120,
 });
 
 console.log(`[server] HTTP server listening on :${PORT}`);
