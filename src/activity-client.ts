@@ -1027,7 +1027,7 @@ async function fetchAssigneeBrief(assignee: string, refresh = false): Promise<vo
   try {
     const qs = new URLSearchParams({ standup: standupKey, assignee });
     if (refresh) qs.set("refresh", "1");
-    const res = await fetch(`/activity/api/assignee-brief?${qs.toString()}`);
+    const res = await fetch(`/api/assignee-brief?${qs.toString()}`);
     if (!res.ok) {
       const body = await res.json().catch(() => ({} as any));
       throw new Error(body.error || `HTTP ${res.status}`);
