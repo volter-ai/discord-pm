@@ -24,13 +24,52 @@ import {
 import { Recorder, type Utterance } from "./recorder";
 import { Transcriber } from "./transcriber";
 import { Summarizer } from "./summarizer";
-import { StandupStore, type UtteranceSegment } from "./store";
+import {
+  StandupStore,
+  type UtteranceSegment,
+  type Proposal,
+  type ProposalPayload,
+  type ProposalTriggerReason,
+  type StandupRecord,
+} from "./store";
 import { STANDUPS, STANDUP_NAMES, buildStepEmbed } from "./review";
+import { ProposalGenerator } from "./proposals";
+import {
+  closeIssue,
+  reopenIssue,
+  createComment,
+  createIssue,
+  assignIssue,
+  setLabels,
+} from "./github";
+import { USERS } from "./users";
 
 const GUILD_ID = process.env.DISCORD_GUILD_ID ?? "1219420218233847878";
 
 /** Max concurrent transcription API calls to avoid rate limits + memory spikes. */
 const MAX_CONCURRENT_TRANSCRIPTIONS = 3;
+
+/** Network-safe projection of a Proposal for the Activity WebSocket. */
+export function serializeProposal(p: Proposal) {
+  return {
+    id: p.id,
+    standupId: p.standup_id,
+    createdAt: p.created_at,
+    triggerReason: p.trigger_reason,
+    focusedIssue: p.focused_issue,
+    actionType: p.action_type,
+    repo: p.repo,
+    targetIssue: p.target_issue,
+    payload: p.payload,
+    originalPayload: p.original_payload,
+    state: p.state,
+    version: p.version,
+    executedAt: p.executed_at,
+    executedBy: p.executed_by,
+    executionResult: p.execution_result,
+    supersededBy: p.superseded_by,
+  };
+}
 
 interface TranscribedLine {
   speaker: string;
@@ -84,10 +123,33 @@ interface SessionMeta {
   hadActivity: boolean;
   /** Cached issue metadata (title + state) keyed by issue number. */
   issueMeta: Map<number, { title: string; state: string }>;
+  /** For standups: pre-inserted standups.id so live proposals (#53) can FK it.
+   *  Null for meetings and sessions that pre-date the lifecycle change. */
+  standupId: number | null;
+  /** Live-proposal trigger state (#53). Null for meetings. */
+  proposalTrigger: {
+    lastEvalAtByIssue: Map<number, number>;
+    lastSegmentCountByIssue: Map<number, number>;
+    evalInFlight: Set<number>;
+    /** Per-issue last generated proposals — lets the generator supersede its
+     *  own outputs instead of duplicating on re-eval. */
+    activeByIssue: Map<number, number[]>;
+  } | null;
+  /** Fallback-60s scanner interval handle (cleared at stop). */
+  proposalFallbackTimer: ReturnType<typeof setInterval> | null;
 }
 
 /** Drain timeout: 5 minutes max wait for transcriptions after stop. */
 const DRAIN_TIMEOUT_MS = 300_000;
+
+/** Min gap between proposal evaluations for the same issue. Prevents rapid-fire
+ *  calls when users browse the board. */
+const PROPOSAL_MIN_DEBOUNCE_MS = 8_000;
+/** Fallback eval cadence: re-evaluate any focused issue whose eval is older than
+ *  this threshold (handles long monologues on one issue). */
+const PROPOSAL_FALLBACK_STALE_MS = 60_000;
+/** Chris's always-affirm admin Discord ID (from src/users.ts USERS.careid). */
+const ADMIN_DISCORD_ID = "913513159329980447";
 
 export class StandupBot {
   private client: Client;
@@ -95,12 +157,16 @@ export class StandupBot {
   private transcriber = new Transcriber();
   private summarizer: Summarizer;
   private store = new StandupStore();
+  private proposalGenerator: ProposalGenerator | null = null;
   private activeSessions = new Map<string, SessionMeta>();
   /** Guards against concurrent finishRecording calls for the same guild. */
   private stoppingGuilds = new Set<string>();
 
   constructor() {
     this.summarizer = new Summarizer(process.env.ANTHROPIC_API_KEY!);
+    if (process.env.ANTHROPIC_API_KEY) {
+      this.proposalGenerator = new ProposalGenerator(process.env.ANTHROPIC_API_KEY);
+    }
 
     this.client = new Client({
       intents: [
@@ -254,6 +320,7 @@ export class StandupBot {
   setFocusedIssue(guildId: string, issueNumber: number | null, issueTitle?: string, issueState?: string) {
     const session = this.activeSessions.get(guildId);
     if (session) {
+      const outgoingIssue = session.focusedIssue;
       session.focusedIssue = issueNumber;
       if (issueNumber && issueTitle) {
         const state = issueState ?? "open";
@@ -262,6 +329,10 @@ export class StandupBot {
       }
       this.store.updateActiveSessionState(guildId, { focused_issue: issueNumber });
       this.broadcastActivityState(guildId);
+      // Eval the OUTGOING issue's proposals before switching context.
+      if (outgoingIssue != null && outgoingIssue !== issueNumber) {
+        this.maybeEvaluateProposals(session, outgoingIssue, "focus_change");
+      }
     }
   }
 
@@ -537,6 +608,14 @@ export class StandupBot {
           issueRepo: row.issue_repo,
           hadActivity: false,
           issueMeta: new Map(),
+          standupId: row.standup_id,
+          proposalTrigger: row.type === "standup" && row.standup_id != null ? {
+            lastEvalAtByIssue: new Map(),
+            lastSegmentCountByIssue: new Map(),
+            evalInFlight: new Set(),
+            activeByIssue: new Map(),
+          } : null,
+          proposalFallbackTimer: null,
         };
         for (const l of this.store.getActiveSessionLines(row.guild_id, row.started_at)) {
           session.lines.push({
@@ -579,8 +658,10 @@ export class StandupBot {
               name: displayName,
               speaking,
             });
+            this.onSpeakerChangeForProposals(session, userId, speaking);
           },
         });
+        this.startProposalFallbackTimer(session);
 
         this.store.saveActiveSession({ ...row, resumed_count: row.resumed_count + 1 });
 
@@ -617,6 +698,7 @@ export class StandupBot {
       presenter: session.presenter,
       active_participant_index: session.activeParticipantIndex,
       resumed_count: 0,
+      standup_id: session.standupId,
     });
   }
 
@@ -720,10 +802,16 @@ export class StandupBot {
     }
 
     const guildId = interaction.guildId!;
+    const startedAt = new Date();
+    const standupId = this.store.startStandup({
+      guild_id: guildId,
+      channel_id: voiceChannel.id,
+      started_at: startedAt.toISOString(),
+    });
     const session: SessionMeta = {
       guildId,
       type: "standup",
-      startedAt: new Date(),
+      startedAt,
       channelId: voiceChannel.id,
       textChannelId: interaction.channelId,
       lines: [],
@@ -741,10 +829,19 @@ export class StandupBot {
       issueRepo: null,
       hadActivity: false,
       issueMeta: new Map(),
+      standupId,
+      proposalTrigger: {
+        lastEvalAtByIssue: new Map(),
+        lastSegmentCountByIssue: new Map(),
+        evalInFlight: new Set(),
+        activeByIssue: new Map(),
+      },
+      proposalFallbackTimer: null,
     };
     this.activeSessions.set(guildId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
     this.persistSessionStart(guildId, session);
+    this.startProposalFallbackTimer(session);
 
     try {
       await this.recorder.start(voiceChannel, {
@@ -766,6 +863,7 @@ export class StandupBot {
             name: displayName,
             speaking,
           });
+          this.onSpeakerChangeForProposals(session, userId, speaking);
         },
       });
 
@@ -797,7 +895,11 @@ export class StandupBot {
       if (this.activeSessions.get(guildId) === session) {
         this.activeSessions.delete(guildId);
       }
+      this.stopProposalFallbackTimer(session);
       this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
+      if (session.standupId != null) {
+        try { this.store.deleteStandup(session.standupId); } catch { /* best-effort */ }
+      }
       await interaction.followUp(`Failed to start recording: ${e.message}`);
     }
   }
@@ -871,6 +973,9 @@ export class StandupBot {
       issueRepo: null,
       hadActivity: false,
       issueMeta: new Map(),
+      standupId: null,
+      proposalTrigger: null,
+      proposalFallbackTimer: null,
     };
     this.activeSessions.set(guildId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
@@ -983,6 +1088,7 @@ export class StandupBot {
       for (const ws of session.activityClients) {
         try { ws.close(); } catch { /* ignore */ }
       }
+      this.stopProposalFallbackTimer(session);
     }
 
     // Identity-guarded cleanup: only evict the map entry if it still points
@@ -998,6 +1104,24 @@ export class StandupBot {
     }
 
     if (!session || session.lines.length === 0) {
+      // Clean up empty pre-inserted standup row if no proposals were generated.
+      if (session?.standupId != null) {
+        const proposals = this.store.listProposalsForStandup(session.standupId);
+        if (proposals.length === 0) {
+          try { this.store.deleteStandup(session.standupId); } catch { /* best-effort */ }
+        } else {
+          // Proposals exist — close out the row with an empty-meeting marker.
+          this.store.finishStandup(session.standupId, {
+            guild_id: session.guildId,
+            channel_id: session.channelId,
+            started_at: session.startedAt.toISOString(),
+            ended_at: endedAt.toISOString(),
+            participants: [],
+            raw_transcript: "",
+            summary_text: "(No speech captured)",
+          });
+        }
+      }
       try {
         await interaction.followUp?.("No speech was captured — meeting may have been silent or too short.");
       } catch {
@@ -1039,7 +1163,7 @@ export class StandupBot {
       }
     } catch (e: any) {
       console.error("[bot] Summarization failed:", e);
-      const { id: recordId } = this.store.save({
+      const { id: recordId } = this.persistFinalRecord(session, {
         guild_id: guildId,
         channel_id: session.channelId,
         started_at: startedAt.toISOString(),
@@ -1079,7 +1203,7 @@ export class StandupBot {
       return;
     }
 
-    const { id: recordId } = this.store.save({
+    const { id: recordId } = this.persistFinalRecord(session, {
       guild_id: guildId,
       channel_id: session.channelId,
       started_at: startedAt.toISOString(),
@@ -1241,6 +1365,302 @@ export class StandupBot {
     } catch (e: any) {
       console.error("[bot] Review error:", e);
       await interaction.followUp(`Failed to fetch issues: ${e.message}`);
+    }
+  }
+
+  /** Finalize the standup row using the lifecycle's finishStandup when we
+   *  pre-inserted at /standup start; otherwise fall back to store.save (meetings
+   *  and legacy standups without a pre-insert). */
+  private persistFinalRecord(session: SessionMeta, record: StandupRecord): { id: number; transcriptPath: string } {
+    if (session.standupId != null) {
+      return this.store.finishStandup(session.standupId, record);
+    }
+    return this.store.save(record);
+  }
+
+  // ── Live action-bar proposals (#53) ────────────────────────────────────
+
+  /** Current proposals for a session's standup, filtered to live ones. */
+  getActiveProposals(guildId: string): Proposal[] {
+    const session = this.activeSessions.get(guildId);
+    if (!session || session.standupId == null) return [];
+    return this.store.listActiveProposalsForStandup(session.standupId);
+  }
+
+  /** Start the 10s fallback scanner that re-evaluates long-monologue issues. */
+  private startProposalFallbackTimer(session: SessionMeta) {
+    if (session.type !== "standup" || session.standupId == null) return;
+    if (session.proposalFallbackTimer) return;
+    session.proposalFallbackTimer = setInterval(() => {
+      if (session.focusedIssue == null) return;
+      const lastEval = session.proposalTrigger?.lastEvalAtByIssue.get(session.focusedIssue) ?? 0;
+      if (Date.now() - lastEval >= PROPOSAL_FALLBACK_STALE_MS) {
+        this.maybeEvaluateProposals(session, session.focusedIssue, "fallback_60s");
+      }
+    }, 10_000);
+  }
+
+  private stopProposalFallbackTimer(session: SessionMeta) {
+    if (session.proposalFallbackTimer) {
+      clearInterval(session.proposalFallbackTimer);
+      session.proposalFallbackTimer = null;
+    }
+  }
+
+  /** Speaker hand-off triggers eval of the currently-focused issue. Edge
+   *  trigger only (someone newly started speaking), not stop events. */
+  private onSpeakerChangeForProposals(
+    session: SessionMeta,
+    _userId: string,
+    speaking: boolean,
+  ) {
+    if (!speaking) return;
+    if (session.focusedIssue == null) return;
+    this.maybeEvaluateProposals(session, session.focusedIssue, "speaker_change");
+  }
+
+  /** Debounced, stampede-guarded entry point for producing proposals. */
+  private maybeEvaluateProposals(
+    session: SessionMeta,
+    issueNumber: number,
+    trigger: ProposalTriggerReason,
+  ) {
+    if (!this.proposalGenerator) return;
+    if (session.type !== "standup" || session.standupId == null) return;
+    const trig = session.proposalTrigger;
+    if (!trig) return;
+    if (trig.evalInFlight.has(issueNumber)) return;
+
+    const lastAt = trig.lastEvalAtByIssue.get(issueNumber) ?? 0;
+    if (Date.now() - lastAt < PROPOSAL_MIN_DEBOUNCE_MS) return;
+
+    // Only eval if there are new segments since the last eval.
+    const issueLines = session.lines.filter((l) => l.issueNumber === issueNumber);
+    const lastCount = trig.lastSegmentCountByIssue.get(issueNumber) ?? 0;
+    if (issueLines.length <= lastCount) return;
+
+    trig.evalInFlight.add(issueNumber);
+    trig.lastEvalAtByIssue.set(issueNumber, Date.now());
+    trig.lastSegmentCountByIssue.set(issueNumber, issueLines.length);
+
+    this.evaluateProposals(session, issueNumber, trigger).finally(() => {
+      trig.evalInFlight.delete(issueNumber);
+    });
+  }
+
+  private async evaluateProposals(
+    session: SessionMeta,
+    issueNumber: number,
+    trigger: ProposalTriggerReason,
+  ) {
+    if (!this.proposalGenerator || session.standupId == null) return;
+    const repo = session.issueRepo;
+    if (!repo) return;
+
+    const meta = session.issueMeta.get(issueNumber);
+    const issueLines = session.lines.filter((l) => l.issueNumber === issueNumber);
+    if (issueLines.length === 0) return;
+
+    const recentSegments = issueLines.map((l) => ({
+      id: l.startedAt,
+      speaker: l.speaker,
+      text: l.text,
+      startedAtMs: l.startedAt,
+    }));
+
+    const known = this.store
+      .listActiveProposalsForStandup(session.standupId)
+      .filter((p) => p.focused_issue === issueNumber);
+
+    const assignableUsers = Object.keys(USERS);
+
+    let generated;
+    try {
+      generated = await this.proposalGenerator.generate({
+        focusedIssue: meta ? { number: issueNumber, title: meta.title, state: meta.state } : { number: issueNumber, title: "", state: "open" },
+        recentSegments,
+        knownProposals: known,
+        repo,
+        assignableUsers,
+        trigger,
+      });
+    } catch (e: any) {
+      console.error(`[bot] ProposalGenerator error for #${issueNumber}:`, e.message);
+      return;
+    }
+
+    if (generated.length === 0) return;
+
+    for (const g of generated) {
+      try {
+        const proposal = this.store.insertProposal({
+          standup_id: session.standupId,
+          guild_id: session.guildId,
+          created_at: new Date().toISOString(),
+          trigger_reason: trigger,
+          focused_issue: issueNumber,
+          action_type: g.action_type,
+          repo,
+          target_issue: g.target_issue,
+          payload: g.payload,
+          source_segment_ids: g.source_segment_ids,
+        });
+        if (g.supersedes != null) {
+          this.store.supersedeProposal(g.supersedes, proposal.id);
+          this.broadcastToActivity(session.guildId, {
+            type: "proposal-remove",
+            id: g.supersedes,
+          });
+        }
+        this.broadcastToActivity(session.guildId, {
+          type: "proposal-upsert",
+          proposal: serializeProposal(proposal),
+        });
+      } catch (e: any) {
+        console.error("[bot] insertProposal failed:", e.message);
+      }
+    }
+  }
+
+  /** Server-side authorization for proposal write actions. Voice-channel
+   *  members (by Discord ID) + Chris (admin override). */
+  private authorizeProposalActor(session: SessionMeta, userId: string | null): boolean {
+    if (!userId) return false;
+    if (userId === ADMIN_DISCORD_ID) return true;
+    return session.voiceMembers.has(userId);
+  }
+
+  /** Edit a proposal's payload (last-write-wins via monotonic version). */
+  handleProposalEdit(
+    guildId: string,
+    userId: string | null,
+    id: number,
+    expectedVersion: number,
+    payload: ProposalPayload,
+  ): { ok: true } | { error: string; status: number } {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return { error: "No active session", status: 404 };
+    if (!this.authorizeProposalActor(session, userId)) return { error: "Forbidden", status: 403 };
+
+    const updated = this.store.editProposal(id, expectedVersion, payload);
+    if (!updated) return { error: "Proposal not found", status: 404 };
+    // Always rebroadcast — stale edits receive canonical version back.
+    this.broadcastToActivity(guildId, {
+      type: "proposal-upsert",
+      proposal: serializeProposal(updated),
+    });
+    return { ok: true };
+  }
+
+  /** Dismiss a proposal (soft delete — row kept for post-meeting audit). */
+  handleProposalDismiss(
+    guildId: string,
+    userId: string | null,
+    id: number,
+  ): { ok: true } | { error: string; status: number } {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return { error: "No active session", status: 404 };
+    if (!this.authorizeProposalActor(session, userId)) return { error: "Forbidden", status: 403 };
+    const updated = this.store.dismissProposal(id);
+    if (!updated) return { error: "Proposal not found", status: 404 };
+    this.broadcastToActivity(guildId, { type: "proposal-remove", id });
+    return { ok: true };
+  }
+
+  /** Affirm and execute a proposal against GitHub. No retry — failures surface
+   *  in the card UI. */
+  async handleProposalAffirm(
+    guildId: string,
+    userId: string | null,
+    id: number,
+    expectedVersion: number,
+  ): Promise<{ ok: true; url?: string } | { error: string; status: number }> {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return { error: "No active session", status: 404 };
+    if (!this.authorizeProposalActor(session, userId)) return { error: "Forbidden", status: 403 };
+
+    const current = this.store.getProposal(id);
+    if (!current) return { error: "Proposal not found", status: 404 };
+    if (current.version !== expectedVersion) {
+      // Stale — rebroadcast canonical so the client picks up the newer payload.
+      this.broadcastToActivity(guildId, {
+        type: "proposal-upsert",
+        proposal: serializeProposal(current),
+      });
+      return { error: "Proposal version is stale — payload was edited. Refresh and try again.", status: 409 };
+    }
+    if (current.state !== "pending" && current.state !== "edited") {
+      return { error: `Proposal state is ${current.state}; already actioned`, status: 409 };
+    }
+
+    const affirmed = this.store.markProposalAffirmed(id, userId!);
+    if (!affirmed) return { error: "Could not affirm proposal", status: 409 };
+    this.broadcastToActivity(guildId, {
+      type: "proposal-upsert",
+      proposal: serializeProposal(affirmed),
+    });
+
+    let result: { url?: string; error?: string };
+    let ok = false;
+    try {
+      result = await this.executeProposal(affirmed);
+      ok = true;
+    } catch (e: any) {
+      result = { error: e.message ?? String(e) };
+    }
+
+    const completed = this.store.completeProposal(id, ok, result);
+    if (completed) {
+      this.broadcastToActivity(guildId, {
+        type: "proposal-upsert",
+        proposal: serializeProposal(completed),
+      });
+    }
+
+    if (!ok) return { error: result.error ?? "Execution failed", status: 502 };
+    return { ok: true, url: result.url };
+  }
+
+  /** Dispatch a proposal to the right GitHub helper. */
+  private async executeProposal(p: Proposal): Promise<{ url?: string }> {
+    const repo = p.repo;
+    switch (p.action_type) {
+      case "close_issue": {
+        if (p.target_issue == null) throw new Error("close_issue: missing target_issue");
+        const reason = p.payload.reason === "not_planned" ? "not_planned" : "completed";
+        return closeIssue(repo, p.target_issue, reason);
+      }
+      case "reopen_issue": {
+        if (p.target_issue == null) throw new Error("reopen_issue: missing target_issue");
+        return reopenIssue(repo, p.target_issue);
+      }
+      case "comment": {
+        if (p.target_issue == null) throw new Error("comment: missing target_issue");
+        const body = (p.payload.body ?? "").trim();
+        if (!body) throw new Error("comment: empty body");
+        return createComment(repo, p.target_issue, body);
+      }
+      case "reassign": {
+        if (p.target_issue == null) throw new Error("reassign: missing target_issue");
+        const assignees = p.payload.assignees ?? [];
+        if (assignees.length === 0) throw new Error("reassign: no assignees");
+        await assignIssue(repo, p.target_issue, assignees);
+        return { url: `https://github.com/${repo}/issues/${p.target_issue}` };
+      }
+      case "set_labels": {
+        if (p.target_issue == null) throw new Error("set_labels: missing target_issue");
+        await setLabels(repo, p.target_issue, { add: p.payload.addLabels ?? [], remove: p.payload.removeLabels ?? [] });
+        return { url: `https://github.com/${repo}/issues/${p.target_issue}` };
+      }
+      case "create_issue": {
+        const title = (p.payload.title ?? "").trim();
+        if (!title) throw new Error("create_issue: empty title");
+        const created = await createIssue(repo, title, p.payload.newBody ?? "", []);
+        if ((p.payload.newAssignees ?? []).length > 0) {
+          try { await assignIssue(repo, created.number, p.payload.newAssignees ?? []); } catch { /* best-effort */ }
+        }
+        return { url: created.url };
+      }
     }
   }
 

@@ -53,14 +53,55 @@ interface IssuesResponse {
   participants: Participant[];
 }
 
+// Live proposal types (#53) — mirror the server's serializeProposal shape.
+type ProposalActionType =
+  | "close_issue" | "reopen_issue" | "comment"
+  | "reassign" | "set_labels" | "create_issue";
+type ProposalState =
+  | "pending" | "edited" | "affirmed"
+  | "dismissed" | "executed" | "failed";
+interface ProposalPayload {
+  reason?: "completed" | "not_planned";
+  body?: string;
+  assignees?: string[];
+  addLabels?: string[];
+  removeLabels?: string[];
+  title?: string;
+  newBody?: string;
+  newAssignees?: string[];
+  reasoning?: string;
+  issueTitle?: string;
+}
+interface ProposalWire {
+  id: number;
+  standupId: number;
+  createdAt: string;
+  triggerReason: "focus_change" | "speaker_change" | "fallback_60s";
+  focusedIssue: number | null;
+  actionType: ProposalActionType;
+  repo: string;
+  targetIssue: number | null;
+  payload: ProposalPayload;
+  originalPayload: ProposalPayload;
+  state: ProposalState;
+  version: number;
+  executedAt: string | null;
+  executedBy: string | null;
+  executionResult: { ok?: boolean; url?: string; error?: string } | null;
+  supersededBy: number | null;
+}
+
 // Server → Client WebSocket messages
 type ServerMessage =
   | { type: "speaker"; userId: string; name: string; speaking: boolean }
   | { type: "utterance"; speaker: string; issueNumber: number | null; text: string; startedAt: number }
   | { type: "session"; recording: boolean; elapsed: number; utteranceCount: number }
-  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; voiceMembers: VoiceMember[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number }
+  | { type: "state"; focusedIssue: number | null; focusedDetailIssue: number | null; presenter: string | null; presenterName: string | null; watcherNames: string[]; voiceMembers: VoiceMember[]; activeParticipantIndex: number; recording: boolean; elapsed: number; utteranceCount: number; proposals?: ProposalWire[] }
   | { type: "scroll"; scrollY: number }
-  | { type: "detailScroll"; scrollTop: number };
+  | { type: "detailScroll"; scrollTop: number }
+  | { type: "proposal-upsert"; proposal: ProposalWire }
+  | { type: "proposal-remove"; id: number }
+  | { type: "proposal-error"; id: number; error: string };
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 
@@ -93,6 +134,14 @@ let focusStartTime: number | null = null;
 const DETAIL_CACHE_MAX = 30;
 let detailCache = new Map<string, any>(); // "repo/number" → detail
 let detailFetchInFlight = false;
+
+// ── Live proposals (#53) ───────────────────────────────────────────────────
+let proposals: ProposalWire[] = [];
+let actionBarOpen = false;
+/** Per-proposal client-side error shown on the card after a server error. */
+const proposalErrors = new Map<number, string>();
+/** Per-proposal ephemeral "affirming" spinner flag. */
+const proposalInFlight = new Set<number>();
 
 // ── Standup brief state (per-assignee, lazy, server-cached) ────────────────
 interface BriefBullet { text: string; issueRefs: number[] }
@@ -424,11 +473,41 @@ function handleServerMessage(msg: ServerMessage) {
       updateHeader();
       break;
 
+    case "proposal-upsert": {
+      const incoming = msg.proposal;
+      const idx = proposals.findIndex((p) => p.id === incoming.id);
+      if (idx === -1) proposals.push(incoming);
+      else proposals[idx] = incoming;
+      proposalErrors.delete(incoming.id);
+      if (incoming.state !== "pending" && incoming.state !== "edited" && incoming.state !== "affirmed") {
+        proposalInFlight.delete(incoming.id);
+      }
+      renderActionBar();
+      break;
+    }
+    case "proposal-remove": {
+      proposals = proposals.filter((p) => p.id !== msg.id);
+      proposalErrors.delete(msg.id);
+      proposalInFlight.delete(msg.id);
+      renderActionBar();
+      break;
+    }
+    case "proposal-error": {
+      proposalErrors.set(msg.id, msg.error);
+      proposalInFlight.delete(msg.id);
+      renderActionBar();
+      break;
+    }
+
     case "state": {
       // Track who the presenter is — needed for sync badge + permission checks
       presenterUserId = msg.presenter;
       presenterName = msg.presenterName ?? null;
       watcherNames = msg.watcherNames ?? [];
+      if (Array.isArray((msg as any).proposals)) {
+        proposals = (msg as any).proposals as ProposalWire[];
+        renderActionBar();
+      }
       // Track voice-channel membership — drives "not present" tab styling.
       // Diff against previous so we only re-render tabs when it actually changes.
       const incomingVM = msg.voiceMembers ?? [];
@@ -1521,6 +1600,296 @@ window.addEventListener("scroll", () => {
     sendWs({ type: "scroll", scrollY: window.scrollY });
   }, 100);
 }, { passive: true });
+
+// ── Live Action Bar (#53) ───────────────────────────────────────────────────
+
+function getActionBarRoot(): HTMLElement {
+  let root = document.getElementById("action-bar-root");
+  if (!root) {
+    root = document.createElement("div");
+    root.id = "action-bar-root";
+    root.className = "action-bar";
+    root.innerHTML = `
+      <div class="action-bar-inner">
+        <div id="action-bar-drawer" class="action-bar-drawer" aria-hidden="true">
+          <div id="action-bar-drawer-inner" class="action-bar-drawer-inner"></div>
+        </div>
+        <button id="action-bar-handle" class="action-bar-handle" aria-expanded="false">
+          <span class="action-bar-label">Action Bar</span>
+          <span id="action-bar-badge" class="action-bar-badge" data-count="0">0</span>
+          <span id="action-bar-chevron" class="action-bar-chevron">▲</span>
+        </button>
+      </div>
+    `;
+    document.body.appendChild(root);
+    const handle = root.querySelector("#action-bar-handle") as HTMLButtonElement;
+    handle.addEventListener("click", () => {
+      actionBarOpen = !actionBarOpen;
+      renderActionBar();
+    });
+  }
+  return root;
+}
+
+function liveProposals(): ProposalWire[] {
+  return proposals.filter(
+    (p) => p.state !== "dismissed" && p.supersededBy == null,
+  );
+}
+
+function pendingCount(): number {
+  return liveProposals().filter(
+    (p) => p.state === "pending" || p.state === "edited",
+  ).length;
+}
+
+function renderActionBar() {
+  const root = getActionBarRoot();
+  const drawer = root.querySelector("#action-bar-drawer") as HTMLElement;
+  const drawerInner = root.querySelector("#action-bar-drawer-inner") as HTMLElement;
+  const handle = root.querySelector("#action-bar-handle") as HTMLButtonElement;
+  const badge = root.querySelector("#action-bar-badge") as HTMLElement;
+  const chevron = root.querySelector("#action-bar-chevron") as HTMLElement;
+
+  const live = liveProposals();
+  const pend = pendingCount();
+  badge.textContent = String(pend);
+  badge.setAttribute("data-count", String(pend));
+  handle.classList.toggle("has-pending", pend > 0);
+  chevron.textContent = actionBarOpen ? "▼" : "▲";
+  handle.setAttribute("aria-expanded", actionBarOpen ? "true" : "false");
+  drawer.classList.toggle("open", actionBarOpen);
+  drawer.setAttribute("aria-hidden", actionBarOpen ? "false" : "true");
+
+  if (!actionBarOpen) return;
+
+  if (live.length === 0) {
+    drawerInner.innerHTML = `<div class="action-bar-empty">No live proposals yet. They will appear here as the bot listens.</div>`;
+    return;
+  }
+
+  drawerInner.innerHTML = live.map(renderProposalCard).join("");
+  wireProposalCards(drawerInner);
+}
+
+function actionTypeLabel(t: ProposalActionType): string {
+  switch (t) {
+    case "close_issue": return "Close issue";
+    case "reopen_issue": return "Reopen issue";
+    case "comment": return "Comment";
+    case "reassign": return "Reassign";
+    case "set_labels": return "Labels";
+    case "create_issue": return "Create issue";
+  }
+}
+
+function renderProposalCard(p: ProposalWire): string {
+  const target = p.targetIssue != null
+    ? `<span class="proposal-target"><a href="https://github.com/${escapeHtml(p.repo)}/issues/${p.targetIssue}" target="_blank">#${p.targetIssue}</a></span>`
+    : "";
+  const reasoning = p.payload.reasoning
+    ? `<span class="proposal-reasoning">${escapeHtml(p.payload.reasoning)}</span>`
+    : "";
+  const locked = p.state === "affirmed" || p.state === "executed" || p.state === "failed";
+  const inFlight = proposalInFlight.has(p.id) || p.state === "affirmed";
+  const err = proposalErrors.get(p.id);
+  const execUrl = p.executionResult?.url;
+  const execErr = p.executionResult?.error;
+
+  let status = "";
+  if (p.state === "executed") {
+    status = `<span class="proposal-status ok">✓ Executed${execUrl ? ` <a href="${escapeHtml(execUrl)}" target="_blank">↗</a>` : ""}</span>`;
+  } else if (p.state === "failed") {
+    status = `<span class="proposal-status err">✗ ${escapeHtml(execErr ?? "Failed")}</span>`;
+  } else if (err) {
+    status = `<span class="proposal-status err">${escapeHtml(err)}</span>`;
+  } else if (inFlight) {
+    status = `<span class="proposal-status">Running…</span>`;
+  } else if (p.state === "edited") {
+    status = `<span class="proposal-status">Edited</span>`;
+  }
+
+  return `
+    <div class="proposal-card state-${p.state}" data-proposal-id="${p.id}" data-version="${p.version}" data-locked="${locked ? 1 : 0}">
+      <div class="proposal-head">
+        <span class="proposal-type">${escapeHtml(actionTypeLabel(p.actionType))}</span>
+        ${target}
+        ${reasoning}
+        ${locked ? "" : `<button class="proposal-dismiss" data-action="dismiss" title="Dismiss">×</button>`}
+      </div>
+      ${renderProposalBody(p)}
+      <div class="proposal-actions">
+        ${status}
+        ${locked ? "" : `<button class="proposal-btn proposal-btn-primary" data-action="affirm" ${inFlight ? "disabled" : ""}>Affirm</button>`}
+      </div>
+    </div>
+  `;
+}
+
+function renderProposalBody(p: ProposalWire): string {
+  const pay = p.payload;
+  switch (p.actionType) {
+    case "close_issue":
+      return `
+        <div class="proposal-field">
+          <label>Reason</label>
+          <select data-field="reason">
+            <option value="completed" ${pay.reason !== "not_planned" ? "selected" : ""}>Completed</option>
+            <option value="not_planned" ${pay.reason === "not_planned" ? "selected" : ""}>Not planned</option>
+          </select>
+        </div>`;
+    case "reopen_issue":
+      return "";
+    case "comment":
+      return `
+        <div class="proposal-field">
+          <label>Comment</label>
+          <textarea data-field="body">${escapeHtml(pay.body ?? "")}</textarea>
+        </div>`;
+    case "reassign":
+      return `
+        <div class="proposal-field">
+          <label>Assignees (comma-separated GitHub logins)</label>
+          <input type="text" data-field="assignees" value="${escapeHtml((pay.assignees ?? []).join(", "))}">
+        </div>`;
+    case "set_labels":
+      return `
+        <div class="proposal-field">
+          <label>Add labels (comma-separated)</label>
+          <input type="text" data-field="addLabels" value="${escapeHtml((pay.addLabels ?? []).join(", "))}">
+        </div>
+        <div class="proposal-field">
+          <label>Remove labels (comma-separated)</label>
+          <input type="text" data-field="removeLabels" value="${escapeHtml((pay.removeLabels ?? []).join(", "))}">
+        </div>`;
+    case "create_issue":
+      return `
+        <div class="proposal-field">
+          <label>Title</label>
+          <input type="text" data-field="title" value="${escapeHtml(pay.title ?? "")}">
+        </div>
+        <div class="proposal-field">
+          <label>Body</label>
+          <textarea data-field="newBody">${escapeHtml(pay.newBody ?? "")}</textarea>
+        </div>
+        <div class="proposal-field">
+          <label>Assignees (comma-separated GitHub logins)</label>
+          <input type="text" data-field="newAssignees" value="${escapeHtml((pay.newAssignees ?? []).join(", "))}">
+        </div>`;
+  }
+}
+
+function readProposalPayloadFromCard(card: HTMLElement, p: ProposalWire): ProposalPayload {
+  const out: ProposalPayload = { ...p.payload };
+  const field = (name: string): string | null => {
+    const el = card.querySelector(`[data-field="${name}"]`) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
+    return el ? el.value : null;
+  };
+  const csv = (v: string | null): string[] =>
+    (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+
+  switch (p.actionType) {
+    case "close_issue": {
+      const r = field("reason");
+      if (r === "not_planned" || r === "completed") out.reason = r;
+      break;
+    }
+    case "comment": {
+      const b = field("body");
+      if (b !== null) out.body = b;
+      break;
+    }
+    case "reassign": {
+      const v = field("assignees");
+      if (v !== null) out.assignees = csv(v);
+      break;
+    }
+    case "set_labels": {
+      const a = field("addLabels");
+      const r = field("removeLabels");
+      if (a !== null) out.addLabels = csv(a);
+      if (r !== null) out.removeLabels = csv(r);
+      break;
+    }
+    case "create_issue": {
+      const t = field("title");
+      const b = field("newBody");
+      const a = field("newAssignees");
+      if (t !== null) out.title = t;
+      if (b !== null) out.newBody = b;
+      if (a !== null) out.newAssignees = csv(a);
+      break;
+    }
+  }
+  return out;
+}
+
+function payloadEqual(a: ProposalPayload, b: ProposalPayload): boolean {
+  return JSON.stringify(normalizeForCompare(a)) === JSON.stringify(normalizeForCompare(b));
+}
+
+function normalizeForCompare(p: ProposalPayload): ProposalPayload {
+  const out: ProposalPayload = {};
+  if (p.reason !== undefined) out.reason = p.reason;
+  if (p.body !== undefined) out.body = p.body;
+  if (p.assignees !== undefined) out.assignees = [...p.assignees].sort();
+  if (p.addLabels !== undefined) out.addLabels = [...p.addLabels].sort();
+  if (p.removeLabels !== undefined) out.removeLabels = [...p.removeLabels].sort();
+  if (p.title !== undefined) out.title = p.title;
+  if (p.newBody !== undefined) out.newBody = p.newBody;
+  if (p.newAssignees !== undefined) out.newAssignees = [...p.newAssignees].sort();
+  return out;
+}
+
+function wireProposalCards(container: HTMLElement) {
+  container.querySelectorAll(".proposal-card").forEach((cardEl) => {
+    const card = cardEl as HTMLElement;
+    const idStr = card.getAttribute("data-proposal-id");
+    if (!idStr) return;
+    const id = parseInt(idStr);
+    const p = proposals.find((x) => x.id === id);
+    if (!p) return;
+
+    // Inline edits fire on blur — avoid thrashing WS on each keystroke.
+    card.querySelectorAll("[data-field]").forEach((el) => {
+      el.addEventListener("blur", () => {
+        const fresh = readProposalPayloadFromCard(card, p);
+        if (!payloadEqual(fresh, p.payload)) {
+          sendWs({ type: "proposal-edit", id, version: p.version, payload: fresh });
+        }
+      });
+    });
+
+    const affirmBtn = card.querySelector('[data-action="affirm"]') as HTMLButtonElement | null;
+    if (affirmBtn) {
+      affirmBtn.addEventListener("click", () => {
+        // Flush any pending edit before affirming.
+        const fresh = readProposalPayloadFromCard(card, p);
+        if (!payloadEqual(fresh, p.payload)) {
+          sendWs({ type: "proposal-edit", id, version: p.version, payload: fresh });
+          // Defer affirm a tick so server processes the edit first and bumps version.
+          proposalInFlight.add(id);
+          renderActionBar();
+          setTimeout(() => {
+            const latest = proposals.find((x) => x.id === id);
+            if (latest) sendWs({ type: "proposal-affirm", id, version: latest.version });
+          }, 250);
+          return;
+        }
+        proposalInFlight.add(id);
+        renderActionBar();
+        sendWs({ type: "proposal-affirm", id, version: p.version });
+      });
+    }
+
+    const dismissBtn = card.querySelector('[data-action="dismiss"]') as HTMLButtonElement | null;
+    if (dismissBtn) {
+      dismissBtn.addEventListener("click", () => {
+        sendWs({ type: "proposal-dismiss", id });
+      });
+    }
+  });
+}
 
 // ── Start ───────────────────────────────────────────────────────────────────
 

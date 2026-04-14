@@ -289,7 +289,7 @@ export async function createComment(
   repo: string,
   issueNumber: number,
   body: string,
-): Promise<void> {
+): Promise<{ url: string }> {
   const res = await fetch(`${GITHUB_API}/repos/${repo}/issues/${issueNumber}/comments`, {
     method: "POST",
     headers: { ...headers(), "Content-Type": "application/json" },
@@ -297,6 +297,69 @@ export async function createComment(
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`GitHub createComment ${res.status}: ${await res.text()}`);
+  const data = await res.json().catch(() => ({}));
+  return { url: data.html_url ?? `https://github.com/${repo}/issues/${issueNumber}` };
+}
+
+export async function closeIssue(
+  repo: string,
+  issueNumber: number,
+  reason: "completed" | "not_planned" = "completed",
+): Promise<{ url: string }> {
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues/${issueNumber}`, {
+    method: "PATCH",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ state: "closed", state_reason: reason }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub closeIssue ${res.status}: ${await res.text()}`);
+  const data = await res.json().catch(() => ({}));
+  return { url: data.html_url ?? `https://github.com/${repo}/issues/${issueNumber}` };
+}
+
+export async function reopenIssue(repo: string, issueNumber: number): Promise<{ url: string }> {
+  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues/${issueNumber}`, {
+    method: "PATCH",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ state: "open" }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GitHub reopenIssue ${res.status}: ${await res.text()}`);
+  const data = await res.json().catch(() => ({}));
+  return { url: data.html_url ?? `https://github.com/${repo}/issues/${issueNumber}` };
+}
+
+/** Add and/or remove labels on an existing issue. Uses GitHub's idempotent
+ *  add-labels + delete-label-by-name endpoints; order is additions then
+ *  removals so the final label set is deterministic. */
+export async function setLabels(
+  repo: string,
+  issueNumber: number,
+  patch: { add?: string[]; remove?: string[] },
+): Promise<void> {
+  const add = (patch.add ?? []).filter(Boolean);
+  const remove = (patch.remove ?? []).filter(Boolean);
+
+  if (add.length > 0) {
+    const res = await fetch(`${GITHUB_API}/repos/${repo}/issues/${issueNumber}/labels`, {
+      method: "POST",
+      headers: { ...headers(), "Content-Type": "application/json" },
+      body: JSON.stringify({ labels: add }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`GitHub addLabels ${res.status}: ${await res.text()}`);
+  }
+
+  for (const label of remove) {
+    const res = await fetch(
+      `${GITHUB_API}/repos/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
+      { method: "DELETE", headers: headers(), signal: AbortSignal.timeout(10_000) },
+    );
+    // 404 = label wasn't on the issue, which is fine — no-op.
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`GitHub removeLabel(${label}) ${res.status}: ${await res.text()}`);
+    }
+  }
 }
 
 export async function fetchOpenNonBacklog(

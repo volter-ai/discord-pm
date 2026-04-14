@@ -47,6 +47,89 @@ export interface ActiveSessionRow {
   presenter: string | null;
   active_participant_index: number;
   resumed_count: number;
+  /** For standups: the pre-inserted standups.id so live proposals can FK it.
+   *  null for meetings and for legacy rows. */
+  standup_id: number | null;
+}
+
+export type ProposalActionType =
+  | "close_issue"
+  | "reopen_issue"
+  | "comment"
+  | "reassign"
+  | "set_labels"
+  | "create_issue";
+
+export type ProposalState =
+  | "pending"
+  | "edited"
+  | "affirmed"
+  | "dismissed"
+  | "executed"
+  | "failed";
+
+export type ProposalTriggerReason = "focus_change" | "speaker_change" | "fallback_60s";
+
+export interface ProposalPayload {
+  // close_issue
+  reason?: "completed" | "not_planned";
+  // comment
+  body?: string;
+  // reassign
+  assignees?: string[];
+  // set_labels
+  addLabels?: string[];
+  removeLabels?: string[];
+  // create_issue
+  title?: string;
+  newBody?: string;
+  newAssignees?: string[];
+  // free-form reasoning from Claude (display only)
+  reasoning?: string;
+  // For comment / create_issue Claude may reference the issue title for display
+  issueTitle?: string;
+}
+
+export interface ProposalRow {
+  id: number;
+  standup_id: number;
+  guild_id: string;
+  created_at: string;
+  trigger_reason: ProposalTriggerReason;
+  focused_issue: number | null;
+  action_type: ProposalActionType;
+  repo: string;
+  target_issue: number | null;
+  payload_json: string;
+  original_payload_json: string;
+  state: ProposalState;
+  version: number;
+  executed_at: string | null;
+  executed_by: string | null;
+  execution_result_json: string | null;
+  superseded_by: number | null;
+  source_segment_ids: string;
+}
+
+export interface Proposal {
+  id: number;
+  standup_id: number;
+  guild_id: string;
+  created_at: string;
+  trigger_reason: ProposalTriggerReason;
+  focused_issue: number | null;
+  action_type: ProposalActionType;
+  repo: string;
+  target_issue: number | null;
+  payload: ProposalPayload;
+  original_payload: ProposalPayload;
+  state: ProposalState;
+  version: number;
+  executed_at: string | null;
+  executed_by: string | null;
+  execution_result: { ok?: boolean; url?: string; error?: string } | null;
+  superseded_by: number | null;
+  source_segment_ids: number[];
 }
 
 export interface ActiveSessionLine {
@@ -65,6 +148,11 @@ export interface ActiveSessionIssueMeta {
 
 const TRANSCRIPTS_DIR = "./transcripts";
 const DB_PATH = "./data/standups.db";
+
+function safeParse<T>(json: string | null | undefined, fallback: T): T {
+  if (!json) return fallback;
+  try { return JSON.parse(json) as T; } catch { return fallback; }
+}
 
 export class StandupStore {
   private db: Database;
@@ -153,6 +241,37 @@ export class StandupStore {
     // (no longer loadable on resume) and safe to drop.
     try { this.db.run(`ALTER TABLE active_session_lines ADD COLUMN session_started_at TEXT`); } catch { /* already exists */ }
     try { this.db.run(`DELETE FROM active_session_lines WHERE session_started_at IS NULL`); } catch { /* noop */ }
+
+    // Migration: standup_id on active_sessions for pre-insert + resume (#53).
+    try { this.db.run(`ALTER TABLE active_sessions ADD COLUMN standup_id INTEGER`); } catch { /* already exists */ }
+
+    // Live proposals surfaced during the meeting (#53).
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS proposals (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        standup_id              INTEGER NOT NULL,
+        guild_id                TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        trigger_reason          TEXT NOT NULL,
+        focused_issue           INTEGER,
+        action_type             TEXT NOT NULL,
+        repo                    TEXT NOT NULL,
+        target_issue            INTEGER,
+        payload_json            TEXT NOT NULL,
+        original_payload_json   TEXT NOT NULL,
+        state                   TEXT NOT NULL DEFAULT 'pending',
+        version                 INTEGER NOT NULL DEFAULT 1,
+        executed_at             TEXT,
+        executed_by             TEXT,
+        execution_result_json   TEXT,
+        superseded_by           INTEGER,
+        source_segment_ids      TEXT NOT NULL DEFAULT '[]',
+        FOREIGN KEY (standup_id)    REFERENCES standups(id),
+        FOREIGN KEY (superseded_by) REFERENCES proposals(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_proposals_standup ON proposals (standup_id);
+      CREATE INDEX IF NOT EXISTS idx_proposals_guild_state ON proposals (guild_id, state);
+    `);
   }
 
   // ── Active-session persistence ────────────────────────────────────────────
@@ -162,8 +281,8 @@ export class StandupStore {
       INSERT INTO active_sessions (
         guild_id, type, channel_id, text_channel_id, started_at,
         issue_repo, focused_issue, focused_detail_issue, presenter,
-        active_participant_index, resumed_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        active_participant_index, resumed_count, standup_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(guild_id) DO UPDATE SET
         type = excluded.type,
         channel_id = excluded.channel_id,
@@ -174,11 +293,12 @@ export class StandupStore {
         focused_detail_issue = excluded.focused_detail_issue,
         presenter = excluded.presenter,
         active_participant_index = excluded.active_participant_index,
-        resumed_count = excluded.resumed_count
+        resumed_count = excluded.resumed_count,
+        standup_id = excluded.standup_id
     `).run(
       row.guild_id, row.type, row.channel_id, row.text_channel_id, row.started_at,
       row.issue_repo, row.focused_issue, row.focused_detail_issue, row.presenter,
-      row.active_participant_index, row.resumed_count,
+      row.active_participant_index, row.resumed_count, row.standup_id,
     );
   }
 
@@ -254,6 +374,194 @@ export class StandupStore {
     return this.db
       .query(`SELECT issue_number, title, state FROM active_session_issue_meta WHERE guild_id = ?`)
       .all(guildId) as ActiveSessionIssueMeta[];
+  }
+
+  /** Pre-insert a standup row at /standup start so live proposals (#53) can
+   *  FK it from the moment they're created. ended_at/participants/transcript/
+   *  summary are left empty — finishStandup() fills them in at /standup stop. */
+  startStandup(args: { guild_id: string; channel_id: string; started_at: string }): number {
+    const result = this.db
+      .prepare(
+        `INSERT INTO standups (guild_id, channel_id, started_at, ended_at, participants, transcript, summary)
+         VALUES (?, ?, ?, '', '[]', '', '')`
+      )
+      .run(args.guild_id, args.channel_id, args.started_at);
+    return result.lastInsertRowid as number;
+  }
+
+  /** Fill in the finished fields on a standup row that was pre-inserted at start,
+   *  and write the markdown artifact. Mirrors save() for the post-meeting path. */
+  finishStandup(id: number, record: {
+    guild_id: string;
+    channel_id: string;
+    started_at: string;
+    ended_at: string;
+    participants: ParticipantUpdate[];
+    raw_transcript: string;
+    summary_text: string;
+  }): { id: number; transcriptPath: string } {
+    this.db
+      .prepare(
+        `UPDATE standups
+            SET ended_at = ?, participants = ?, transcript = ?, summary = ?
+          WHERE id = ?`
+      )
+      .run(
+        record.ended_at,
+        JSON.stringify(record.participants),
+        record.raw_transcript,
+        record.summary_text,
+        id,
+      );
+    const transcriptPath = this.exportMarkdown({ ...record, id });
+    return { id, transcriptPath };
+  }
+
+  /** Delete a pre-inserted standup row whose meeting produced no speech.
+   *  Only safe to call if nothing else references the row (no segments, no
+   *  proposals). Caller should check. */
+  deleteStandup(id: number): void {
+    this.db.prepare(`DELETE FROM standups WHERE id = ?`).run(id);
+  }
+
+  // ── Proposals (#53) ────────────────────────────────────────────────────────
+
+  insertProposal(p: {
+    standup_id: number;
+    guild_id: string;
+    created_at: string;
+    trigger_reason: ProposalTriggerReason;
+    focused_issue: number | null;
+    action_type: ProposalActionType;
+    repo: string;
+    target_issue: number | null;
+    payload: ProposalPayload;
+    source_segment_ids: number[];
+  }): Proposal {
+    const payloadJson = JSON.stringify(p.payload);
+    const result = this.db.prepare(`
+      INSERT INTO proposals (
+        standup_id, guild_id, created_at, trigger_reason, focused_issue,
+        action_type, repo, target_issue, payload_json, original_payload_json,
+        source_segment_ids
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      p.standup_id, p.guild_id, p.created_at, p.trigger_reason, p.focused_issue,
+      p.action_type, p.repo, p.target_issue, payloadJson, payloadJson,
+      JSON.stringify(p.source_segment_ids),
+    );
+    const id = result.lastInsertRowid as number;
+    return this.getProposal(id)!;
+  }
+
+  getProposal(id: number): Proposal | null {
+    const row = this.db.query(`SELECT * FROM proposals WHERE id = ?`).get(id) as ProposalRow | undefined;
+    return row ? this.hydrateProposal(row) : null;
+  }
+
+  listProposalsForStandup(standupId: number): Proposal[] {
+    const rows = this.db
+      .query(`SELECT * FROM proposals WHERE standup_id = ? ORDER BY created_at ASC, id ASC`)
+      .all(standupId) as ProposalRow[];
+    return rows.map((r) => this.hydrateProposal(r));
+  }
+
+  listActiveProposalsForStandup(standupId: number): Proposal[] {
+    const rows = this.db
+      .query(
+        `SELECT * FROM proposals
+           WHERE standup_id = ?
+             AND state IN ('pending','edited','affirmed','executed','failed')
+             AND superseded_by IS NULL
+           ORDER BY created_at ASC, id ASC`
+      )
+      .all(standupId) as ProposalRow[];
+    return rows.map((r) => this.hydrateProposal(r));
+  }
+
+  /** Patch a proposal's payload. Returns the new row, or null if the row is gone
+   *  or if expectedVersion doesn't match. Version bumps monotonically (#53 edits). */
+  editProposal(id: number, expectedVersion: number, payload: ProposalPayload): Proposal | null {
+    const current = this.getProposal(id);
+    if (!current) return null;
+    if (current.version !== expectedVersion) {
+      // Stale edit — canonical row wins, caller should rebroadcast.
+      return current;
+    }
+    this.db.prepare(
+      `UPDATE proposals
+          SET payload_json = ?,
+              version = version + 1,
+              state = CASE WHEN state = 'pending' THEN 'edited' ELSE state END
+        WHERE id = ?`
+    ).run(JSON.stringify(payload), id);
+    return this.getProposal(id);
+  }
+
+  dismissProposal(id: number): Proposal | null {
+    this.db.prepare(`UPDATE proposals SET state = 'dismissed' WHERE id = ?`).run(id);
+    return this.getProposal(id);
+  }
+
+  /** Transition to affirmed immediately before execution, so broadcast shows a
+   *  spinner state. Only pending/edited rows are eligible. */
+  markProposalAffirmed(id: number, executedBy: string): Proposal | null {
+    this.db.prepare(
+      `UPDATE proposals
+          SET state = 'affirmed',
+              executed_by = ?
+        WHERE id = ? AND state IN ('pending','edited')`
+    ).run(executedBy, id);
+    return this.getProposal(id);
+  }
+
+  completeProposal(
+    id: number,
+    ok: boolean,
+    result: { url?: string; error?: string },
+  ): Proposal | null {
+    this.db.prepare(
+      `UPDATE proposals
+          SET state = ?,
+              executed_at = ?,
+              execution_result_json = ?
+        WHERE id = ?`
+    ).run(
+      ok ? "executed" : "failed",
+      new Date().toISOString(),
+      JSON.stringify(result),
+      id,
+    );
+    return this.getProposal(id);
+  }
+
+  supersedeProposal(oldId: number, newId: number): void {
+    this.db.prepare(
+      `UPDATE proposals SET superseded_by = ? WHERE id = ?`
+    ).run(newId, oldId);
+  }
+
+  private hydrateProposal(row: ProposalRow): Proposal {
+    return {
+      id: row.id,
+      standup_id: row.standup_id,
+      guild_id: row.guild_id,
+      created_at: row.created_at,
+      trigger_reason: row.trigger_reason,
+      focused_issue: row.focused_issue,
+      action_type: row.action_type,
+      repo: row.repo,
+      target_issue: row.target_issue,
+      payload: safeParse(row.payload_json, {}),
+      original_payload: safeParse(row.original_payload_json, {}),
+      state: row.state,
+      version: row.version,
+      executed_at: row.executed_at,
+      executed_by: row.executed_by,
+      execution_result: row.execution_result_json ? safeParse(row.execution_result_json, null) : null,
+      superseded_by: row.superseded_by,
+      source_segment_ids: safeParse(row.source_segment_ids, []),
+    };
   }
 
   save(record: StandupRecord): { id: number; transcriptPath: string } {
@@ -337,6 +645,8 @@ export class StandupStore {
     const endDate = new Date(record.ended_at);
     const durationMin = Math.round((endDate.getTime() - date.getTime()) / 60000);
 
+    const proposalsSection = this.buildProposalsMarkdown(record.id);
+
     const md = `# Standup — ${dateStr} ${timeStr} UTC (${durationMin}m)
 
 > Record #${record.id} | Guild: ${record.guild_id} | Channel: ${record.channel_id}
@@ -348,7 +658,7 @@ ${record.summary_text}
 ## Per-Participant
 
 ${participantsMd}
-
+${proposalsSection}
 ## Full Transcript
 
 \`\`\`
@@ -359,5 +669,57 @@ ${record.raw_transcript}
     writeFileSync(path, md, "utf8");
     console.log(`[store] Transcript saved → ${path}`);
     return path;
+  }
+
+  /** Render proposals grouped by state for the markdown artifact. Shows an
+   *  edit diff when payload diverges from the original AI output. */
+  private buildProposalsMarkdown(standupId: number): string {
+    const proposals = this.listProposalsForStandup(standupId);
+    if (proposals.length === 0) return "";
+
+    const order: ProposalState[] = ["executed", "affirmed", "failed", "edited", "pending", "dismissed"];
+    const stateTitle: Record<ProposalState, string> = {
+      executed: "Executed",
+      affirmed: "Affirmed",
+      failed: "Failed",
+      edited: "Edited (not affirmed)",
+      pending: "Pending at stop",
+      dismissed: "Dismissed",
+    };
+
+    const grouped = new Map<ProposalState, Proposal[]>();
+    for (const p of proposals) {
+      if (p.superseded_by != null) continue; // skip superseded intermediate versions
+      const list = grouped.get(p.state) ?? [];
+      list.push(p);
+      grouped.set(p.state, list);
+    }
+
+    const sections: string[] = ["", "## Proposed Actions", ""];
+    for (const state of order) {
+      const list = grouped.get(state);
+      if (!list || list.length === 0) continue;
+      sections.push(`### ${stateTitle[state]} (${list.length})`, "");
+      for (const p of list) {
+        sections.push(this.renderProposalMarkdown(p));
+      }
+    }
+    return sections.join("\n") + "\n";
+  }
+
+  private renderProposalMarkdown(p: Proposal): string {
+    const targetRef = p.target_issue != null
+      ? `[#${p.target_issue}](https://github.com/${p.repo}/issues/${p.target_issue})`
+      : `(new issue)`;
+    const head = `**${p.action_type}** ${targetRef}`;
+    const reasoning = p.payload.reasoning ? `\n_${p.payload.reasoning}_` : "";
+    const payloadSerialized = JSON.stringify(p.payload, null, 2);
+    const diff = JSON.stringify(p.payload) !== JSON.stringify(p.original_payload)
+      ? `\n\nOriginal (AI):\n\`\`\`json\n${JSON.stringify(p.original_payload, null, 2)}\n\`\`\`\n\nEdited:\n\`\`\`json\n${payloadSerialized}\n\`\`\`\n`
+      : `\n\n\`\`\`json\n${payloadSerialized}\n\`\`\`\n`;
+    const result = p.execution_result
+      ? (p.execution_result.url ? `\n\nResult: ${p.execution_result.url}` : p.execution_result.error ? `\n\nError: ${p.execution_result.error}` : "")
+      : "";
+    return `- ${head}${reasoning}${diff}${result}`;
   }
 }

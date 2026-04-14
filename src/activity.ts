@@ -34,6 +34,7 @@ import {
 } from "./github";
 import { Summarizer, type AssigneeBrief } from "./summarizer";
 import type { StandupBot } from "./bot";
+import { serializeProposal } from "./bot";
 
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID ?? "";
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET ?? "";
@@ -301,6 +302,55 @@ const ACTIVITY_CSS = `
   .pr-file-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd5e1}
   .pr-file-diff{flex-shrink:0;font-family:monospace;font-size:.72rem}
   .detail-meta-state-merged{color:#a78bfa}
+
+  /* Live Action Bar (#53) — default-collapsed, slides up from bottom */
+  .action-bar{position:fixed;left:0;right:0;bottom:0;z-index:20;pointer-events:none;display:flex;flex-direction:column;align-items:stretch}
+  .action-bar .action-bar-inner{pointer-events:auto;background:rgba(15,23,42,.98);border-top:1px solid #312e81;box-shadow:0 -6px 24px rgba(0,0,0,.45)}
+  .action-bar-handle{display:flex;align-items:center;gap:.5rem;width:100%;padding:.45rem .75rem;background:#1e1b4b;color:#c7d2fe;border:none;border-top:1px solid #312e81;cursor:pointer;font-size:.82rem;font-weight:600;letter-spacing:.02em}
+  .action-bar-handle:hover{background:#2e27a0}
+  .action-bar-handle.has-pending{background:#312e81;color:#e0e7ff}
+  .action-bar-badge{min-width:1.1rem;padding:.05rem .35rem;background:#4f46e5;color:white;border-radius:999px;font-size:.72rem;text-align:center;display:inline-block}
+  .action-bar-badge[data-count="0"]{display:none}
+  .action-bar-label{flex:1;text-align:left}
+  .action-bar-chevron{font-size:.7rem;color:#a5b4fc}
+  .action-bar-drawer{max-height:0;overflow:hidden;transition:max-height .18s ease}
+  .action-bar-drawer.open{max-height:60vh;overflow-y:auto}
+  .action-bar-drawer-inner{padding:.6rem .75rem .9rem;display:flex;flex-direction:column;gap:.5rem}
+  .action-bar-empty{color:#64748b;font-size:.82rem;text-align:center;padding:.75rem}
+  .proposal-card{background:#1e293b;border:1px solid #334155;border-radius:.4rem;padding:.55rem .7rem;display:flex;flex-direction:column;gap:.4rem}
+  .proposal-card.state-affirmed{border-color:#6366f1}
+  .proposal-card.state-executed{border-color:#166534;background:#052e16}
+  .proposal-card.state-failed{border-color:#7f1d1d;background:#2b0505}
+  .proposal-card.state-edited{border-color:#a16207}
+  .proposal-head{display:flex;align-items:center;gap:.4rem;font-size:.78rem}
+  .proposal-type{font-weight:700;color:#a5b4fc;text-transform:uppercase;letter-spacing:.04em}
+  .proposal-target{color:#94a3b8;font-family:monospace}
+  .proposal-target a{color:#c7d2fe;text-decoration:none}
+  .proposal-target a:hover{text-decoration:underline}
+  .proposal-reasoning{color:#94a3b8;font-size:.75rem;font-style:italic;flex:1}
+  .proposal-reasoning:empty{display:none}
+  .proposal-field{display:flex;flex-direction:column;gap:.15rem}
+  .proposal-field label{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.03em}
+  .proposal-field input,.proposal-field textarea,.proposal-field select{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:.3rem;padding:.35rem .45rem;font-size:.82rem;font-family:inherit}
+  .proposal-field textarea{min-height:3.2rem;resize:vertical}
+  .proposal-actions{display:flex;gap:.4rem;align-items:center;justify-content:flex-end}
+  .proposal-status{flex:1;font-size:.75rem}
+  .proposal-status.ok{color:#4ade80}
+  .proposal-status.err{color:#fca5a5}
+  .proposal-status a{color:inherit;text-decoration:underline}
+  .proposal-btn{background:#1e1b4b;color:#c7d2fe;border:1px solid #312e81;padding:.3rem .7rem;border-radius:.3rem;cursor:pointer;font-size:.78rem;transition:background .1s}
+  .proposal-btn:hover:not(:disabled){background:#2e27a0}
+  .proposal-btn:disabled{opacity:.5;cursor:not-allowed}
+  .proposal-btn-primary{background:#4f46e5;color:white;border-color:#4f46e5}
+  .proposal-btn-primary:hover:not(:disabled){background:#4338ca}
+  .proposal-btn-spinner::after{content:"…";margin-left:.25rem}
+  .proposal-dismiss{background:none;border:none;color:#64748b;cursor:pointer;font-size:1rem;padding:0 .25rem}
+  .proposal-dismiss:hover{color:#f87171}
+  .proposal-card.state-executed .proposal-actions,
+  .proposal-card.state-dismissed .proposal-actions{display:none}
+  .proposal-card[data-locked="1"] .proposal-field input,
+  .proposal-card[data-locked="1"] .proposal-field textarea,
+  .proposal-card[data-locked="1"] .proposal-field select{pointer-events:none;opacity:.7}
 
   /* Extra (unlisted) participant badge on board header */
   .board-extra-badge{font-size:.7rem;padding:.15rem .4rem;background:#292524;color:#a8a29e;border-radius:.25rem;margin-left:.5rem}
@@ -609,24 +659,92 @@ export function createActivityApp(
     }
   });
 
+  // CSRF guard — reject cross-origin POSTs from anywhere except our own host
+  // or Discord's Activity proxy (*.discordsays.com).
+  const csrfOk = (c: any): boolean => {
+    const origin = c.req.header("origin");
+    const host = c.req.header("host");
+    if (!origin || !host) return true; // same-origin fetches often omit Origin
+    try {
+      const originHost = new URL(origin).host;
+      if (originHost === host) return true;
+      if (originHost.endsWith(".discordsays.com")) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  // Authenticate a caller via their Discord access token; returns the verified
+  // user id or null on failure. Used by HTTP proposal routes that need actor id.
+  const verifyDiscordUser = async (c: any): Promise<string | null> => {
+    const auth = c.req.header("authorization");
+    const match = auth?.match(/^Bearer\s+(.+)$/i);
+    if (!match) return null;
+    try {
+      const res = await fetch("https://discord.com/api/v10/users/@me", {
+        headers: { Authorization: `Bearer ${match[1]}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) return null;
+      const u = await res.json();
+      return typeof u?.id === "string" ? u.id : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // ── Live proposals (#53) ────────────────────────────────────────────────
+
+  app.post("/api/proposals/:id/edit", async (c) => {
+    if (!csrfOk(c)) return c.json({ error: "Forbidden" }, 403);
+    const userId = await verifyDiscordUser(c);
+    if (!userId) return c.json({ error: "Unauthorized" }, 401);
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.json({ error: "Invalid id" }, 400);
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.version !== "number" || typeof body.payload !== "object") {
+      return c.json({ error: "Missing version/payload" }, 400);
+    }
+    const session = bot.getFirstActiveSession();
+    if (!session) return c.json({ error: "No active session" }, 404);
+    const result = bot.handleProposalEdit(session.guildId, userId, id, body.version, body.payload);
+    if ("error" in result) return c.json({ error: result.error }, result.status as any);
+    return c.json(result);
+  });
+
+  app.post("/api/proposals/:id/dismiss", async (c) => {
+    if (!csrfOk(c)) return c.json({ error: "Forbidden" }, 403);
+    const userId = await verifyDiscordUser(c);
+    if (!userId) return c.json({ error: "Unauthorized" }, 401);
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.json({ error: "Invalid id" }, 400);
+    const session = bot.getFirstActiveSession();
+    if (!session) return c.json({ error: "No active session" }, 404);
+    const result = bot.handleProposalDismiss(session.guildId, userId, id);
+    if ("error" in result) return c.json({ error: result.error }, result.status as any);
+    return c.json(result);
+  });
+
+  app.post("/api/proposals/:id/affirm", async (c) => {
+    if (!csrfOk(c)) return c.json({ error: "Forbidden" }, 403);
+    const userId = await verifyDiscordUser(c);
+    if (!userId) return c.json({ error: "Unauthorized" }, 401);
+    const id = parseInt(c.req.param("id"));
+    if (isNaN(id)) return c.json({ error: "Invalid id" }, 400);
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.version !== "number") return c.json({ error: "Missing version" }, 400);
+    const session = bot.getFirstActiveSession();
+    if (!session) return c.json({ error: "No active session" }, 404);
+    const result = await bot.handleProposalAffirm(session.guildId, userId, id, body.version);
+    if ("error" in result) return c.json({ error: result.error }, result.status as any);
+    return c.json(result);
+  });
+
   // Reassign issue to a different contributor
   app.post("/api/issues/:repo/:number/assign", async (c) => {
     // CSRF: reject cross-origin requests that are not from our server or Discord's Activity proxy.
-    const origin = c.req.header("origin");
-    const host = c.req.header("host");
-    try {
-      if (origin && host) {
-        const originHost = new URL(origin).host;
-        const isSameOrigin = originHost === host;
-        // Discord Activity iframes run on *.discordsays.com — allow those origins.
-        const isDiscordActivity = originHost.endsWith(".discordsays.com");
-        if (!isSameOrigin && !isDiscordActivity) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-      }
-    } catch {
-      return c.json({ error: "Forbidden" }, 403);
-    }
+    if (!csrfOk(c)) return c.json({ error: "Forbidden" }, 403);
 
     const repo = decodeURIComponent(c.req.param("repo"));
     const number = parseInt(c.req.param("number"));
@@ -715,6 +833,7 @@ export function createActivityApp(
                     .filter(([uid]) => uid !== session.meta.presenter)
                     .map(([, name]) => name);
                   const voiceMembers = [...session.meta.voiceMembers.entries()].map(([id, name]) => ({ id, name }));
+                  const proposals = bot.getActiveProposals(guildId).map(serializeProposal);
                   ws.send(JSON.stringify({
                     type: "state",
                     focusedIssue: session.meta.focusedIssue,
@@ -727,6 +846,7 @@ export function createActivityApp(
                     recording: true,
                     elapsed: Math.round((Date.now() - session.meta.startedAt.getTime()) / 1000),
                     utteranceCount: session.meta.lines.length,
+                    proposals,
                   }));
                 } else {
                   ws.send(JSON.stringify({
@@ -741,6 +861,7 @@ export function createActivityApp(
                     recording: false,
                     elapsed: 0,
                     utteranceCount: 0,
+                    proposals: [],
                   }));
                 }
               }
@@ -771,6 +892,31 @@ export function createActivityApp(
 
             if (msg.type === "detailScroll" && guildId && typeof msg.scrollTop === "number") {
               bot.relayDetailScroll(guildId, msg.scrollTop);
+            }
+
+            if (msg.type === "proposal-edit" && guildId && clientUserId &&
+                typeof msg.id === "number" && typeof msg.version === "number" &&
+                typeof msg.payload === "object") {
+              const res = bot.handleProposalEdit(guildId, clientUserId, msg.id, msg.version, msg.payload);
+              if ("error" in res) {
+                try { ws.send(JSON.stringify({ type: "proposal-error", id: msg.id, error: res.error })); } catch {}
+              }
+            }
+
+            if (msg.type === "proposal-dismiss" && guildId && clientUserId && typeof msg.id === "number") {
+              const res = bot.handleProposalDismiss(guildId, clientUserId, msg.id);
+              if ("error" in res) {
+                try { ws.send(JSON.stringify({ type: "proposal-error", id: msg.id, error: res.error })); } catch {}
+              }
+            }
+
+            if (msg.type === "proposal-affirm" && guildId && clientUserId &&
+                typeof msg.id === "number" && typeof msg.version === "number") {
+              bot.handleProposalAffirm(guildId, clientUserId, msg.id, msg.version).then((res) => {
+                if ("error" in res) {
+                  try { ws.send(JSON.stringify({ type: "proposal-error", id: msg.id, error: res.error })); } catch {}
+                }
+              });
             }
           } catch (e: any) {
             console.error("[activity] WebSocket message error:", e.message);

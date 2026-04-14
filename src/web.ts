@@ -94,8 +94,9 @@ function listStandups(limit = 50, offset = 0): Row[] {
   const db = openDb();
   if (!db) return [];
   try {
+    // Filter out pre-inserted (#53) rows whose meeting hasn't ended yet.
     return db
-      .query(`SELECT * FROM standups ORDER BY started_at DESC LIMIT ? OFFSET ?`)
+      .query(`SELECT * FROM standups WHERE ended_at != '' ORDER BY started_at DESC LIMIT ? OFFSET ?`)
       .all(limit, offset) as Row[];
   } catch (e: any) {
     console.error("[web] listStandups error:", e.message);
@@ -109,7 +110,7 @@ function countStandups(): number {
   const db = openDb();
   if (!db) return 0;
   try {
-    const row = db.query(`SELECT COUNT(*) as n FROM standups`).get() as { n: number } | null;
+    const row = db.query(`SELECT COUNT(*) as n FROM standups WHERE ended_at != ''`).get() as { n: number } | null;
     return row?.n ?? 0;
   } catch (e: any) {
     console.error("[web] countStandups error:", e.message);
@@ -127,6 +128,40 @@ function getStandup(id: number): Row | null {
   } catch (e: any) {
     console.error("[web] getStandup error:", e.message);
     return null;
+  } finally {
+    db.close();
+  }
+}
+
+interface ProposalDbRow {
+  id: number;
+  standup_id: number;
+  created_at: string;
+  trigger_reason: string;
+  focused_issue: number | null;
+  action_type: string;
+  repo: string;
+  target_issue: number | null;
+  payload_json: string;
+  original_payload_json: string;
+  state: string;
+  version: number;
+  executed_at: string | null;
+  executed_by: string | null;
+  execution_result_json: string | null;
+  superseded_by: number | null;
+}
+
+function getProposalsFor(standupId: number): ProposalDbRow[] {
+  const db = openDb();
+  if (!db) return [];
+  try {
+    return db
+      .query(`SELECT * FROM proposals WHERE standup_id = ? AND superseded_by IS NULL ORDER BY created_at ASC, id ASC`)
+      .all(standupId) as ProposalDbRow[];
+  } catch (e: any) {
+    // Table may not exist on older databases — treat as empty.
+    return [];
   } finally {
     db.close();
   }
@@ -596,6 +631,7 @@ function detailPage(r: Row, segments: SegmentRow[]) {
   }
 
   const suggestionsHtml = suggestionsSection(r.id);
+  const proposalsHtml = renderProposalsPane(r.id);
 
   return page(`#${r.id}`, `
     <a class="back" href="/">← All transcripts</a>
@@ -610,6 +646,8 @@ function detailPage(r: Row, segments: SegmentRow[]) {
     <h2>Per Participant</h2>
     ${participantBlocks || '<p class="empty">No participant data.</p>'}
 
+    ${proposalsHtml}
+
     ${issueTranscriptHtml}
 
     ${suggestionsHtml}
@@ -617,6 +655,71 @@ function detailPage(r: Row, segments: SegmentRow[]) {
     <h2>Full Transcript</h2>
     <pre>${esc(r.transcript)}</pre>
   `);
+}
+
+function renderProposalsPane(standupId: number): string {
+  const rows = getProposalsFor(standupId);
+  if (rows.length === 0) return "";
+
+  const order = ["executed", "affirmed", "failed", "edited", "pending", "dismissed"];
+  const label: Record<string, string> = {
+    executed: "Executed",
+    affirmed: "Affirmed",
+    failed: "Failed",
+    edited: "Edited (not affirmed)",
+    pending: "Pending at stop",
+    dismissed: "Dismissed",
+  };
+  const grouped = new Map<string, ProposalDbRow[]>();
+  for (const p of rows) {
+    const list = grouped.get(p.state) ?? [];
+    list.push(p);
+    grouped.set(p.state, list);
+  }
+
+  const sections = order.map((state) => {
+    const list = grouped.get(state);
+    if (!list || list.length === 0) return "";
+    const cards = list.map(renderProposalDbCard).join("");
+    return `<h3 style="color:#94a3b8;font-size:.85rem;margin-top:1rem">${label[state] ?? state} (${list.length})</h3>${cards}`;
+  }).join("");
+
+  return `<h2>Proposed Actions</h2>${sections}`;
+}
+
+function renderProposalDbCard(p: ProposalDbRow): string {
+  let payload: any = {};
+  let original: any = {};
+  let result: any = null;
+  try { payload = JSON.parse(p.payload_json); } catch {}
+  try { original = JSON.parse(p.original_payload_json); } catch {}
+  try { if (p.execution_result_json) result = JSON.parse(p.execution_result_json); } catch {}
+
+  const target = p.target_issue != null
+    ? `<a href="https://github.com/${esc(p.repo)}/issues/${p.target_issue}" target="_blank">#${p.target_issue}</a>`
+    : "new issue";
+  const edited = JSON.stringify(payload) !== JSON.stringify(original);
+  const reasoning = payload?.reasoning
+    ? `<div style="color:#64748b;font-size:.8rem;font-style:italic;margin-bottom:.4rem">${esc(String(payload.reasoning))}</div>`
+    : "";
+  const payloadBlock = edited
+    ? `<details><summary style="cursor:pointer;color:#a5b4fc;font-size:.82rem">Edited from original</summary>
+         <pre style="font-size:.75rem">${esc(JSON.stringify(original, null, 2))}</pre>
+         <div style="color:#fbbf24;font-size:.75rem">→ Edited to:</div>
+         <pre style="font-size:.75rem">${esc(JSON.stringify(payload, null, 2))}</pre>
+       </details>`
+    : `<pre style="font-size:.75rem">${esc(JSON.stringify(payload, null, 2))}</pre>`;
+  const resultBlock = result?.url
+    ? `<div style="font-size:.82rem;margin-top:.35rem">Result: <a href="${esc(String(result.url))}" target="_blank">${esc(String(result.url))}</a></div>`
+    : result?.error
+      ? `<div style="font-size:.82rem;color:#fca5a5;margin-top:.35rem">Error: ${esc(String(result.error))}</div>`
+      : "";
+  return `<div class="suggestion-card">
+    <div class="sug-type">${esc(p.action_type)} → ${target}</div>
+    ${reasoning}
+    ${payloadBlock}
+    ${resultBlock}
+  </div>`;
 }
 
 function esc(s: string) {
