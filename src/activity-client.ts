@@ -142,6 +142,9 @@ let actionBarOpen = false;
 const proposalErrors = new Map<number, string>();
 /** Per-proposal ephemeral "affirming" spinner flag. */
 const proposalInFlight = new Set<number>();
+/** Proposal IDs whose edit form is expanded. Default is collapsed — cards
+ *  show a one-line summary + affirm/dismiss until the user clicks to edit. */
+const expandedProposals = new Set<number>();
 
 // ── Standup brief state (per-assignee, lazy, server-cached) ────────────────
 interface BriefBullet { text: string; issueRefs: number[] }
@@ -489,6 +492,7 @@ function handleServerMessage(msg: ServerMessage) {
       proposals = proposals.filter((p) => p.id !== msg.id);
       proposalErrors.delete(msg.id);
       proposalInFlight.delete(msg.id);
+      expandedProposals.delete(msg.id);
       renderActionBar();
       break;
     }
@@ -1684,17 +1688,14 @@ function actionTypeLabel(t: ProposalActionType): string {
 }
 
 function renderProposalCard(p: ProposalWire): string {
-  const target = p.targetIssue != null
-    ? `<span class="proposal-target"><a href="https://github.com/${escapeHtml(p.repo)}/issues/${p.targetIssue}" target="_blank">#${p.targetIssue}</a></span>`
-    : "";
-  const reasoning = p.payload.reasoning
-    ? `<span class="proposal-reasoning">${escapeHtml(p.payload.reasoning)}</span>`
-    : "";
   const locked = p.state === "affirmed" || p.state === "executed" || p.state === "failed";
   const inFlight = proposalInFlight.has(p.id) || p.state === "affirmed";
   const err = proposalErrors.get(p.id);
   const execUrl = p.executionResult?.url;
   const execErr = p.executionResult?.error;
+  // Locked/terminal cards stay open so the result is visible; otherwise the
+  // card is collapsed until the user clicks the summary.
+  const expanded = locked || expandedProposals.has(p.id);
 
   let status = "";
   if (p.state === "executed") {
@@ -1709,21 +1710,61 @@ function renderProposalCard(p: ProposalWire): string {
     status = `<span class="proposal-status">Edited</span>`;
   }
 
+  const summary = proposalSummary(p);
+  const chevron = expanded ? "▾" : "▸";
+  const affirmBtn = locked
+    ? ""
+    : `<button class="proposal-btn proposal-btn-primary" data-action="affirm" ${inFlight ? "disabled" : ""}>Affirm</button>`;
+  const dismissBtn = locked
+    ? ""
+    : `<button class="proposal-dismiss" data-action="dismiss" title="Dismiss">×</button>`;
+
   return `
-    <div class="proposal-card state-${p.state}" data-proposal-id="${p.id}" data-version="${p.version}" data-locked="${locked ? 1 : 0}">
-      <div class="proposal-head">
+    <div class="proposal-card state-${p.state}" data-proposal-id="${p.id}" data-version="${p.version}" data-locked="${locked ? 1 : 0}" data-expanded="${expanded ? 1 : 0}">
+      <div class="proposal-summary" data-action="toggle">
+        <span class="proposal-chevron">${chevron}</span>
         <span class="proposal-type">${escapeHtml(actionTypeLabel(p.actionType))}</span>
-        ${target}
-        ${reasoning}
-        ${locked ? "" : `<button class="proposal-dismiss" data-action="dismiss" title="Dismiss">×</button>`}
-      </div>
-      ${renderProposalBody(p)}
-      <div class="proposal-actions">
+        <span class="proposal-summary-text">${escapeHtml(summary)}</span>
+        <span class="proposal-summary-spacer"></span>
         ${status}
-        ${locked ? "" : `<button class="proposal-btn proposal-btn-primary" data-action="affirm" ${inFlight ? "disabled" : ""}>Affirm</button>`}
+        ${affirmBtn}
+        ${dismissBtn}
+      </div>
+      <div class="proposal-body">
+        ${p.payload.reasoning ? `<div class="proposal-reasoning">${escapeHtml(p.payload.reasoning)}</div>` : ""}
+        ${renderProposalBody(p)}
       </div>
     </div>
   `;
+}
+
+/** One-line human-readable preview of a proposal's current payload. */
+function proposalSummary(p: ProposalWire): string {
+  const target = p.targetIssue != null ? `#${p.targetIssue}` : "";
+  const pay = p.payload;
+  switch (p.actionType) {
+    case "close_issue":
+      return `Close ${target}${pay.reason === "not_planned" ? " (not planned)" : ""}`.trim();
+    case "reopen_issue":
+      return `Reopen ${target}`.trim();
+    case "comment": {
+      const body = (pay.body ?? "").replace(/\s+/g, " ").trim();
+      const preview = body.length > 90 ? body.slice(0, 90) + "…" : body;
+      return preview ? `${target}: ${preview}` : target || "Comment";
+    }
+    case "reassign": {
+      const who = (pay.assignees ?? []).map((a) => "@" + a).join(", ");
+      return `${target} → ${who || "(none)"}`.trim();
+    }
+    case "set_labels": {
+      const adds = (pay.addLabels ?? []).map((l) => "+" + l);
+      const removes = (pay.removeLabels ?? []).map((l) => "−" + l);
+      const parts = [...adds, ...removes].join(", ");
+      return `${target}: ${parts || "(no changes)"}`.trim();
+    }
+    case "create_issue":
+      return pay.title ? pay.title : "(untitled)";
+  }
 }
 
 function renderProposalBody(p: ProposalWire): string {
@@ -1860,9 +1901,22 @@ function wireProposalCards(container: HTMLElement) {
       });
     });
 
+    const summary = card.querySelector('[data-action="toggle"]') as HTMLElement | null;
+    if (summary) {
+      summary.addEventListener("click", (e) => {
+        // Ignore clicks that land on an interactive child (buttons, links).
+        const t = e.target as HTMLElement;
+        if (t.closest("button") || t.closest("a")) return;
+        if (expandedProposals.has(id)) expandedProposals.delete(id);
+        else expandedProposals.add(id);
+        renderActionBar();
+      });
+    }
+
     const affirmBtn = card.querySelector('[data-action="affirm"]') as HTMLButtonElement | null;
     if (affirmBtn) {
-      affirmBtn.addEventListener("click", () => {
+      affirmBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
         // Flush any pending edit before affirming.
         const fresh = readProposalPayloadFromCard(card, p);
         if (!payloadEqual(fresh, p.payload)) {
@@ -1884,7 +1938,8 @@ function wireProposalCards(container: HTMLElement) {
 
     const dismissBtn = card.querySelector('[data-action="dismiss"]') as HTMLButtonElement | null;
     if (dismissBtn) {
-      dismissBtn.addEventListener("click", () => {
+      dismissBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
         sendWs({ type: "proposal-dismiss", id });
       });
     }

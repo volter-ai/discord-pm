@@ -317,24 +317,30 @@ const ACTIVITY_CSS = `
   .action-bar-drawer.open{max-height:60vh;overflow-y:auto}
   .action-bar-drawer-inner{padding:.6rem .75rem .9rem;display:flex;flex-direction:column;gap:.5rem}
   .action-bar-empty{color:#64748b;font-size:.82rem;text-align:center;padding:.75rem}
-  .proposal-card{background:#1e293b;border:1px solid #334155;border-radius:.4rem;padding:.55rem .7rem;display:flex;flex-direction:column;gap:.4rem}
+  .proposal-card{background:#1e293b;border:1px solid #334155;border-radius:.4rem;display:flex;flex-direction:column}
   .proposal-card.state-affirmed{border-color:#6366f1}
   .proposal-card.state-executed{border-color:#166534;background:#052e16}
   .proposal-card.state-failed{border-color:#7f1d1d;background:#2b0505}
   .proposal-card.state-edited{border-color:#a16207}
-  .proposal-head{display:flex;align-items:center;gap:.4rem;font-size:.78rem}
-  .proposal-type{font-weight:700;color:#a5b4fc;text-transform:uppercase;letter-spacing:.04em}
+  .proposal-summary{display:flex;align-items:center;gap:.45rem;padding:.45rem .65rem;font-size:.8rem;cursor:pointer;min-width:0}
+  .proposal-summary:hover{background:rgba(129,140,248,.05)}
+  .proposal-chevron{color:#64748b;font-size:.7rem;flex-shrink:0;width:.8rem;text-align:center}
+  .proposal-type{font-weight:700;color:#a5b4fc;text-transform:uppercase;letter-spacing:.04em;font-size:.7rem;flex-shrink:0}
   .proposal-target{color:#94a3b8;font-family:monospace}
   .proposal-target a{color:#c7d2fe;text-decoration:none}
   .proposal-target a:hover{text-decoration:underline}
-  .proposal-reasoning{color:#94a3b8;font-size:.75rem;font-style:italic;flex:1}
+  .proposal-summary-text{color:#cbd5e1;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .proposal-summary-spacer{flex-shrink:0}
+  .proposal-reasoning{color:#94a3b8;font-size:.75rem;font-style:italic;padding:0 .65rem .35rem}
   .proposal-reasoning:empty{display:none}
+  .proposal-body{padding:.1rem .65rem .6rem;display:flex;flex-direction:column;gap:.4rem}
+  .proposal-card[data-expanded="0"] .proposal-body{display:none}
   .proposal-field{display:flex;flex-direction:column;gap:.15rem}
   .proposal-field label{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.03em}
   .proposal-field input,.proposal-field textarea,.proposal-field select{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:.3rem;padding:.35rem .45rem;font-size:.82rem;font-family:inherit}
   .proposal-field textarea{min-height:3.2rem;resize:vertical}
   .proposal-actions{display:flex;gap:.4rem;align-items:center;justify-content:flex-end}
-  .proposal-status{flex:1;font-size:.75rem}
+  .proposal-status{font-size:.72rem;color:#94a3b8;flex-shrink:0}
   .proposal-status.ok{color:#4ade80}
   .proposal-status.err{color:#fca5a5}
   .proposal-status a{color:inherit;text-decoration:underline}
