@@ -150,6 +150,8 @@ const PROPOSAL_MIN_DEBOUNCE_MS = 8_000;
 const PROPOSAL_FALLBACK_STALE_MS = 60_000;
 /** Chris's always-affirm admin Discord ID (from src/users.ts USERS.careid). */
 const ADMIN_DISCORD_ID = "913513159329980447";
+/** Map sentinel for the "general discussion" proposal bucket (focusedIssue=null). */
+const GENERAL_BUCKET_KEY = -1;
 
 export class StandupBot {
   private client: Client;
@@ -288,6 +290,18 @@ export class StandupBot {
     }
   }
 
+  /** Bind the GitHub repo for this session's proposals. Called from the
+   *  Activity's `ready` handler so the proposal generator knows what repo to
+   *  target even before any issue gets focused. */
+  setIssueRepo(guildId: string, repo: string) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+    if (session.issueRepo === repo) return;
+    session.issueRepo = repo;
+    this.store.updateActiveSessionState(guildId, { issue_repo: repo });
+    console.log(`[bot] Session ${guildId} issueRepo set → ${repo}`);
+  }
+
   /** Set the detail panel issue from Activity. Broadcasts state to all clients. */
   setDetailPanel(guildId: string, issueNumber: number | null) {
     const session = this.activeSessions.get(guildId);
@@ -329,8 +343,9 @@ export class StandupBot {
       }
       this.store.updateActiveSessionState(guildId, { focused_issue: issueNumber });
       this.broadcastActivityState(guildId);
-      // Eval the OUTGOING issue's proposals before switching context.
-      if (outgoingIssue != null && outgoingIssue !== issueNumber) {
+      // Eval the OUTGOING bucket's proposals before switching context.
+      // Null bucket (general discussion) is valid too.
+      if (outgoingIssue !== issueNumber) {
         this.maybeEvaluateProposals(session, outgoingIssue, "focus_change");
       }
     }
@@ -1387,15 +1402,18 @@ export class StandupBot {
     return this.store.listActiveProposalsForStandup(session.standupId);
   }
 
-  /** Start the 10s fallback scanner that re-evaluates long-monologue issues. */
+  /** Start the 10s fallback scanner that re-evaluates long-monologue issues.
+   *  Also fires on the "general discussion" bucket (focusedIssue null) so
+   *  create_issue proposals surface even when nobody clicked a card. */
   private startProposalFallbackTimer(session: SessionMeta) {
     if (session.type !== "standup" || session.standupId == null) return;
     if (session.proposalFallbackTimer) return;
     session.proposalFallbackTimer = setInterval(() => {
-      if (session.focusedIssue == null) return;
-      const lastEval = session.proposalTrigger?.lastEvalAtByIssue.get(session.focusedIssue) ?? 0;
+      const bucket = session.focusedIssue;
+      const key = bucket ?? GENERAL_BUCKET_KEY;
+      const lastEval = session.proposalTrigger?.lastEvalAtByIssue.get(key) ?? 0;
       if (Date.now() - lastEval >= PROPOSAL_FALLBACK_STALE_MS) {
-        this.maybeEvaluateProposals(session, session.focusedIssue, "fallback_60s");
+        this.maybeEvaluateProposals(session, bucket, "fallback_60s");
       }
     }, 10_000);
   }
@@ -1407,61 +1425,71 @@ export class StandupBot {
     }
   }
 
-  /** Speaker hand-off triggers eval of the currently-focused issue. Edge
-   *  trigger only (someone newly started speaking), not stop events. */
+  /** Speaker hand-off triggers eval of the current bucket (focused issue or
+   *  general discussion). Edge trigger only (speaking=true). */
   private onSpeakerChangeForProposals(
     session: SessionMeta,
     _userId: string,
     speaking: boolean,
   ) {
     if (!speaking) return;
-    if (session.focusedIssue == null) return;
     this.maybeEvaluateProposals(session, session.focusedIssue, "speaker_change");
   }
 
-  /** Debounced, stampede-guarded entry point for producing proposals. */
+  /** Debounced, stampede-guarded entry point for producing proposals. Pass
+   *  null for the general-discussion bucket (no focused issue). */
   private maybeEvaluateProposals(
     session: SessionMeta,
-    issueNumber: number,
+    bucket: number | null,
     trigger: ProposalTriggerReason,
   ) {
-    if (!this.proposalGenerator) return;
+    if (!this.proposalGenerator) {
+      if (!session.proposalTrigger) return;
+      return;
+    }
     if (session.type !== "standup" || session.standupId == null) return;
     const trig = session.proposalTrigger;
     if (!trig) return;
-    if (trig.evalInFlight.has(issueNumber)) return;
+    if (!session.issueRepo) {
+      console.warn(`[bot] Skipping proposal eval (bucket=${bucket}) — issueRepo not set yet`);
+      return;
+    }
+    const key = bucket ?? GENERAL_BUCKET_KEY;
+    if (trig.evalInFlight.has(key)) return;
 
-    const lastAt = trig.lastEvalAtByIssue.get(issueNumber) ?? 0;
+    const lastAt = trig.lastEvalAtByIssue.get(key) ?? 0;
     if (Date.now() - lastAt < PROPOSAL_MIN_DEBOUNCE_MS) return;
 
     // Only eval if there are new segments since the last eval.
-    const issueLines = session.lines.filter((l) => l.issueNumber === issueNumber);
-    const lastCount = trig.lastSegmentCountByIssue.get(issueNumber) ?? 0;
-    if (issueLines.length <= lastCount) return;
+    const bucketLines = session.lines.filter((l) => l.issueNumber === bucket);
+    const lastCount = trig.lastSegmentCountByIssue.get(key) ?? 0;
+    if (bucketLines.length <= lastCount) return;
 
-    trig.evalInFlight.add(issueNumber);
-    trig.lastEvalAtByIssue.set(issueNumber, Date.now());
-    trig.lastSegmentCountByIssue.set(issueNumber, issueLines.length);
+    trig.evalInFlight.add(key);
+    trig.lastEvalAtByIssue.set(key, Date.now());
+    trig.lastSegmentCountByIssue.set(key, bucketLines.length);
 
-    this.evaluateProposals(session, issueNumber, trigger).finally(() => {
-      trig.evalInFlight.delete(issueNumber);
+    console.log(`[bot] Evaluating proposals bucket=${bucket ?? "general"} trigger=${trigger} segs=${bucketLines.length}`);
+
+    this.evaluateProposals(session, bucket, trigger).finally(() => {
+      trig.evalInFlight.delete(key);
     });
   }
 
   private async evaluateProposals(
     session: SessionMeta,
-    issueNumber: number,
+    bucket: number | null,
     trigger: ProposalTriggerReason,
   ) {
     if (!this.proposalGenerator || session.standupId == null) return;
     const repo = session.issueRepo;
     if (!repo) return;
 
-    const meta = session.issueMeta.get(issueNumber);
-    const issueLines = session.lines.filter((l) => l.issueNumber === issueNumber);
-    if (issueLines.length === 0) return;
+    const meta = bucket != null ? session.issueMeta.get(bucket) : null;
+    const bucketLines = session.lines.filter((l) => l.issueNumber === bucket);
+    if (bucketLines.length === 0) return;
 
-    const recentSegments = issueLines.map((l) => ({
+    const recentSegments = bucketLines.map((l) => ({
       id: l.startedAt,
       speaker: l.speaker,
       text: l.text,
@@ -1470,14 +1498,18 @@ export class StandupBot {
 
     const known = this.store
       .listActiveProposalsForStandup(session.standupId)
-      .filter((p) => p.focused_issue === issueNumber);
+      .filter((p) => p.focused_issue === bucket);
 
     const assignableUsers = Object.keys(USERS);
 
     let generated;
     try {
       generated = await this.proposalGenerator.generate({
-        focusedIssue: meta ? { number: issueNumber, title: meta.title, state: meta.state } : { number: issueNumber, title: "", state: "open" },
+        focusedIssue: bucket != null
+          ? (meta
+              ? { number: bucket, title: meta.title, state: meta.state }
+              : { number: bucket, title: "", state: "open" })
+          : null,
         recentSegments,
         knownProposals: known,
         repo,
@@ -1485,10 +1517,11 @@ export class StandupBot {
         trigger,
       });
     } catch (e: any) {
-      console.error(`[bot] ProposalGenerator error for #${issueNumber}:`, e.message);
+      console.error(`[bot] ProposalGenerator error for bucket=${bucket ?? "general"}:`, e.message);
       return;
     }
 
+    console.log(`[bot] ProposalGenerator returned ${generated.length} for bucket=${bucket ?? "general"}`);
     if (generated.length === 0) return;
 
     for (const g of generated) {
@@ -1498,7 +1531,7 @@ export class StandupBot {
           guild_id: session.guildId,
           created_at: new Date().toISOString(),
           trigger_reason: trigger,
-          focused_issue: issueNumber,
+          focused_issue: bucket,
           action_type: g.action_type,
           repo,
           target_issue: g.target_issue,

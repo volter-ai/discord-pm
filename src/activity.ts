@@ -824,6 +824,12 @@ export function createActivityApp(
                 if (session) {
                   guildId = session.guildId;
                   bot.addActivityClient(guildId, ws, clientUserId, clientUsername);
+                  // Bind the standup's repo so live proposals (#53) can target
+                  // GitHub. This is idempotent — cheap to call on every ready.
+                  const pickedKey = typeof msg.standupKey === "string" ? msg.standupKey : null;
+                  if (pickedKey && STANDUPS[pickedKey]) {
+                    bot.setIssueRepo(guildId, STANDUPS[pickedKey].repo);
+                  }
                   // addActivityClient already broadcasts updated state; send a personal
                   // initial state so the client has all fields before the broadcast arrives.
                   const presenterName = session.meta.presenter
