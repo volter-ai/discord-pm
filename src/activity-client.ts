@@ -479,8 +479,15 @@ function handleServerMessage(msg: ServerMessage) {
     case "proposal-upsert": {
       const incoming = msg.proposal;
       const idx = proposals.findIndex((p) => p.id === incoming.id);
+      const prev = idx !== -1 ? proposals[idx] : null;
       if (idx === -1) proposals.push(incoming);
       else proposals[idx] = incoming;
+      // Auto-expand on transition to affirmed/executed/failed so the user sees
+      // the spinner or result. They can still collapse manually afterwards.
+      if (prev && prev.state !== incoming.state &&
+          (incoming.state === "affirmed" || incoming.state === "executed" || incoming.state === "failed")) {
+        expandedProposals.add(incoming.id);
+      }
       proposalErrors.delete(incoming.id);
       if (incoming.state !== "pending" && incoming.state !== "edited" && incoming.state !== "affirmed") {
         proposalInFlight.delete(incoming.id);
@@ -1693,9 +1700,9 @@ function renderProposalCard(p: ProposalWire): string {
   const err = proposalErrors.get(p.id);
   const execUrl = p.executionResult?.url;
   const execErr = p.executionResult?.error;
-  // Locked/terminal cards stay open so the result is visible; otherwise the
-  // card is collapsed until the user clicks the summary.
-  const expanded = locked || expandedProposals.has(p.id);
+  // Freshly-transitioned locked cards are auto-added to expandedProposals in
+  // the upsert handler so the result is visible; the user can then collapse.
+  const expanded = expandedProposals.has(p.id);
 
   let status = "";
   if (p.state === "executed") {
