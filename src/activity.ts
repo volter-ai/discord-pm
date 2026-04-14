@@ -368,7 +368,7 @@ async function fetchParticipantData(config: StandupConfig) {
         fetchOpenNonBacklog(config.repo, step.githubUser, config.backlogLabel),
         fetchOpenPRsByAuthor(config.repo, step.githubUser),
       ]);
-      avatarUrl = `/activity/avatar?user=${encodeURIComponent(step.githubUser)}`;
+      avatarUrl = `/avatar?user=${encodeURIComponent(step.githubUser)}`;
       prs = fetchedPRs;
       const recentNums = new Set(recent.map(i => i.number));
       const recentOpen = recent.filter(i => i.state === "open");
