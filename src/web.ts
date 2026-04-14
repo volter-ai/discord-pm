@@ -17,6 +17,7 @@ import { Hono } from "hono";
 import { Database } from "bun:sqlite";
 import { Summarizer, type GitHubSuggestion } from "./summarizer";
 import { createIssue, createComment } from "./github";
+import type { StandupBot } from "./bot";
 
 const PASSWORD = process.env.WEB_PASSWORD ?? "";
 const DB_PATH = "./data/standups.db";
@@ -629,7 +630,7 @@ function esc(s: string) {
 
 // ── App factory ─────────────────────────────────────────────────────────────
 
-export function createWebApp(): Hono {
+export function createWebApp(bot?: StandupBot): Hono {
   const app = new Hono();
 
   // Auth middleware
@@ -657,6 +658,12 @@ export function createWebApp(): Hono {
     if (!row) return c.notFound();
     const segments = getSegments(id);
     return c.html(detailPage(row, segments));
+  });
+
+  // Deploy-safety check: list in-memory sessions a restart would drop.
+  app.get("/internal/active-sessions", (c) => {
+    if (!bot) return c.json({ sessions: [] });
+    return c.json(bot.getActiveSessionsInfo());
   });
 
   // JSON API routes

@@ -61,7 +61,7 @@ app.get("/activity/", async (c) => {
 });
 
 // Transcript web UI + JSON API (with Basic Auth)
-app.route("/", createWebApp());
+app.route("/", createWebApp(bot));
 
 // Start HTTP server
 const server = Bun.serve({

@@ -175,6 +175,28 @@ export class StandupBot {
     return null;
   }
 
+  /** Summary of in-memory sessions that would be lost on restart. Review
+   *  walkthroughs are state-free (encoded in Discord button customIds) and
+   *  are not reported here. */
+  getActiveSessionsInfo(): {
+    sessions: Array<{
+      guildId: string;
+      type: "standup" | "meeting";
+      channelId: string;
+      startedAt: string;
+      lineCount: number;
+    }>;
+  } {
+    const sessions = [...this.activeSessions.entries()].map(([guildId, meta]) => ({
+      guildId,
+      type: meta.type,
+      channelId: meta.channelId,
+      startedAt: meta.startedAt.toISOString(),
+      lineCount: meta.lines.length,
+    }));
+    return { sessions };
+  }
+
   /** Register an Activity WebSocket client for a guild session. */
   addActivityClient(guildId: string, ws: any, userId: string | null, username: string | null) {
     const session = this.activeSessions.get(guildId);
