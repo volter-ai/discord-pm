@@ -137,6 +137,8 @@ interface SessionMeta {
   } | null;
   /** Fallback-60s scanner interval handle (cleared at stop). */
   proposalFallbackTimer: ReturnType<typeof setInterval> | null;
+  /** Per-session Recorder instance (#60). Isolated so concurrent guilds don't collide. */
+  recorder: Recorder;
 }
 
 /** Drain timeout: 5 minutes max wait for transcriptions after stop. */
@@ -155,7 +157,6 @@ const GENERAL_BUCKET_KEY = -1;
 
 export class StandupBot {
   private client: Client;
-  private recorder = new Recorder();
   private transcriber = new Transcriber();
   private summarizer: Summarizer;
   private store = new StandupStore();
@@ -645,6 +646,7 @@ export class StandupBot {
             activeByIssue: new Map(),
           } : null,
           proposalFallbackTimer: null,
+          recorder: new Recorder(),
         };
         for (const l of this.store.getActiveSessionLines(row.guild_id, row.started_at)) {
           session.lines.push({
@@ -670,7 +672,7 @@ export class StandupBot {
           channel: textChannel,
         };
 
-        await this.recorder.start(voiceChannel, {
+        await session.recorder.start(voiceChannel, {
           onUtterance: (u) => this.enqueueUtterance(session, u),
           onTimeout: () => {
             console.warn("[bot] Auto-stop triggered by timeout (resumed session).");
@@ -826,11 +828,11 @@ export class StandupBot {
       return interaction.followUp("You must be in a voice channel to start the standup.");
     }
 
-    if (this.recorder.isRecording) {
-      return interaction.followUp("A recording is already in progress. Stop it first.");
+    const guildId = interaction.guildId!;
+    if (this.activeSessions.has(guildId)) {
+      return interaction.followUp("A recording is already in progress in this server. Stop it first.");
     }
 
-    const guildId = interaction.guildId!;
     const startedAt = new Date();
     const standupId = this.store.startStandup({
       guild_id: guildId,
@@ -866,6 +868,7 @@ export class StandupBot {
         activeByIssue: new Map(),
       },
       proposalFallbackTimer: null,
+      recorder: new Recorder(),
     };
     this.activeSessions.set(guildId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
@@ -873,7 +876,7 @@ export class StandupBot {
     this.startProposalFallbackTimer(session);
 
     try {
-      await this.recorder.start(voiceChannel, {
+      await session.recorder.start(voiceChannel, {
         onUtterance: (utterance) => {
           this.enqueueUtterance(session, utterance);
         },
@@ -976,11 +979,11 @@ export class StandupBot {
       return interaction.followUp("You must be in a voice channel to start recording.");
     }
 
-    if (this.recorder.isRecording) {
-      return interaction.followUp("A recording is already in progress. Stop it first.");
+    const guildId = interaction.guildId!;
+    if (this.activeSessions.has(guildId)) {
+      return interaction.followUp("A recording is already in progress in this server. Stop it first.");
     }
 
-    const guildId = interaction.guildId!;
     const session: SessionMeta = {
       guildId,
       type: "meeting",
@@ -1005,13 +1008,14 @@ export class StandupBot {
       standupId: null,
       proposalTrigger: null,
       proposalFallbackTimer: null,
+      recorder: new Recorder(),
     };
     this.activeSessions.set(guildId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
     this.persistSessionStart(guildId, session);
 
     try {
-      await this.recorder.start(voiceChannel, {
+      await session.recorder.start(voiceChannel, {
         onUtterance: (utterance) => {
           this.enqueueUtterance(session, utterance);
         },
@@ -1082,7 +1086,8 @@ export class StandupBot {
     const startedAt = session?.startedAt ?? endedAt;
 
     // Stop recorder — returns any utterances still in-progress.
-    const remaining = this.recorder.stop();
+    // Per-session recorder (#60): isolated to this guild, won't affect others.
+    const remaining = session ? session.recorder.stop() : [];
 
     // Transcribe remaining utterances (people who were mid-sentence at stop).
     if (session) {
@@ -1330,7 +1335,7 @@ export class StandupBot {
 
   private async handleStatus(interaction: any) {
     const session = this.activeSessions.get(interaction.guildId!);
-    if (session && this.recorder.isRecording) {
+    if (session && session.recorder.isRecording) {
       const elapsed = Math.round((Date.now() - session.startedAt.getTime()) / 1000);
       const min = Math.floor(elapsed / 60);
       const sec = elapsed % 60;
