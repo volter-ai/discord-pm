@@ -94,12 +94,27 @@ const DETAIL_CACHE_MAX = 30;
 let detailCache = new Map<string, any>(); // "repo/number" → detail
 let detailFetchInFlight = false;
 
+// ── Standup brief state (per-assignee, lazy, server-cached) ────────────────
+interface BriefBullet { text: string; issueRefs: number[] }
+interface Brief { headline: string; bullets: BriefBullet[] }
+type BriefState =
+  | { status: "loading" }
+  | { status: "ok"; brief: Brief | null }
+  | { status: "error"; message: string };
+const briefByAssignee = new Map<string, BriefState>();
+
 // ── Speaker name resolver ────────────────────────────────────────────────────
 // Discord display names may not exactly match config names (e.g. "Brennan Volter" vs "Brennan").
 // This resolves a Discord display name to the canonical config participant name.
 const nameResolverCache = new Map<string, string>();
 
-function resolveParticipantName(discordName: string): string {
+function resolveParticipantName(discordName: string, discordId?: string): string {
+  // Discord ID match wins — the display name can be a server nickname that
+  // doesn't resemble the GitHub-derived participant name (e.g. alt account).
+  if (discordId) {
+    const byId = participants.find(p => p.discordId === discordId);
+    if (byId) return byId.name;
+  }
   const cached = nameResolverCache.get(discordName);
   if (cached !== undefined) return cached;
   // 1. Exact match
@@ -378,7 +393,7 @@ function sendWs(msg: object) {
 function handleServerMessage(msg: ServerMessage) {
   switch (msg.type) {
     case "speaker": {
-      const resolvedName = resolveParticipantName(msg.name);
+      const resolvedName = resolveParticipantName(msg.name, msg.userId);
       if (msg.speaking) {
         speakingUsers.add(msg.userId);
         speakingNames.add(resolvedName);
@@ -498,7 +513,10 @@ function render() {
   const headerHtml = renderHeader();
   const tabsHtml = renderTabs();
   const boardHtml = renderBoard();
-  const liveHtml = `<div id="live-feed" class="live-feed"></div>`;
+  const collapsed = localStorage.getItem("dpm.liveFeed.collapsed") === "1";
+  const feedClass = `live-feed${collapsed ? " live-feed-collapsed" : ""}`;
+  const toggleIcon = collapsed ? "▲" : "▼";
+  const liveHtml = `<div id="live-feed" class="${feedClass}"><button id="live-feed-toggle" class="live-feed-toggle" title="Collapse/expand transcript">${toggleIcon}</button></div>`;
 
   app.innerHTML = `
     ${headerHtml}
@@ -507,6 +525,9 @@ function render() {
     ${liveHtml}
   `;
   updateTabTimes();
+  setupLiveFeedToggle();
+  wireBriefCard();
+  maybeLoadBrief();
 }
 
 function renderHeader(): string {
@@ -662,12 +683,15 @@ function renderBoard(): string {
   const extraBadge = participant.githubUser && participant.name === participant.githubUser
     ? `<span class="board-extra-badge">unlisted</span>` : "";
 
+  const briefSlot = participant.githubUser ? `<div id="brief-slot">${renderBriefCardHtml()}</div>` : "";
+
   return `
     <div class="board" id="board">
       <div class="board-participant">
         ${participant.avatarUrl ? `<img class="board-avatar" src="${escapeHtml(participant.avatarUrl)}" alt="">` : ""}
         <span class="board-name">${escapeHtml(participant.name)}</span>${extraBadge}
       </div>
+      ${briefSlot}
       <div class="stages">${stagesHtml}${prsHtml}</div>
       ${navHtml}
     </div>
@@ -992,10 +1016,103 @@ function addLiveUtterance(speaker: string, text: string, issueNumber: number | n
   entry.innerHTML = `${issueTag}<strong>${escapeHtml(speaker)}:</strong> ${escapeHtml(text)}`;
   feed.prepend(entry);
 
-  // Keep max 10 entries
-  while (feed.children.length > 10) {
-    feed.removeChild(feed.lastChild!);
+  // Keep max 10 .live-entry elements (toggle button is a sibling child — ignored).
+  const entries = feed.querySelectorAll(".live-entry");
+  for (let i = 10; i < entries.length; i++) entries[i].remove();
+}
+
+async function fetchAssigneeBrief(assignee: string, refresh = false): Promise<void> {
+  briefByAssignee.set(assignee, { status: "loading" });
+  if (assignee === currentBriefAssignee()) renderBriefCard();
+  try {
+    const qs = new URLSearchParams({ standup: standupKey, assignee });
+    if (refresh) qs.set("refresh", "1");
+    const res = await fetch(`/activity/api/assignee-brief?${qs.toString()}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({} as any));
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    const data = await res.json() as { brief: Brief | null };
+    briefByAssignee.set(assignee, { status: "ok", brief: data.brief });
+  } catch (e: any) {
+    briefByAssignee.set(assignee, { status: "error", message: e.message || "Unknown error" });
   }
+  if (assignee === currentBriefAssignee()) renderBriefCard();
+}
+
+function currentBriefAssignee(): string | null {
+  const p = participants[activeTabIndex];
+  if (!p || !p.githubUser) return null;
+  return p.githubUser;
+}
+
+function maybeLoadBrief() {
+  const assignee = currentBriefAssignee();
+  if (!assignee) return;
+  if (!briefByAssignee.has(assignee)) void fetchAssigneeBrief(assignee, false);
+}
+
+function renderBriefCardHtml(): string {
+  const assignee = currentBriefAssignee();
+  if (!assignee) return "";
+  const state = briefByAssignee.get(assignee);
+  if (!state) return "";
+  if (state.status === "loading") {
+    return `<div class="brief-skeleton" id="brief-card"><div class="brief-skeleton-line"></div><div class="brief-skeleton-line"></div><div class="brief-skeleton-line"></div></div>`;
+  }
+  if (state.status === "error") {
+    return `<div class="brief-card" id="brief-card"><div class="brief-header"><span class="brief-error">Brief unavailable: ${escapeHtml(state.message)}</span><button class="brief-refresh" id="brief-refresh" title="Retry">↻</button></div></div>`;
+  }
+  if (!state.brief) return ""; // no updates → hide entirely
+  const bulletsHtml = state.brief.bullets.slice(0, 5).map(b => {
+    const chips = b.issueRefs.map(n => `<span class="live-issue" data-detail="${n}">#${n}</span>`).join("");
+    return `<li class="brief-bullet"><span class="bullet-text">${chips}${escapeHtml(b.text)}</span></li>`;
+  }).join("");
+  return `
+    <div class="brief-card" id="brief-card">
+      <div class="brief-header">
+        <div class="brief-headline">${escapeHtml(state.brief.headline)}</div>
+        <button class="brief-refresh" id="brief-refresh" title="Regenerate brief">↻</button>
+      </div>
+      <ul class="brief-bullets">${bulletsHtml}</ul>
+    </div>
+  `;
+}
+
+function renderBriefCard() {
+  const slot = document.getElementById("brief-slot");
+  if (!slot) return;
+  slot.innerHTML = renderBriefCardHtml();
+  wireBriefCard();
+}
+
+function wireBriefCard() {
+  const refresh = document.getElementById("brief-refresh");
+  const assignee = currentBriefAssignee();
+  if (refresh && assignee) {
+    refresh.addEventListener("click", () => {
+      refresh.classList.add("spinning");
+      void fetchAssigneeBrief(assignee, true);
+    });
+  }
+  // #N issue chips inside bullets open the detail modal (reuse data-detail handler)
+  document.querySelectorAll<HTMLElement>("#brief-card .live-issue[data-detail]").forEach(el => {
+    el.addEventListener("click", () => {
+      const n = parseInt(el.dataset.detail!);
+      if (!isNaN(n)) openDetailPanel(n);
+    });
+  });
+}
+
+function setupLiveFeedToggle() {
+  const toggle = document.getElementById("live-feed-toggle");
+  const feed = document.getElementById("live-feed");
+  if (!toggle || !feed) return;
+  toggle.addEventListener("click", () => {
+    const collapsed = feed.classList.toggle("live-feed-collapsed");
+    toggle.textContent = collapsed ? "▲" : "▼";
+    localStorage.setItem("dpm.liveFeed.collapsed", collapsed ? "1" : "0");
+  });
 }
 
 function startTimer() {

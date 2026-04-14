@@ -71,7 +71,7 @@ function parseIssues(raw: any[]): GitHubIssue[] {
  * Returns midnight UTC of the most recent business day.
  * Monday → Friday, Sat/Sun → Friday, Tue–Fri → yesterday.
  */
-function sinceLastBusinessDayStart(): string {
+export function sinceLastBusinessDayStart(): string {
   const now = new Date();
   const day = now.getUTCDay(); // 0=Sun,1=Mon,...,6=Sat
   // Mon=1 → back 3 days to Fri; Sun=0 → back 2 days to Fri; Sat=6 → back 1 day to Fri; else → back 1 day
@@ -182,6 +182,76 @@ export async function fetchIssueDetail(
       createdAt: c.created_at,
     })),
   };
+}
+
+export interface AssigneeIssueUpdate {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  labels: string[];
+  priority: "P0" | "P1" | "P2" | "P3" | null;
+  bodyExcerpt: string;
+  url: string;
+  transitions: Array<{ event: string; at: string; label?: string }>;
+  recentComments: Array<{ user: string; body: string; createdAt: string }>;
+}
+
+function extractPriority(labels: string[]): "P0" | "P1" | "P2" | "P3" | null {
+  for (const label of labels) {
+    const m = label.match(/^p([0-3])$/i);
+    if (m) return ("P" + m[1]) as "P0" | "P1" | "P2" | "P3";
+  }
+  return null;
+}
+
+/**
+ * Fetch per-issue change data for an assignee over the window: body excerpt,
+ * priority, timeline transitions within window, recent comments within window.
+ * Used for the per-assignee standup brief.
+ */
+export async function fetchAssigneeUpdates(
+  repo: string,
+  assignee: string,
+  since = sinceLastBusinessDayStart(),
+): Promise<AssigneeIssueUpdate[]> {
+  const issues = await fetchRecentlyUpdated(repo, assignee, since);
+  if (issues.length === 0) return [];
+  const sinceTs = new Date(since).getTime();
+
+  return Promise.all(issues.slice(0, 10).map(async (issue) => {
+    const [timelineRaw, detail] = await Promise.all([
+      fetch(`${GITHUB_API}/repos/${repo}/issues/${issue.number}/timeline?per_page=100`, {
+        headers: headers(),
+        signal: AbortSignal.timeout(10_000),
+      }).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetchIssueDetail(repo, issue.number).catch(() => null),
+    ]);
+
+    const transitions = (timelineRaw as any[])
+      .filter(e =>
+        ["labeled", "unlabeled", "closed", "reopened", "assigned", "unassigned"].includes(e.event) &&
+        e.created_at && new Date(e.created_at).getTime() >= sinceTs,
+      )
+      .slice(-15)
+      .map(e => ({ event: e.event, at: e.created_at, label: e.label?.name }));
+
+    const recentComments = (detail?.comments ?? [])
+      .filter(c => new Date(c.createdAt).getTime() >= sinceTs)
+      .slice(-3)
+      .map(c => ({ user: c.user, body: c.body.slice(0, 500), createdAt: c.createdAt }));
+
+    return {
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      labels: issue.labels,
+      priority: extractPriority(issue.labels),
+      bodyExcerpt: (detail?.body ?? "").slice(0, 800),
+      url: issue.url,
+      transitions,
+      recentComments,
+    };
+  }));
 }
 
 export async function createIssue(
@@ -347,7 +417,7 @@ export async function fetchPRDetail(repo: string, number: number): Promise<GitHu
 
 export async function fetchAllOpenAssigned(repo: string, backlogLabel: string): Promise<GitHubIssue[]> {
   const escapedLabel = backlogLabel.replace(/"/g, '\\"');
-  const q = `is:issue repo:${repo} is:open is:assigned -label:"${escapedLabel}"`;
+  const q = `is:issue repo:${repo} is:open assignee:* -label:"${escapedLabel}"`;
   const params = new URLSearchParams({ q, sort: "updated", order: "desc", per_page: "100" });
   return withRetry("fetchAllOpenAssigned", async () => {
     const res = await fetch(`${GITHUB_API}/search/issues?${params}`, {

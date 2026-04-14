@@ -39,4 +39,3 @@ htmlcov/
 .DS_Store
 node_modules/
 models/
-bun.lock

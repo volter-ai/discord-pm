@@ -27,9 +27,12 @@ import {
   assignIssue,
   fetchOpenPRsByAuthor,
   fetchPRDetail,
+  fetchAssigneeUpdates,
+  sinceLastBusinessDayStart,
   type GitHubIssue,
   type GitHubPR,
 } from "./github";
+import { Summarizer, type AssigneeBrief } from "./summarizer";
 import type { StandupBot } from "./bot";
 
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID ?? "";
@@ -161,8 +164,33 @@ const ACTIVITY_CSS = `
   .nav-btn-primary{background:#4f46e5;color:white;border-color:#4f46e5}
   .nav-btn-primary:hover{background:#4338ca}
 
-  /* Live Feed */
-  .live-feed{padding:.75rem 1rem;border-top:1px solid #1e293b;max-height:180px;overflow-y:auto;flex-shrink:0}
+  /* Standup brief card (auto-generated per-assignee) */
+  .brief-card{background:linear-gradient(135deg,#1e1b4b 0%,#1e293b 100%);border:1px solid #4338ca;border-radius:.5rem;padding:.9rem 1rem;margin-bottom:1rem;position:relative}
+  .brief-header{display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem;margin-bottom:.55rem}
+  .brief-headline{font-size:.95rem;font-weight:600;color:#c7d2fe;line-height:1.35;flex:1}
+  .brief-refresh{background:none;border:none;color:#818cf8;cursor:pointer;font-size:.8rem;padding:.15rem .35rem;border-radius:.25rem;flex-shrink:0}
+  .brief-refresh:hover{background:#312e81;color:#e0e7ff}
+  .brief-refresh.spinning{animation:spin .7s linear infinite}
+  .brief-bullets{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:.35rem}
+  .brief-bullet{font-size:.85rem;color:#cbd5e1;line-height:1.45;display:flex;align-items:flex-start;gap:.4rem}
+  .brief-bullet::before{content:"•";color:#818cf8;font-weight:700;flex-shrink:0;margin-top:.05rem}
+  .brief-bullet .bullet-text{flex:1}
+  .brief-bullet .live-issue{cursor:pointer}
+  .brief-skeleton{background:#1e293b;border:1px solid #334155;border-radius:.5rem;padding:.9rem 1rem;margin-bottom:1rem}
+  .brief-skeleton-line{height:.65rem;background:linear-gradient(90deg,#334155 25%,#475569 50%,#334155 75%);background-size:200% 100%;animation:brief-shimmer 1.4s ease-in-out infinite;border-radius:.2rem;margin-bottom:.5rem}
+  .brief-skeleton-line:nth-child(1){width:72%}
+  .brief-skeleton-line:nth-child(2){width:55%}
+  .brief-skeleton-line:nth-child(3){width:62%}
+  .brief-skeleton-line:last-child{margin-bottom:0}
+  @keyframes brief-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .brief-error{font-size:.78rem;color:#fca5a5;font-style:italic}
+
+  /* Live Feed — sticky at bottom of viewport so it stays visible while scrolling tabs */
+  .live-feed{position:sticky;bottom:0;z-index:5;padding:.75rem 1rem .75rem 2.25rem;border-top:1px solid #1e293b;max-height:180px;overflow-y:auto;flex-shrink:0;background:rgba(15,23,42,.92);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+  .live-feed-collapsed{max-height:2.4rem;overflow:hidden}
+  .live-feed-collapsed .live-entry:not(:first-child){display:none}
+  .live-feed-toggle{position:absolute;top:.35rem;left:.5rem;background:none;border:none;color:#64748b;cursor:pointer;font-size:.85rem;padding:.15rem .3rem;border-radius:.25rem;line-height:1}
+  .live-feed-toggle:hover{color:#e2e8f0;background:#1e293b}
   .live-entry{font-size:.82rem;color:#94a3b8;padding:.25rem 0;border-bottom:1px solid #0f172a;line-height:1.4}
   .live-entry strong{color:#c7d2fe}
   .live-issue{background:#1e1b4b;color:#a5b4fc;padding:.05rem .3rem;border-radius:.2rem;font-size:.75rem;margin-right:.25rem}
@@ -281,6 +309,16 @@ const ACTIVITY_CSS = `
 /** Cache /api/issues responses per standup key for 2 minutes to avoid hammering GitHub. */
 const issuesCache = new Map<string, { data: object; expiresAt: number }>();
 const ISSUES_CACHE_TTL_MS = 2 * 60 * 1_000;
+
+/**
+ * Cache per-assignee briefs keyed by `${standupKey}:${assignee}:${windowStart}`.
+ * TTL = 1h. Everyone in the same standup window shares the same brief so
+ * facilitators see consistent text. `refresh=1` busts the entry.
+ */
+const briefCache = new Map<string, { brief: AssigneeBrief | null; expiresAt: number }>();
+const BRIEF_CACHE_TTL_MS = 60 * 60 * 1_000;
+/** Coalesce in-flight brief requests so concurrent callers share one Claude call. */
+const briefInflight = new Map<string, Promise<AssigneeBrief | null>>();
 
 // ── Issue data helpers ──────────────────────────────────────────────────────
 
@@ -441,6 +479,66 @@ export function createActivityApp(
     } catch (e: any) {
       console.error("[activity] Issues fetch error:", e.message);
       return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // Auto-generated per-assignee standup brief (lazy, cached per standup window)
+  app.get("/api/assignee-brief", async (c) => {
+    const standupKey = c.req.query("standup");
+    const assignee = c.req.query("assignee");
+    const refresh = c.req.query("refresh") === "1";
+
+    if (!standupKey || !STANDUPS[standupKey]) {
+      return c.json({ error: `Unknown standup` }, 400);
+    }
+    if (!assignee || !/^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$/.test(assignee)) {
+      return c.json({ error: "Missing or invalid assignee" }, 400);
+    }
+
+    const config = STANDUPS[standupKey];
+    const windowStart = sinceLastBusinessDayStart();
+    const cacheKey = `${standupKey}:${assignee}:${windowStart}`;
+
+    if (!refresh) {
+      const cached = briefCache.get(cacheKey);
+      if (cached && Date.now() < cached.expiresAt) {
+        return c.json({ brief: cached.brief, cached: true });
+      }
+    } else {
+      briefCache.delete(cacheKey);
+      briefInflight.delete(cacheKey);
+    }
+
+    const inflight = briefInflight.get(cacheKey);
+    if (inflight) {
+      try {
+        const brief = await inflight;
+        return c.json({ brief, cached: true });
+      } catch (e: any) {
+        return c.json({ error: e.message || "Brief generation failed" }, 500);
+      }
+    }
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return c.json({ error: "ANTHROPIC_API_KEY not configured" }, 500);
+
+    const promise = (async (): Promise<AssigneeBrief | null> => {
+      const updates = await fetchAssigneeUpdates(config.repo, assignee, windowStart);
+      if (updates.length === 0) return null;
+      const summarizer = new Summarizer(apiKey);
+      return summarizer.summarizeAssigneeDay(assignee, updates);
+    })();
+
+    briefInflight.set(cacheKey, promise);
+    try {
+      const brief = await promise;
+      briefCache.set(cacheKey, { brief, expiresAt: Date.now() + BRIEF_CACHE_TTL_MS });
+      return c.json({ brief });
+    } catch (e: any) {
+      console.error("[activity] Brief error:", e.message);
+      return c.json({ error: "Brief generation failed" }, 500);
+    } finally {
+      briefInflight.delete(cacheKey);
     }
   });
 

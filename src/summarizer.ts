@@ -98,6 +98,40 @@ export interface IssueSummaryResult {
   summary_text: string;
 }
 
+export interface AssigneeBriefBullet {
+  text: string;
+  issueRefs: number[];
+}
+export interface AssigneeBrief {
+  headline: string;
+  bullets: AssigneeBriefBullet[];
+}
+
+const ASSIGNEE_BRIEF_SYSTEM_PROMPT = `You write the assignee's portion of a daily engineering standup brief for a technical project manager.
+
+Input: JSON describing one assignee and the GitHub issues they touched in the standup window. Each issue includes title, state, labels (priority labels look like "p0"-"p3"), a body excerpt, timeline transitions within the window (labeled/unlabeled/closed/reopened), and recent comments.
+
+Output: VALID JSON ONLY, no markdown, matching this schema:
+{
+  "headline": "string (1 line, bold, the single most important thing that changed overnight — what a busy engineering lead most needs to know about this person)",
+  "bullets": [
+    { "text": "string (one line, specific, action-oriented)", "issueRefs": [142, 143] }
+  ]
+}
+
+Rules:
+- Max 5 bullets total. Fewer is better. Aim for 2-4.
+- Group related issues into a single bullet when they share a theme (e.g. same area label, cross-reference each other, or describe one coherent workstream). Use multiple issueRefs.
+- Lead with the highest-priority movement. Order: P0 > P1 > P2 > P3. Within a priority: closed today > stage advanced > commented.
+- P0 activity: always surface, even if only commented on.
+- P1 activity: surface unless purely cosmetic.
+- P2/P3 activity: only if the state changed or was closed. Do NOT surface a P2/P3 that only got a minor comment.
+- Exception: a comment that contains a decision ("we'll ship X on Friday", "blocked on Y", "moved to Z") always counts regardless of priority.
+- Frame each bullet in terms of **what changed** and **what it means for end users or the next step** — not raw diff language. Don't say "added label stage:review"; say "ready for review."
+- Headline should read like a competent engineer's own one-sentence standup opener. Be specific and confident, never hedging ("seems to have").
+- Do not reference issues that are not in the input.
+- Never include the assignee's name inside the bullets (it's implicit). You MAY use their name in the headline if natural.`;
+
 export interface GitHubSuggestion {
   type: "new_issue" | "comment";
   title?: string;           // for new_issue
@@ -185,6 +219,42 @@ export class Summarizer {
       throw new Error(`Summarizer response missing required fields: ${JSON.stringify(parsed).slice(0, 200)}`);
     }
     return parsed as IssueSummaryResult;
+  }
+
+  /**
+   * Summarize an assignee's overnight GitHub activity into a short headline + bullets.
+   * The system prompt is prompt-cached (ephemeral) so the 3-5 calls per standup share it.
+   */
+  async summarizeAssigneeDay(
+    assigneeName: string,
+    updates: unknown,
+  ): Promise<AssigneeBrief> {
+    const userPayload = JSON.stringify({ assignee: assigneeName, issues: updates });
+    const response = await this.client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: [
+        {
+          type: "text",
+          text: ASSIGNEE_BRIEF_SYSTEM_PROMPT,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      messages: [{ role: "user", content: userPayload }],
+    });
+
+    const block = response.content.find((b) => b.type === "text");
+    if (!block || block.type !== "text") throw new Error("Brief: no text block in response");
+    const text = block.text;
+    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    const start = stripped.indexOf("{");
+    const end = stripped.lastIndexOf("}");
+    if (start === -1 || end === -1) throw new Error(`No JSON in brief response: ${text.slice(0, 200)}`);
+    const parsed = JSON.parse(stripped.slice(start, end + 1));
+    if (typeof parsed.headline !== "string" || !Array.isArray(parsed.bullets)) {
+      throw new Error(`Brief response missing required fields: ${JSON.stringify(parsed).slice(0, 200)}`);
+    }
+    return parsed as AssigneeBrief;
   }
 
   async suggestGitHubActions(

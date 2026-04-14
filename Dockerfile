@@ -10,8 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install deps before copying source so this layer is cached on source-only changes
-COPY package.json ./
-RUN bun install
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY src ./src
 COPY entrypoint.sh ./

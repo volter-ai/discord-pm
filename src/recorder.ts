@@ -22,8 +22,10 @@ import { OpusEncoder } from "@discordjs/opus";
 const SAMPLE_RATE = 48000;
 const CHANNELS = 2;
 
-/** Default auto-stop after 60 minutes to prevent runaway memory usage. */
-const DEFAULT_MAX_DURATION_MS = 60 * 60 * 1000;
+/** Default auto-stop after 90 minutes to prevent runaway memory usage.
+ *  Override via RECORDING_MAX_DURATION_MINUTES env var. */
+const DEFAULT_MAX_DURATION_MS =
+  (Number(process.env.RECORDING_MAX_DURATION_MINUTES) || 90) * 60 * 1000;
 
 /**
  * Max Opus packets per utterance before auto-flushing (~30s at 50 packets/sec).
