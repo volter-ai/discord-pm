@@ -42,6 +42,7 @@ interface TranscribedLine {
 }
 
 interface SessionMeta {
+  guildId: string;
   type: "standup" | "meeting";
   startedAt: Date;
   channelId: string;
@@ -319,11 +320,10 @@ export class StandupBot {
     });
   }
 
-  /** Broadcast a message to all connected Activity clients for a guild. */
-  private broadcastToActivity(guildId: string, message: object) {
-    const session = this.activeSessions.get(guildId);
-    if (!session) return;
-
+  /** Broadcast a message to the clients of a specific session (used by the
+   *  old session's in-flight drain to avoid bleeding into a newer session
+   *  that has taken over the guildId slot). */
+  private broadcastToSession(session: SessionMeta, message: object) {
     const json = JSON.stringify(message);
     const closed: any[] = [];
 
@@ -342,6 +342,15 @@ export class StandupBot {
     for (const ws of closed) {
       session.activityClients.delete(ws);
     }
+  }
+
+  /** Broadcast to the CURRENT session of a guild. External API setters
+   *  (setFocusedIssue, setActiveTab, …) call this so the message reaches
+   *  whichever session owns the guildId slot right now. */
+  private broadcastToActivity(guildId: string, message: object) {
+    const session = this.activeSessions.get(guildId);
+    if (!session) return;
+    this.broadcastToSession(session, message);
   }
 
   // ── Command registration ───────────────────────────────────────────────
@@ -484,7 +493,7 @@ export class StandupBot {
         const guild = await this.client.guilds.fetch(row.guild_id).catch(() => null);
         if (!guild) {
           console.warn(`[bot] Resume: guild ${row.guild_id} not accessible — dropping row.`);
-          this.store.deleteActiveSession(row.guild_id);
+          this.store.deleteActiveSession(row.guild_id, row.started_at);
           continue;
         }
 
@@ -492,14 +501,14 @@ export class StandupBot {
         const voiceChannel = channel && "members" in channel ? (channel as VoiceChannel) : null;
         if (!voiceChannel) {
           console.warn(`[bot] Resume: voice channel ${row.channel_id} gone — dropping row.`);
-          this.store.deleteActiveSession(row.guild_id);
+          this.store.deleteActiveSession(row.guild_id, row.started_at);
           continue;
         }
 
         const humans = [...voiceChannel.members.values()].filter((m) => !m.user.bot);
         if (humans.length === 0) {
           console.log(`[bot] Resume: voice channel is empty — session ended while down. Dropping row.`);
-          this.store.deleteActiveSession(row.guild_id);
+          this.store.deleteActiveSession(row.guild_id, row.started_at);
           continue;
         }
 
@@ -508,6 +517,7 @@ export class StandupBot {
           .catch(() => null);
 
         const session: SessionMeta = {
+          guildId: row.guild_id,
           type: row.type,
           startedAt: new Date(row.started_at),
           channelId: row.channel_id,
@@ -528,7 +538,7 @@ export class StandupBot {
           hadActivity: false,
           issueMeta: new Map(),
         };
-        for (const l of this.store.getActiveSessionLines(row.guild_id)) {
+        for (const l of this.store.getActiveSessionLines(row.guild_id, row.started_at)) {
           session.lines.push({
             speaker: l.speaker,
             userId: l.user_id,
@@ -553,7 +563,7 @@ export class StandupBot {
         };
 
         await this.recorder.start(voiceChannel, {
-          onUtterance: (u) => this.enqueueUtterance(row.guild_id, u),
+          onUtterance: (u) => this.enqueueUtterance(session, u),
           onTimeout: () => {
             console.warn("[bot] Auto-stop triggered by timeout (resumed session).");
             this.autoStop(resumedShim, row.guild_id);
@@ -587,7 +597,7 @@ export class StandupBot {
       } catch (e: any) {
         console.error(`[bot] Resume failed for guild ${row.guild_id}:`, e.message);
         this.activeSessions.delete(row.guild_id);
-        this.store.deleteActiveSession(row.guild_id);
+        this.store.deleteActiveSession(row.guild_id, row.started_at);
       }
     }
   }
@@ -611,26 +621,25 @@ export class StandupBot {
   }
 
   // ── Concurrency-limited transcription queue ────────────────────────────
+  //
+  // The pipeline operates on a SessionMeta reference captured at start time,
+  // NOT on a guildId lookup. This keeps an in-progress drain after a
+  // `/standup stop` correctly scoped to the old session even if a new
+  // session for the same guild has been registered in the activeSessions
+  // map (see #58).
 
-  private enqueueUtterance(guildId: string, utterance: Utterance) {
-    const session = this.activeSessions.get(guildId);
-    if (!session) return;
+  private enqueueUtterance(session: SessionMeta, utterance: Utterance) {
     session.queue.push(utterance);
-    this.drainQueue(guildId);
+    this.drainQueue(session);
   }
 
-  private drainQueue(guildId: string) {
-    const session = this.activeSessions.get(guildId);
-    if (!session) return;
-
+  private drainQueue(session: SessionMeta) {
     while (session.inflight < MAX_CONCURRENT_TRANSCRIPTIONS && session.queue.length > 0) {
       const utterance = session.queue.shift()!;
       session.inflight++;
-      this.transcribeOne(guildId, utterance).finally(() => {
+      this.transcribeOne(session, utterance).finally(() => {
         session.inflight--;
-        // Continue draining
-        this.drainQueue(guildId);
-        // Resolve drain promise if queue is empty and nothing in-flight
+        this.drainQueue(session);
         if (session.inflight === 0 && session.queue.length === 0 && session.drainResolve) {
           session.drainResolve();
           session.drainResolve = null;
@@ -640,11 +649,7 @@ export class StandupBot {
     }
   }
 
-  private async transcribeOne(guildId: string, utterance: Utterance) {
-    const session = this.activeSessions.get(guildId);
-    if (!session) return;
-
-    // Capture the focused issue at the time this utterance started
+  private async transcribeOne(session: SessionMeta, utterance: Utterance) {
     const issueAtTime = session.focusedIssue;
 
     try {
@@ -664,7 +669,7 @@ export class StandupBot {
           issueNumber: issueAtTime,
         };
         session.lines.push(line);
-        this.store.appendActiveSessionLine(guildId, {
+        this.store.appendActiveSessionLine(session.guildId, session.startedAt.toISOString(), {
           speaker: line.speaker,
           user_id: line.userId,
           text: line.text,
@@ -672,8 +677,7 @@ export class StandupBot {
           issue_number: line.issueNumber,
         });
 
-        // Broadcast to Activity clients
-        this.broadcastToActivity(guildId, {
+        this.broadcastToSession(session, {
           type: "utterance",
           speaker: line.speaker,
           issueNumber: line.issueNumber,
@@ -688,9 +692,7 @@ export class StandupBot {
   }
 
   /** Wait for all queued and in-flight transcriptions to finish. */
-  private waitForDrain(guildId: string): Promise<void> {
-    const session = this.activeSessions.get(guildId);
-    if (!session) return Promise.resolve();
+  private waitForDrain(session: SessionMeta): Promise<void> {
     if (session.inflight === 0 && session.queue.length === 0) return Promise.resolve();
 
     if (!session.drainPromise) {
@@ -719,6 +721,7 @@ export class StandupBot {
 
     const guildId = interaction.guildId!;
     const session: SessionMeta = {
+      guildId,
       type: "standup",
       startedAt: new Date(),
       channelId: voiceChannel.id,
@@ -746,7 +749,7 @@ export class StandupBot {
     try {
       await this.recorder.start(voiceChannel, {
         onUtterance: (utterance) => {
-          this.enqueueUtterance(guildId, utterance);
+          this.enqueueUtterance(session, utterance);
         },
         onTimeout: () => {
           console.warn("[bot] Auto-stop triggered by timeout.");
@@ -791,8 +794,10 @@ export class StandupBot {
         ...(components ? { components } : {}),
       });
     } catch (e: any) {
-      this.activeSessions.delete(guildId);
-      this.store.deleteActiveSession(guildId);
+      if (this.activeSessions.get(guildId) === session) {
+        this.activeSessions.delete(guildId);
+      }
+      this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
       await interaction.followUp(`Failed to start recording: ${e.message}`);
     }
   }
@@ -846,6 +851,7 @@ export class StandupBot {
 
     const guildId = interaction.guildId!;
     const session: SessionMeta = {
+      guildId,
       type: "meeting",
       startedAt: new Date(),
       channelId: voiceChannel.id,
@@ -873,7 +879,7 @@ export class StandupBot {
     try {
       await this.recorder.start(voiceChannel, {
         onUtterance: (utterance) => {
-          this.enqueueUtterance(guildId, utterance);
+          this.enqueueUtterance(session, utterance);
         },
         onTimeout: () => {
           console.warn("[bot] Auto-stop triggered by timeout.");
@@ -897,8 +903,10 @@ export class StandupBot {
         `Recording meeting in **${voiceChannel.name}**. Use \`/meeting stop\` when done.`
       );
     } catch (e: any) {
-      this.activeSessions.delete(guildId);
-      this.store.deleteActiveSession(guildId);
+      if (this.activeSessions.get(guildId) === session) {
+        this.activeSessions.delete(guildId);
+      }
+      this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
       await interaction.followUp(`Failed to start recording: ${e.message}`);
     }
   }
@@ -943,8 +951,10 @@ export class StandupBot {
     const remaining = this.recorder.stop();
 
     // Transcribe remaining utterances (people who were mid-sentence at stop).
-    for (const utterance of remaining) {
-      this.enqueueUtterance(guildId, utterance);
+    if (session) {
+      for (const utterance of remaining) {
+        this.enqueueUtterance(session, utterance);
+      }
     }
 
     // Wait for ALL transcriptions (incremental + remaining) to complete.
@@ -955,26 +965,37 @@ export class StandupBot {
         await interaction.followUp?.(`Finishing ${totalPending} remaining transcription(s)…`);
       } catch { /* interaction may be expired */ }
     }
-    try {
-      await Promise.race([
-        this.waitForDrain(guildId),
-        new Promise<void>((_, reject) =>
-          setTimeout(() => reject(new Error("Drain timed out")), DRAIN_TIMEOUT_MS)
-        ),
-      ]);
-    } catch (e: any) {
-      console.error(`[bot] ${e.message} — proceeding with available transcriptions.`);
+    if (session) {
+      try {
+        await Promise.race([
+          this.waitForDrain(session),
+          new Promise<void>((_, reject) =>
+            setTimeout(() => reject(new Error("Drain timed out")), DRAIN_TIMEOUT_MS)
+          ),
+        ]);
+      } catch (e: any) {
+        console.error(`[bot] ${e.message} — proceeding with available transcriptions.`);
+      }
     }
 
-    // Close Activity WebSocket clients
+    // Close Activity WebSocket clients for THIS session only.
     if (session) {
       for (const ws of session.activityClients) {
         try { ws.close(); } catch { /* ignore */ }
       }
     }
 
-    this.activeSessions.delete(guildId);
-    this.store.deleteActiveSession(guildId);
+    // Identity-guarded cleanup: only evict the map entry if it still points
+    // to the session we're finishing. A fast /standup start during our
+    // drain window may have replaced the entry — leave that new session
+    // alone (#58). The DB-side delete is scoped to this session's
+    // started_at, so it's always safe to call.
+    if (session && this.activeSessions.get(guildId) === session) {
+      this.activeSessions.delete(guildId);
+    }
+    if (session) {
+      this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
+    }
 
     if (!session || session.lines.length === 0) {
       try {

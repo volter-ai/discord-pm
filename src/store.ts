@@ -128,16 +128,17 @@ export class StandupStore {
         resumed_count            INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS active_session_lines (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        guild_id     TEXT NOT NULL,
-        speaker      TEXT NOT NULL,
-        user_id      TEXT NOT NULL,
-        text         TEXT NOT NULL,
-        started_at   INTEGER NOT NULL,
-        issue_number INTEGER
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id            TEXT NOT NULL,
+        session_started_at  TEXT,
+        speaker             TEXT NOT NULL,
+        user_id             TEXT NOT NULL,
+        text                TEXT NOT NULL,
+        started_at          INTEGER NOT NULL,
+        issue_number        INTEGER
       );
-      CREATE INDEX IF NOT EXISTS idx_active_lines_guild
-        ON active_session_lines (guild_id, started_at);
+      CREATE INDEX IF NOT EXISTS idx_active_lines_session
+        ON active_session_lines (guild_id, session_started_at, started_at);
       CREATE TABLE IF NOT EXISTS active_session_issue_meta (
         guild_id     TEXT NOT NULL,
         issue_number INTEGER NOT NULL,
@@ -146,6 +147,12 @@ export class StandupStore {
         PRIMARY KEY (guild_id, issue_number)
       );
     `);
+
+    // Migration: add session_started_at to active_session_lines for installs
+    // that predate #58. Old rows without a session_started_at are orphaned
+    // (no longer loadable on resume) and safe to drop.
+    try { this.db.run(`ALTER TABLE active_session_lines ADD COLUMN session_started_at TEXT`); } catch { /* already exists */ }
+    try { this.db.run(`DELETE FROM active_session_lines WHERE session_started_at IS NULL`); } catch { /* noop */ }
   }
 
   // ── Active-session persistence ────────────────────────────────────────────
@@ -192,11 +199,21 @@ export class StandupStore {
     this.db.prepare(`UPDATE active_sessions SET ${fields.join(", ")} WHERE guild_id = ?`).run(...values);
   }
 
-  deleteActiveSession(guildId: string): void {
+  /** Delete this session's row + its lines. Row delete is identity-scoped
+   *  (guild_id AND started_at), so a concurrent new session for the same
+   *  guild keeps its row. Issue meta is only cleared if we successfully
+   *  dropped our row — otherwise the newer session owns it. */
+  deleteActiveSession(guildId: string, sessionStartedAt: string): void {
     const tx = this.db.transaction(() => {
-      this.db.prepare(`DELETE FROM active_sessions WHERE guild_id = ?`).run(guildId);
-      this.db.prepare(`DELETE FROM active_session_lines WHERE guild_id = ?`).run(guildId);
-      this.db.prepare(`DELETE FROM active_session_issue_meta WHERE guild_id = ?`).run(guildId);
+      this.db.prepare(
+        `DELETE FROM active_session_lines WHERE guild_id = ? AND session_started_at = ?`
+      ).run(guildId, sessionStartedAt);
+      const { changes } = this.db.prepare(
+        `DELETE FROM active_sessions WHERE guild_id = ? AND started_at = ?`
+      ).run(guildId, sessionStartedAt);
+      if (Number(changes) > 0) {
+        this.db.prepare(`DELETE FROM active_session_issue_meta WHERE guild_id = ?`).run(guildId);
+      }
     });
     tx();
   }
@@ -205,17 +222,22 @@ export class StandupStore {
     return this.db.query(`SELECT * FROM active_sessions`).all() as ActiveSessionRow[];
   }
 
-  appendActiveSessionLine(guildId: string, line: ActiveSessionLine): void {
+  appendActiveSessionLine(guildId: string, sessionStartedAt: string, line: ActiveSessionLine): void {
     this.db.prepare(`
-      INSERT INTO active_session_lines (guild_id, speaker, user_id, text, started_at, issue_number)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(guildId, line.speaker, line.user_id, line.text, line.started_at, line.issue_number);
+      INSERT INTO active_session_lines (guild_id, session_started_at, speaker, user_id, text, started_at, issue_number)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(guildId, sessionStartedAt, line.speaker, line.user_id, line.text, line.started_at, line.issue_number);
   }
 
-  getActiveSessionLines(guildId: string): ActiveSessionLine[] {
+  getActiveSessionLines(guildId: string, sessionStartedAt: string): ActiveSessionLine[] {
     return this.db
-      .query(`SELECT speaker, user_id, text, started_at, issue_number FROM active_session_lines WHERE guild_id = ? ORDER BY started_at`)
-      .all(guildId) as ActiveSessionLine[];
+      .query(
+        `SELECT speaker, user_id, text, started_at, issue_number
+         FROM active_session_lines
+         WHERE guild_id = ? AND session_started_at = ?
+         ORDER BY started_at`
+      )
+      .all(guildId, sessionStartedAt) as ActiveSessionLine[];
   }
 
   upsertActiveSessionIssueMeta(guildId: string, meta: ActiveSessionIssueMeta): void {
