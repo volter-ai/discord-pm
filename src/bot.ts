@@ -161,9 +161,11 @@ export class StandupBot {
   private summarizer: Summarizer;
   private store = new StandupStore();
   private proposalGenerator: ProposalGenerator | null = null;
+  /** Active sessions keyed by voice channel ID. Two channels in the same
+   *  guild can host concurrent standups (#61). */
   private activeSessions = new Map<string, SessionMeta>();
-  /** Guards against concurrent finishRecording calls for the same guild. */
-  private stoppingGuilds = new Set<string>();
+  /** Guards against concurrent finishRecording calls for the same channel. */
+  private stoppingChannels = new Set<string>();
 
   constructor() {
     this.summarizer = new Summarizer(process.env.ANTHROPIC_API_KEY!);
@@ -198,31 +200,37 @@ export class StandupBot {
    * Broadcasts the updated state so Activity tabs can re-evaluate "not present".
    */
   private handleVoiceStateUpdate(oldState: any, newState: any) {
-    const guildId = newState.guild?.id ?? oldState.guild?.id;
-    if (!guildId) return;
-    const session = this.activeSessions.get(guildId);
-    if (!session) return;
-
     const userId: string | undefined = newState.id ?? oldState.id;
     if (!userId) return;
 
-    const joinedThisChannel = newState.channelId === session.channelId;
-    const leftThisChannel =
-      oldState.channelId === session.channelId && newState.channelId !== session.channelId;
+    // Update both affected channels: the one the user left and the one they
+    // joined. Either may host an active session.
+    const affectedChannelIds = new Set<string>();
+    if (oldState.channelId) affectedChannelIds.add(oldState.channelId);
+    if (newState.channelId) affectedChannelIds.add(newState.channelId);
 
-    let changed = false;
-    if (joinedThisChannel) {
-      const name =
-        newState.member?.displayName ?? newState.member?.user?.username ?? userId;
-      if (session.voiceMembers.get(userId) !== name) {
-        session.voiceMembers.set(userId, name);
-        changed = true;
+    for (const channelId of affectedChannelIds) {
+      const session = this.activeSessions.get(channelId);
+      if (!session) continue;
+
+      const joinedThisChannel = newState.channelId === session.channelId;
+      const leftThisChannel =
+        oldState.channelId === session.channelId && newState.channelId !== session.channelId;
+
+      let changed = false;
+      if (joinedThisChannel) {
+        const name =
+          newState.member?.displayName ?? newState.member?.user?.username ?? userId;
+        if (session.voiceMembers.get(userId) !== name) {
+          session.voiceMembers.set(userId, name);
+          changed = true;
+        }
+      } else if (leftThisChannel) {
+        if (session.voiceMembers.delete(userId)) changed = true;
       }
-    } else if (leftThisChannel) {
-      if (session.voiceMembers.delete(userId)) changed = true;
-    }
 
-    if (changed) this.broadcastActivityState(guildId);
+      if (changed) this.broadcastActivityState(channelId);
+    }
   }
 
   /** Seed voiceMembers from the current voice channel membership. */
@@ -240,12 +248,13 @@ export class StandupBot {
 
   // ── Activity integration ────────────────────────────────────────────────
 
-  /** Get the first active recording session (used by Activity to connect). */
-  getFirstActiveSession(): { guildId: string; meta: SessionMeta } | null {
-    for (const [guildId, meta] of this.activeSessions) {
-      return { guildId, meta };
-    }
-    return null;
+  /** Look up the active session for a specific voice channel. Returns null
+   *  if no standup/meeting is currently running in that channel. Used by the
+   *  Activity to bind its WebSocket to the right session (#61). */
+  getSessionForChannel(channelId: string | null): { channelId: string; meta: SessionMeta } | null {
+    if (!channelId) return null;
+    const meta = this.activeSessions.get(channelId);
+    return meta ? { channelId, meta } : null;
   }
 
   /** Resolve a channel's display name via Discord API. Used by the Activity
@@ -274,8 +283,8 @@ export class StandupBot {
       lineCount: number;
     }>;
   } {
-    const sessions = [...this.activeSessions.entries()].map(([guildId, meta]) => ({
-      guildId,
+    const sessions = [...this.activeSessions.values()].map((meta) => ({
+      guildId: meta.guildId,
       type: meta.type,
       channelId: meta.channelId,
       startedAt: meta.startedAt.toISOString(),
@@ -284,80 +293,80 @@ export class StandupBot {
     return { sessions };
   }
 
-  /** Register an Activity WebSocket client for a guild session. */
-  addActivityClient(guildId: string, ws: any, userId: string | null, username: string | null) {
-    const session = this.activeSessions.get(guildId);
+  /** Register an Activity WebSocket client for the session running in this voice channel. */
+  addActivityClient(channelId: string, ws: any, userId: string | null, username: string | null) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       session.activityClients.add(ws);
       if (userId && username) session.connectedUsers.set(userId, username);
       session.hadActivity = true;
       console.log(`[bot] Activity client added (${session.activityClients.size} total)`);
-      this.broadcastActivityState(guildId);
+      this.broadcastActivityState(channelId);
     }
   }
 
   /** Remove a connected user from presence tracking. */
-  removeActivityUser(guildId: string, userId: string) {
-    const session = this.activeSessions.get(guildId);
+  removeActivityUser(channelId: string, userId: string) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       session.connectedUsers.delete(userId);
-      this.broadcastActivityState(guildId);
+      this.broadcastActivityState(channelId);
     }
   }
 
   /** Bind the GitHub repo for this session's proposals. Called from the
    *  Activity's `ready` handler so the proposal generator knows what repo to
    *  target even before any issue gets focused. */
-  setIssueRepo(guildId: string, repo: string) {
-    const session = this.activeSessions.get(guildId);
+  setIssueRepo(channelId: string, repo: string) {
+    const session = this.activeSessions.get(channelId);
     if (!session) return;
     if (session.issueRepo === repo) return;
     session.issueRepo = repo;
-    this.store.updateActiveSessionState(guildId, { issue_repo: repo });
-    console.log(`[bot] Session ${guildId} issueRepo set → ${repo}`);
+    this.store.updateActiveSessionState(channelId, { issue_repo: repo });
+    console.log(`[bot] Session ${session.guildId}/${channelId} issueRepo set → ${repo}`);
   }
 
   /** Set the detail panel issue from Activity. Broadcasts state to all clients. */
-  setDetailPanel(guildId: string, issueNumber: number | null) {
-    const session = this.activeSessions.get(guildId);
+  setDetailPanel(channelId: string, issueNumber: number | null) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       session.focusedDetailIssue = issueNumber;
-      this.store.updateActiveSessionState(guildId, { focused_detail_issue: issueNumber });
-      this.broadcastActivityState(guildId);
+      this.store.updateActiveSessionState(channelId, { focused_detail_issue: issueNumber });
+      this.broadcastActivityState(channelId);
     }
   }
 
   /** Relay a scroll position from the presenter to all connected Activity clients. */
-  relayScroll(guildId: string, scrollY: number) {
-    this.broadcastToActivity(guildId, { type: "scroll", scrollY });
+  relayScroll(channelId: string, scrollY: number) {
+    this.broadcastToActivity(channelId, { type: "scroll", scrollY });
   }
 
   /** Relay a detail panel scroll position from the presenter to all connected Activity clients. */
-  relayDetailScroll(guildId: string, scrollTop: number) {
-    this.broadcastToActivity(guildId, { type: "detailScroll", scrollTop });
+  relayDetailScroll(channelId: string, scrollTop: number) {
+    this.broadcastToActivity(channelId, { type: "detailScroll", scrollTop });
   }
 
   /** Remove a specific Activity WebSocket client by reference. */
-  removeActivityClient(guildId: string, ws: any) {
-    const session = this.activeSessions.get(guildId);
+  removeActivityClient(channelId: string, ws: any) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       session.activityClients.delete(ws);
     }
   }
 
   /** Set the currently focused issue from Activity. Broadcasts state to all clients. */
-  setFocusedIssue(guildId: string, issueNumber: number | null, issueTitle?: string, issueState?: string) {
-    const session = this.activeSessions.get(guildId);
+  setFocusedIssue(channelId: string, issueNumber: number | null, issueTitle?: string, issueState?: string) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       const outgoingIssue = session.focusedIssue;
       session.focusedIssue = issueNumber;
       if (issueNumber && issueTitle) {
         const state = issueState ?? "open";
         session.issueMeta.set(issueNumber, { title: issueTitle, state });
-        this.store.upsertActiveSessionIssueMeta(guildId, { issue_number: issueNumber, title: issueTitle, state });
+        this.store.upsertActiveSessionIssueMeta(channelId, { issue_number: issueNumber, title: issueTitle, state });
       }
-      this.store.updateActiveSessionState(guildId, { focused_issue: issueNumber });
-      this.broadcastActivityState(guildId);
+      this.store.updateActiveSessionState(channelId, { focused_issue: issueNumber });
+      this.broadcastActivityState(channelId);
       // Eval the OUTGOING bucket's proposals before switching context.
       // Null bucket (general discussion) is valid too.
       if (outgoingIssue !== issueNumber) {
@@ -367,46 +376,46 @@ export class StandupBot {
   }
 
   /** Set the active participant tab index from Activity. Broadcasts state to all clients. */
-  setActiveTab(guildId: string, participantIndex: number) {
-    const session = this.activeSessions.get(guildId);
+  setActiveTab(channelId: string, participantIndex: number) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       session.activeParticipantIndex = participantIndex;
-      this.store.updateActiveSessionState(guildId, { active_participant_index: participantIndex });
-      this.broadcastActivityState(guildId);
+      this.store.updateActiveSessionState(channelId, { active_participant_index: participantIndex });
+      this.broadcastActivityState(channelId);
     }
   }
 
   /** Clear the presenter if the disconnecting client was the one holding the role. */
-  clearPresenterIfDisconnected(guildId: string, userId: string | null) {
-    const session = this.activeSessions.get(guildId);
+  clearPresenterIfDisconnected(channelId: string, userId: string | null) {
+    const session = this.activeSessions.get(channelId);
     if (session && userId && session.presenter === userId) {
       session.presenter = null;
-      this.store.updateActiveSessionState(guildId, { presenter: null });
-      this.broadcastActivityState(guildId);
+      this.store.updateActiveSessionState(channelId, { presenter: null });
+      this.broadcastActivityState(channelId);
       console.log(`[bot] Presenter ${userId} disconnected — presenter role cleared`);
     }
   }
 
   /** Set the current presenter from Activity. Broadcasts state so all clients learn the new presenter. */
-  setPresenter(guildId: string, userId: string) {
-    const session = this.activeSessions.get(guildId);
+  setPresenter(channelId: string, userId: string) {
+    const session = this.activeSessions.get(channelId);
     if (session) {
       session.presenter = userId;
-      this.store.updateActiveSessionState(guildId, { presenter: userId });
-      this.broadcastActivityState(guildId);
+      this.store.updateActiveSessionState(channelId, { presenter: userId });
+      this.broadcastActivityState(channelId);
     }
   }
 
   /** Broadcast current session state to all connected Activity clients. */
-  private broadcastActivityState(guildId: string) {
-    const session = this.activeSessions.get(guildId);
+  private broadcastActivityState(channelId: string) {
+    const session = this.activeSessions.get(channelId);
     if (!session) return;
     const presenterName = session.presenter ? (session.connectedUsers.get(session.presenter) ?? null) : null;
     const watcherNames = [...session.connectedUsers.entries()]
       .filter(([userId]) => userId !== session.presenter)
       .map(([, name]) => name);
     const voiceMembers = [...session.voiceMembers.entries()].map(([id, name]) => ({ id, name }));
-    this.broadcastToActivity(guildId, {
+    this.broadcastToActivity(channelId, {
       type: "state",
       focusedIssue: session.focusedIssue,
       focusedDetailIssue: session.focusedDetailIssue,
@@ -423,7 +432,7 @@ export class StandupBot {
 
   /** Broadcast a message to the clients of a specific session (used by the
    *  old session's in-flight drain to avoid bleeding into a newer session
-   *  that has taken over the guildId slot). */
+   *  that has taken over the channel slot). */
   private broadcastToSession(session: SessionMeta, message: object) {
     const json = JSON.stringify(message);
     const closed: any[] = [];
@@ -445,11 +454,11 @@ export class StandupBot {
     }
   }
 
-  /** Broadcast to the CURRENT session of a guild. External API setters
-   *  (setFocusedIssue, setActiveTab, …) call this so the message reaches
-   *  whichever session owns the guildId slot right now. */
-  private broadcastToActivity(guildId: string, message: object) {
-    const session = this.activeSessions.get(guildId);
+  /** Broadcast to the CURRENT session of a voice channel. External API
+   *  setters (setFocusedIssue, setActiveTab, …) call this so the message
+   *  reaches whichever session owns the channel slot right now. */
+  private broadcastToActivity(channelId: string, message: object) {
+    const session = this.activeSessions.get(channelId);
     if (!session) return;
     this.broadcastToSession(session, message);
   }
@@ -594,7 +603,7 @@ export class StandupBot {
         const guild = await this.client.guilds.fetch(row.guild_id).catch(() => null);
         if (!guild) {
           console.warn(`[bot] Resume: guild ${row.guild_id} not accessible — dropping row.`);
-          this.store.deleteActiveSession(row.guild_id, row.started_at);
+          this.store.deleteActiveSession(row.channel_id, row.started_at);
           continue;
         }
 
@@ -602,14 +611,14 @@ export class StandupBot {
         const voiceChannel = channel && "members" in channel ? (channel as VoiceChannel) : null;
         if (!voiceChannel) {
           console.warn(`[bot] Resume: voice channel ${row.channel_id} gone — dropping row.`);
-          this.store.deleteActiveSession(row.guild_id, row.started_at);
+          this.store.deleteActiveSession(row.channel_id, row.started_at);
           continue;
         }
 
         const humans = [...voiceChannel.members.values()].filter((m) => !m.user.bot);
         if (humans.length === 0) {
           console.log(`[bot] Resume: voice channel is empty — session ended while down. Dropping row.`);
-          this.store.deleteActiveSession(row.guild_id, row.started_at);
+          this.store.deleteActiveSession(row.channel_id, row.started_at);
           continue;
         }
 
@@ -648,7 +657,7 @@ export class StandupBot {
           proposalFallbackTimer: null,
           recorder: new Recorder(),
         };
-        for (const l of this.store.getActiveSessionLines(row.guild_id, row.started_at)) {
+        for (const l of this.store.getActiveSessionLines(row.channel_id, row.started_at)) {
           session.lines.push({
             speaker: l.speaker,
             userId: l.user_id,
@@ -657,10 +666,10 @@ export class StandupBot {
             issueNumber: l.issue_number,
           });
         }
-        for (const m of this.store.getActiveSessionIssueMeta(row.guild_id)) {
+        for (const m of this.store.getActiveSessionIssueMeta(row.channel_id)) {
           session.issueMeta.set(m.issue_number, { title: m.title, state: m.state });
         }
-        this.activeSessions.set(row.guild_id, session);
+        this.activeSessions.set(row.channel_id, session);
         this.snapshotVoiceMembers(session, voiceChannel);
 
         // Synthetic interaction used by auto-stop paths — no followUp, just
@@ -676,14 +685,14 @@ export class StandupBot {
           onUtterance: (u) => this.enqueueUtterance(session, u),
           onTimeout: () => {
             console.warn("[bot] Auto-stop triggered by timeout (resumed session).");
-            this.autoStop(resumedShim, row.guild_id);
+            this.autoStop(resumedShim, row.channel_id);
           },
           onDisconnect: (reason) => {
             console.error(`[bot] Voice disconnected (resumed session): ${reason}`);
-            this.autoStop(resumedShim, row.guild_id);
+            this.autoStop(resumedShim, row.channel_id);
           },
           onSpeakingChange: (userId, displayName, speaking) => {
-            this.broadcastToActivity(row.guild_id, {
+            this.broadcastToActivity(row.channel_id, {
               type: "speaker",
               userId,
               name: displayName,
@@ -705,20 +714,20 @@ export class StandupBot {
         if (textChannel && "send" in textChannel) {
           try { await (textChannel as any).send(banner); } catch { /* best-effort */ }
         }
-        console.log(`[bot] Resumed ${row.type} session for guild ${row.guild_id}.`);
+        console.log(`[bot] Resumed ${row.type} session for guild ${row.guild_id} channel ${row.channel_id}.`);
       } catch (e: any) {
-        console.error(`[bot] Resume failed for guild ${row.guild_id}:`, e.message);
-        this.activeSessions.delete(row.guild_id);
-        this.store.deleteActiveSession(row.guild_id, row.started_at);
+        console.error(`[bot] Resume failed for channel ${row.channel_id}:`, e.message);
+        this.activeSessions.delete(row.channel_id);
+        this.store.deleteActiveSession(row.channel_id, row.started_at);
       }
     }
   }
 
   // ── Session persistence helpers ────────────────────────────────────────
 
-  private persistSessionStart(guildId: string, session: SessionMeta) {
+  private persistSessionStart(session: SessionMeta) {
     this.store.saveActiveSession({
-      guild_id: guildId,
+      guild_id: session.guildId,
       type: session.type,
       channel_id: session.channelId,
       text_channel_id: session.textChannelId,
@@ -782,7 +791,7 @@ export class StandupBot {
           issueNumber: issueAtTime,
         };
         session.lines.push(line);
-        this.store.appendActiveSessionLine(session.guildId, session.startedAt.toISOString(), {
+        this.store.appendActiveSessionLine(session.channelId, session.startedAt.toISOString(), {
           speaker: line.speaker,
           user_id: line.userId,
           text: line.text,
@@ -829,14 +838,15 @@ export class StandupBot {
     }
 
     const guildId = interaction.guildId!;
-    if (this.activeSessions.has(guildId)) {
-      return interaction.followUp("A recording is already in progress in this server. Stop it first.");
+    const channelId = voiceChannel.id;
+    if (this.activeSessions.has(channelId)) {
+      return interaction.followUp(`A recording is already in progress in **${voiceChannel.name}**. Stop it first.`);
     }
 
     const startedAt = new Date();
     const standupId = this.store.startStandup({
       guild_id: guildId,
-      channel_id: voiceChannel.id,
+      channel_id: channelId,
       started_at: startedAt.toISOString(),
     });
     const session: SessionMeta = {
@@ -870,9 +880,9 @@ export class StandupBot {
       proposalFallbackTimer: null,
       recorder: new Recorder(),
     };
-    this.activeSessions.set(guildId, session);
+    this.activeSessions.set(channelId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
-    this.persistSessionStart(guildId, session);
+    this.persistSessionStart(session);
     this.startProposalFallbackTimer(session);
 
     try {
@@ -882,14 +892,14 @@ export class StandupBot {
         },
         onTimeout: () => {
           console.warn("[bot] Auto-stop triggered by timeout.");
-          this.autoStop(interaction, guildId);
+          this.autoStop(interaction, channelId);
         },
         onDisconnect: (reason) => {
           console.error(`[bot] Voice disconnected: ${reason}`);
-          this.autoStop(interaction, guildId);
+          this.autoStop(interaction, channelId);
         },
         onSpeakingChange: (userId, displayName, speaking) => {
-          this.broadcastToActivity(guildId, {
+          this.broadcastToActivity(channelId, {
             type: "speaker",
             userId,
             name: displayName,
@@ -924,11 +934,11 @@ export class StandupBot {
         ...(components ? { components } : {}),
       });
     } catch (e: any) {
-      if (this.activeSessions.get(guildId) === session) {
-        this.activeSessions.delete(guildId);
+      if (this.activeSessions.get(channelId) === session) {
+        this.activeSessions.delete(channelId);
       }
       this.stopProposalFallbackTimer(session);
-      this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
+      this.store.deleteActiveSession(channelId, session.startedAt.toISOString());
       if (session.standupId != null) {
         try { this.store.deleteStandup(session.standupId); } catch { /* best-effort */ }
       }
@@ -937,16 +947,45 @@ export class StandupBot {
   }
 
   /** Auto-stop triggered by timeout or disconnect — posts results to the original channel. */
-  private async autoStop(interaction: any, guildId: string) {
-    if (!this.activeSessions.has(guildId)) return;
+  private async autoStop(interaction: any, channelId: string) {
+    if (!this.activeSessions.has(channelId)) return;
 
     try {
       const channel = interaction.channel;
       await channel?.send("Recording auto-stopped (timeout or disconnection). Processing...");
-      await this.finishRecording(interaction, guildId);
+      await this.finishRecording(interaction, channelId);
     } catch (e: any) {
       console.error("[bot] Auto-stop error:", e);
     }
+  }
+
+  /** Resolve the active session for the user invoking a slash command.
+   *  Sessions are now per-channel (#61), so "stop" / "status" act on the
+   *  session in the user's current voice channel. As a convenience, if the
+   *  user isn't in any active channel but exactly one session is running in
+   *  this guild, fall back to that one — this preserves the legacy "/stop
+   *  from anywhere" UX for the single-standup case. */
+  private resolveSessionForInteraction(
+    interaction: any,
+  ): { channelId: string; session: SessionMeta } | null {
+    const voiceChannelId: string | null =
+      interaction.member?.voice?.channelId ?? interaction.member?.voice?.channel?.id ?? null;
+    if (voiceChannelId) {
+      const session = this.activeSessions.get(voiceChannelId);
+      if (session) return { channelId: voiceChannelId, session };
+    }
+
+    // Single-session fallback within this guild.
+    const guildId: string | undefined = interaction.guildId;
+    if (!guildId) return null;
+    const guildSessions = [...this.activeSessions.entries()].filter(
+      ([, s]) => s.guildId === guildId,
+    );
+    if (guildSessions.length === 1) {
+      const [channelId, session] = guildSessions[0];
+      return { channelId, session };
+    }
+    return null;
   }
 
   // ── /standup stop ───────────────────────────────────────────────────────
@@ -954,17 +993,22 @@ export class StandupBot {
   private async handleStop(interaction: any) {
     await interaction.deferReply();
 
-    const guildId = interaction.guildId!;
-    const session = this.activeSessions.get(guildId);
-    if (!session) {
-      return interaction.followUp("No active recording found.");
+    const found = this.resolveSessionForInteraction(interaction);
+    if (!found) {
+      const anyActive = [...this.activeSessions.values()].some(
+        (s) => s.guildId === interaction.guildId,
+      );
+      const msg = anyActive
+        ? "Multiple recordings are active here. Join the voice channel of the standup you want to stop."
+        : "No active recording found.";
+      return interaction.followUp(msg);
     }
-    if (session.type === "meeting") {
-      return interaction.followUp("A meeting is being recorded. Use `/meeting stop` to stop it.");
+    if (found.session.type === "meeting") {
+      return interaction.followUp("A meeting is being recorded in this channel. Use `/meeting stop` to stop it.");
     }
 
     await interaction.followUp("Recording stopped — processing…");
-    await this.finishRecording(interaction, guildId);
+    await this.finishRecording(interaction, found.channelId);
   }
 
   // ── /meeting start ────────────────────────────────────────────────────
@@ -980,8 +1024,9 @@ export class StandupBot {
     }
 
     const guildId = interaction.guildId!;
-    if (this.activeSessions.has(guildId)) {
-      return interaction.followUp("A recording is already in progress in this server. Stop it first.");
+    const channelId = voiceChannel.id;
+    if (this.activeSessions.has(channelId)) {
+      return interaction.followUp(`A recording is already in progress in **${voiceChannel.name}**. Stop it first.`);
     }
 
     const session: SessionMeta = {
@@ -1010,9 +1055,9 @@ export class StandupBot {
       proposalFallbackTimer: null,
       recorder: new Recorder(),
     };
-    this.activeSessions.set(guildId, session);
+    this.activeSessions.set(channelId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
-    this.persistSessionStart(guildId, session);
+    this.persistSessionStart(session);
 
     try {
       await session.recorder.start(voiceChannel, {
@@ -1021,14 +1066,14 @@ export class StandupBot {
         },
         onTimeout: () => {
           console.warn("[bot] Auto-stop triggered by timeout.");
-          this.autoStop(interaction, guildId);
+          this.autoStop(interaction, channelId);
         },
         onDisconnect: (reason) => {
           console.error(`[bot] Voice disconnected: ${reason}`);
-          this.autoStop(interaction, guildId);
+          this.autoStop(interaction, channelId);
         },
         onSpeakingChange: (userId, displayName, speaking) => {
-          this.broadcastToActivity(guildId, {
+          this.broadcastToActivity(channelId, {
             type: "speaker",
             userId,
             name: displayName,
@@ -1041,10 +1086,10 @@ export class StandupBot {
         `Recording meeting in **${voiceChannel.name}**. Use \`/meeting stop\` when done.`
       );
     } catch (e: any) {
-      if (this.activeSessions.get(guildId) === session) {
-        this.activeSessions.delete(guildId);
+      if (this.activeSessions.get(channelId) === session) {
+        this.activeSessions.delete(channelId);
       }
-      this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
+      this.store.deleteActiveSession(channelId, session.startedAt.toISOString());
       await interaction.followUp(`Failed to start recording: ${e.message}`);
     }
   }
@@ -1054,39 +1099,45 @@ export class StandupBot {
   private async handleMeetingStop(interaction: any) {
     await interaction.deferReply();
 
-    const guildId = interaction.guildId!;
-    const session = this.activeSessions.get(guildId);
-    if (!session) {
-      return interaction.followUp("No active recording found.");
+    const found = this.resolveSessionForInteraction(interaction);
+    if (!found) {
+      const anyActive = [...this.activeSessions.values()].some(
+        (s) => s.guildId === interaction.guildId,
+      );
+      const msg = anyActive
+        ? "Multiple recordings are active here. Join the voice channel of the meeting you want to stop."
+        : "No active recording found.";
+      return interaction.followUp(msg);
     }
-    if (session.type === "standup") {
-      return interaction.followUp("A standup is being recorded. Use `/standup stop` to stop it.");
+    if (found.session.type === "standup") {
+      return interaction.followUp("A standup is being recorded in this channel. Use `/standup stop` to stop it.");
     }
 
     await interaction.followUp("Recording stopped — processing…");
-    await this.finishRecording(interaction, guildId);
+    await this.finishRecording(interaction, found.channelId);
   }
 
   /** Shared stop logic: drain transcription queue, summarize, post results. */
-  private async finishRecording(interaction: any, guildId: string) {
-    // Prevent concurrent stop calls for the same guild.
-    if (this.stoppingGuilds.has(guildId)) return;
-    this.stoppingGuilds.add(guildId);
+  private async finishRecording(interaction: any, channelId: string) {
+    // Prevent concurrent stop calls for the same channel.
+    if (this.stoppingChannels.has(channelId)) return;
+    this.stoppingChannels.add(channelId);
 
     try {
-      await this._finishRecordingInner(interaction, guildId);
+      await this._finishRecordingInner(interaction, channelId);
     } finally {
-      this.stoppingGuilds.delete(guildId);
+      this.stoppingChannels.delete(channelId);
     }
   }
 
-  private async _finishRecordingInner(interaction: any, guildId: string) {
-    const session = this.activeSessions.get(guildId);
+  private async _finishRecordingInner(interaction: any, channelId: string) {
+    const session = this.activeSessions.get(channelId);
     const endedAt = new Date();
     const startedAt = session?.startedAt ?? endedAt;
+    const guildId = session?.guildId ?? interaction.guildId ?? "";
 
     // Stop recorder — returns any utterances still in-progress.
-    // Per-session recorder (#60): isolated to this guild, won't affect others.
+    // Per-session recorder (#60): isolated to this channel, won't affect others.
     const remaining = session ? session.recorder.stop() : [];
 
     // Transcribe remaining utterances (people who were mid-sentence at stop).
@@ -1130,11 +1181,11 @@ export class StandupBot {
     // drain window may have replaced the entry — leave that new session
     // alone (#58). The DB-side delete is scoped to this session's
     // started_at, so it's always safe to call.
-    if (session && this.activeSessions.get(guildId) === session) {
-      this.activeSessions.delete(guildId);
+    if (session && this.activeSessions.get(channelId) === session) {
+      this.activeSessions.delete(channelId);
     }
     if (session) {
-      this.store.deleteActiveSession(guildId, session.startedAt.toISOString());
+      this.store.deleteActiveSession(channelId, session.startedAt.toISOString());
     }
 
     if (!session || session.lines.length === 0) {
@@ -1334,7 +1385,8 @@ export class StandupBot {
   // ── /standup status ─────────────────────────────────────────────────────
 
   private async handleStatus(interaction: any) {
-    const session = this.activeSessions.get(interaction.guildId!);
+    const found = this.resolveSessionForInteraction(interaction);
+    const session = found?.session;
     if (session && session.recorder.isRecording) {
       const elapsed = Math.round((Date.now() - session.startedAt.getTime()) / 1000);
       const min = Math.floor(elapsed / 60);
@@ -1415,8 +1467,8 @@ export class StandupBot {
   // ── Live action-bar proposals (#53) ────────────────────────────────────
 
   /** Current proposals for a session's standup, filtered to live ones. */
-  getActiveProposals(guildId: string): Proposal[] {
-    const session = this.activeSessions.get(guildId);
+  getActiveProposals(channelId: string): Proposal[] {
+    const session = this.activeSessions.get(channelId);
     if (!session || session.standupId == null) return [];
     return this.store.listActiveProposalsForStandup(session.standupId);
   }
@@ -1559,12 +1611,12 @@ export class StandupBot {
         });
         if (g.supersedes != null) {
           this.store.supersedeProposal(g.supersedes, proposal.id);
-          this.broadcastToActivity(session.guildId, {
+          this.broadcastToActivity(session.channelId, {
             type: "proposal-remove",
             id: g.supersedes,
           });
         }
-        this.broadcastToActivity(session.guildId, {
+        this.broadcastToActivity(session.channelId, {
           type: "proposal-upsert",
           proposal: serializeProposal(proposal),
         });
@@ -1584,20 +1636,20 @@ export class StandupBot {
 
   /** Edit a proposal's payload (last-write-wins via monotonic version). */
   handleProposalEdit(
-    guildId: string,
+    channelId: string,
     userId: string | null,
     id: number,
     expectedVersion: number,
     payload: ProposalPayload,
   ): { ok: true } | { error: string; status: number } {
-    const session = this.activeSessions.get(guildId);
+    const session = this.activeSessions.get(channelId);
     if (!session) return { error: "No active session", status: 404 };
     if (!this.authorizeProposalActor(session, userId)) return { error: "Forbidden", status: 403 };
 
     const updated = this.store.editProposal(id, expectedVersion, payload);
     if (!updated) return { error: "Proposal not found", status: 404 };
     // Always rebroadcast — stale edits receive canonical version back.
-    this.broadcastToActivity(guildId, {
+    this.broadcastToActivity(channelId, {
       type: "proposal-upsert",
       proposal: serializeProposal(updated),
     });
@@ -1606,28 +1658,28 @@ export class StandupBot {
 
   /** Dismiss a proposal (soft delete — row kept for post-meeting audit). */
   handleProposalDismiss(
-    guildId: string,
+    channelId: string,
     userId: string | null,
     id: number,
   ): { ok: true } | { error: string; status: number } {
-    const session = this.activeSessions.get(guildId);
+    const session = this.activeSessions.get(channelId);
     if (!session) return { error: "No active session", status: 404 };
     if (!this.authorizeProposalActor(session, userId)) return { error: "Forbidden", status: 403 };
     const updated = this.store.dismissProposal(id);
     if (!updated) return { error: "Proposal not found", status: 404 };
-    this.broadcastToActivity(guildId, { type: "proposal-remove", id });
+    this.broadcastToActivity(channelId, { type: "proposal-remove", id });
     return { ok: true };
   }
 
   /** Affirm and execute a proposal against GitHub. No retry — failures surface
    *  in the card UI. */
   async handleProposalAffirm(
-    guildId: string,
+    channelId: string,
     userId: string | null,
     id: number,
     expectedVersion: number,
   ): Promise<{ ok: true; url?: string } | { error: string; status: number }> {
-    const session = this.activeSessions.get(guildId);
+    const session = this.activeSessions.get(channelId);
     if (!session) return { error: "No active session", status: 404 };
     if (!this.authorizeProposalActor(session, userId)) return { error: "Forbidden", status: 403 };
 
@@ -1635,7 +1687,7 @@ export class StandupBot {
     if (!current) return { error: "Proposal not found", status: 404 };
     if (current.version !== expectedVersion) {
       // Stale — rebroadcast canonical so the client picks up the newer payload.
-      this.broadcastToActivity(guildId, {
+      this.broadcastToActivity(channelId, {
         type: "proposal-upsert",
         proposal: serializeProposal(current),
       });
@@ -1647,7 +1699,7 @@ export class StandupBot {
 
     const affirmed = this.store.markProposalAffirmed(id, userId!);
     if (!affirmed) return { error: "Could not affirm proposal", status: 409 };
-    this.broadcastToActivity(guildId, {
+    this.broadcastToActivity(channelId, {
       type: "proposal-upsert",
       proposal: serializeProposal(affirmed),
     });
@@ -1663,7 +1715,7 @@ export class StandupBot {
 
     const completed = this.store.completeProposal(id, ok, result);
     if (completed) {
-      this.broadcastToActivity(guildId, {
+      this.broadcastToActivity(channelId, {
         type: "proposal-upsert",
         proposal: serializeProposal(completed),
       });

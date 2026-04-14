@@ -128,6 +128,10 @@ let speakerStartTimes = new Map<string, number>();  // name → start timestamp
 let voiceMembers: VoiceMember[] = [];
 let standupKey = "";
 let repo = "";
+/** Discord voice channel ID for this Activity instance. Captured from
+ *  sdk.channelId once auth completes; sent on the WS ready handshake so the
+ *  server binds us to the right per-channel session (#61). */
+let activityChannelId: string | null = null;
 let timerInterval: ReturnType<typeof setInterval> | null = null;
 let issueTimers = new Map<number, number>(); // issue# → accumulated ms
 let focusStartTime: number | null = null;
@@ -280,6 +284,10 @@ async function init() {
 
     app.innerHTML = `<div class="loading">Loading standup data...</div>`;
 
+    // Capture the voice channel this Activity was launched in. Sent on the WS
+    // ready handshake so the server can bind us to the per-channel session (#61).
+    activityChannelId = (sdk as any).channelId ?? null;
+
     // Determine standup key — try to get from URL or default
     const params = new URLSearchParams(window.location.search);
     standupKey = params.get("standup") || "";
@@ -287,8 +295,7 @@ async function init() {
     if (!standupKey) {
       // Show standup picker — pass the Discord channelId so the server can
       // suggest a standup based on the voice channel the Activity launched in.
-      const launchChannelId = (sdk as any).channelId ?? null;
-      renderStandupPicker(launchChannelId);
+      renderStandupPicker(activityChannelId);
       return;
     }
 
@@ -487,6 +494,7 @@ function connectWebSocket() {
     newWs.send(JSON.stringify({
       type: "ready",
       standupKey,
+      channelId: activityChannelId,
       userId: currentUser?.id ?? null,
       username: currentUser?.username ?? null,
       token: accessToken,

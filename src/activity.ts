@@ -540,7 +540,10 @@ export function createActivityApp(
   // so the client can pre-highlight one project and collapse the others.
   app.get("/api/picker-context", async (c) => {
     const channelId = c.req.query("channelId") || null;
-    const session = bot.getFirstActiveSession();
+    // Active session in *this* voice channel (per-channel keying, #61). With
+    // multiple concurrent standups in one guild, only the one in the user's
+    // channel should drive the picker.
+    const session = bot.getSessionForChannel(channelId);
     const activeStandup = session ? standupKeyForRepo(session.meta.issueRepo) : null;
     const activeSession = session && activeStandup
       ? {
@@ -761,12 +764,10 @@ export function createActivityApp(
     const id = parseInt(c.req.param("id"));
     if (isNaN(id)) return c.json({ error: "Invalid id" }, 400);
     const body = await c.req.json().catch(() => null);
-    if (!body || typeof body.version !== "number" || typeof body.payload !== "object") {
-      return c.json({ error: "Missing version/payload" }, 400);
+    if (!body || typeof body.version !== "number" || typeof body.payload !== "object" || typeof body.channelId !== "string") {
+      return c.json({ error: "Missing channelId/version/payload" }, 400);
     }
-    const session = bot.getFirstActiveSession();
-    if (!session) return c.json({ error: "No active session" }, 404);
-    const result = bot.handleProposalEdit(session.guildId, userId, id, body.version, body.payload);
+    const result = bot.handleProposalEdit(body.channelId, userId, id, body.version, body.payload);
     if ("error" in result) return c.json({ error: result.error }, result.status as any);
     return c.json(result);
   });
@@ -777,9 +778,9 @@ export function createActivityApp(
     if (!userId) return c.json({ error: "Unauthorized" }, 401);
     const id = parseInt(c.req.param("id"));
     if (isNaN(id)) return c.json({ error: "Invalid id" }, 400);
-    const session = bot.getFirstActiveSession();
-    if (!session) return c.json({ error: "No active session" }, 404);
-    const result = bot.handleProposalDismiss(session.guildId, userId, id);
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.channelId !== "string") return c.json({ error: "Missing channelId" }, 400);
+    const result = bot.handleProposalDismiss(body.channelId, userId, id);
     if ("error" in result) return c.json({ error: result.error }, result.status as any);
     return c.json(result);
   });
@@ -791,10 +792,10 @@ export function createActivityApp(
     const id = parseInt(c.req.param("id"));
     if (isNaN(id)) return c.json({ error: "Invalid id" }, 400);
     const body = await c.req.json().catch(() => null);
-    if (!body || typeof body.version !== "number") return c.json({ error: "Missing version" }, 400);
-    const session = bot.getFirstActiveSession();
-    if (!session) return c.json({ error: "No active session" }, 404);
-    const result = await bot.handleProposalAffirm(session.guildId, userId, id, body.version);
+    if (!body || typeof body.version !== "number" || typeof body.channelId !== "string") {
+      return c.json({ error: "Missing channelId/version" }, 400);
+    }
+    const result = await bot.handleProposalAffirm(body.channelId, userId, id, body.version);
     if ("error" in result) return c.json({ error: result.error }, result.status as any);
     return c.json(result);
   });
@@ -828,7 +829,7 @@ export function createActivityApp(
   app.get(
     "/ws",
     upgradeWebSocket((c) => {
-      let guildId: string | null = null;
+      let channelId: string | null = null;
       let clientUserId: string | null = null;
       let clientUsername: string | null = null;
       let authenticated = false;
@@ -878,15 +879,20 @@ export function createActivityApp(
               }
 
               function registerClient(ws: any) {
-                const session = bot.getFirstActiveSession();
+                // Bind to the session running in the Activity's voice channel
+                // (per-channel keying, #61). Falls back to the first active
+                // session if the client didn't send a channelId — preserves
+                // the legacy single-standup case.
+                const requestedChannelId = typeof msg.channelId === "string" ? msg.channelId : null;
+                const session = bot.getSessionForChannel(requestedChannelId);
                 if (session) {
-                  guildId = session.guildId;
-                  bot.addActivityClient(guildId, ws, clientUserId, clientUsername);
+                  channelId = session.channelId;
+                  bot.addActivityClient(channelId, ws, clientUserId, clientUsername);
                   // Bind the standup's repo so live proposals (#53) can target
                   // GitHub. This is idempotent — cheap to call on every ready.
                   const pickedKey = typeof msg.standupKey === "string" ? msg.standupKey : null;
                   if (pickedKey && STANDUPS[pickedKey]) {
-                    bot.setIssueRepo(guildId, STANDUPS[pickedKey].repo);
+                    bot.setIssueRepo(channelId, STANDUPS[pickedKey].repo);
                   }
                   // addActivityClient already broadcasts updated state; send a personal
                   // initial state so the client has all fields before the broadcast arrives.
@@ -897,7 +903,7 @@ export function createActivityApp(
                     .filter(([uid]) => uid !== session.meta.presenter)
                     .map(([, name]) => name);
                   const voiceMembers = [...session.meta.voiceMembers.entries()].map(([id, name]) => ({ id, name }));
-                  const proposals = bot.getActiveProposals(guildId).map(serializeProposal);
+                  const proposals = bot.getActiveProposals(channelId).map(serializeProposal);
                   ws.send(JSON.stringify({
                     type: "state",
                     focusedIssue: session.meta.focusedIssue,
@@ -933,50 +939,50 @@ export function createActivityApp(
 
             if (!authenticated) return;
 
-            if (msg.type === "focus" && guildId) {
-              bot.setFocusedIssue(guildId, msg.issueNumber ?? null, msg.issueTitle, msg.issueState);
+            if (msg.type === "focus" && channelId) {
+              bot.setFocusedIssue(channelId, msg.issueNumber ?? null, msg.issueTitle, msg.issueState);
             }
 
-            if (msg.type === "tab" && guildId && typeof msg.participantIndex === "number") {
-              bot.setActiveTab(guildId, msg.participantIndex);
+            if (msg.type === "tab" && channelId && typeof msg.participantIndex === "number") {
+              bot.setActiveTab(channelId, msg.participantIndex);
             }
 
-            if (msg.type === "detail" && guildId) {
-              bot.setDetailPanel(guildId, msg.issueNumber ?? null);
+            if (msg.type === "detail" && channelId) {
+              bot.setDetailPanel(channelId, msg.issueNumber ?? null);
             }
 
             // Use server-verified clientUserId — never trust client-supplied userId.
-            if (msg.type === "controls" && guildId && clientUserId) {
-              bot.setPresenter(guildId, clientUserId);
+            if (msg.type === "controls" && channelId && clientUserId) {
+              bot.setPresenter(channelId, clientUserId);
             }
 
-            if (msg.type === "scroll" && guildId && typeof msg.scrollY === "number") {
-              bot.relayScroll(guildId, msg.scrollY);
+            if (msg.type === "scroll" && channelId && typeof msg.scrollY === "number") {
+              bot.relayScroll(channelId, msg.scrollY);
             }
 
-            if (msg.type === "detailScroll" && guildId && typeof msg.scrollTop === "number") {
-              bot.relayDetailScroll(guildId, msg.scrollTop);
+            if (msg.type === "detailScroll" && channelId && typeof msg.scrollTop === "number") {
+              bot.relayDetailScroll(channelId, msg.scrollTop);
             }
 
-            if (msg.type === "proposal-edit" && guildId && clientUserId &&
+            if (msg.type === "proposal-edit" && channelId && clientUserId &&
                 typeof msg.id === "number" && typeof msg.version === "number" &&
                 typeof msg.payload === "object") {
-              const res = bot.handleProposalEdit(guildId, clientUserId, msg.id, msg.version, msg.payload);
+              const res = bot.handleProposalEdit(channelId, clientUserId, msg.id, msg.version, msg.payload);
               if ("error" in res) {
                 try { ws.send(JSON.stringify({ type: "proposal-error", id: msg.id, error: res.error })); } catch {}
               }
             }
 
-            if (msg.type === "proposal-dismiss" && guildId && clientUserId && typeof msg.id === "number") {
-              const res = bot.handleProposalDismiss(guildId, clientUserId, msg.id);
+            if (msg.type === "proposal-dismiss" && channelId && clientUserId && typeof msg.id === "number") {
+              const res = bot.handleProposalDismiss(channelId, clientUserId, msg.id);
               if ("error" in res) {
                 try { ws.send(JSON.stringify({ type: "proposal-error", id: msg.id, error: res.error })); } catch {}
               }
             }
 
-            if (msg.type === "proposal-affirm" && guildId && clientUserId &&
+            if (msg.type === "proposal-affirm" && channelId && clientUserId &&
                 typeof msg.id === "number" && typeof msg.version === "number") {
-              bot.handleProposalAffirm(guildId, clientUserId, msg.id, msg.version).then((res) => {
+              bot.handleProposalAffirm(channelId, clientUserId, msg.id, msg.version).then((res) => {
                 if ("error" in res) {
                   try { ws.send(JSON.stringify({ type: "proposal-error", id: msg.id, error: res.error })); } catch {}
                 }
@@ -988,10 +994,10 @@ export function createActivityApp(
         },
 
         onClose() {
-          if (guildId) {
-            bot.clearPresenterIfDisconnected(guildId, clientUserId);
-            if (capturedWs) bot.removeActivityClient(guildId, capturedWs);
-            if (clientUserId) bot.removeActivityUser(guildId, clientUserId);
+          if (channelId) {
+            bot.clearPresenterIfDisconnected(channelId, clientUserId);
+            if (capturedWs) bot.removeActivityClient(channelId, capturedWs);
+            if (clientUserId) bot.removeActivityUser(channelId, clientUserId);
           }
           console.log("[activity] WebSocket client disconnected");
         },

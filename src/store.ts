@@ -200,12 +200,28 @@ export class StandupStore {
       try { this.db.run(`ALTER TABLE utterance_segments ADD COLUMN ${col}`); } catch { /* already exists */ }
     }
 
-    // In-flight session state — survives process restart.
+    // Per-channel migration (#61): rekey session-state tables from guild_id
+    // to channel_id so multiple voice channels in the same guild can host
+    // concurrent standups. Only in-flight session state lives here, so
+    // dropping any rows that would be lost is acceptable — completed
+    // recordings are in `standups`, not `active_sessions`.
+    const existingActive = this.db
+      .query(`SELECT sql FROM sqlite_master WHERE type='table' AND name='active_sessions'`)
+      .get() as { sql?: string } | undefined;
+    if (existingActive?.sql && /guild_id\s+TEXT\s+PRIMARY KEY/i.test(existingActive.sql)) {
+      console.warn("[store] Migrating active_sessions to channel_id PK (#61). Any in-flight session state will be dropped.");
+      this.db.run(`DROP TABLE IF EXISTS active_sessions`);
+      this.db.run(`DROP TABLE IF EXISTS active_session_lines`);
+      this.db.run(`DROP TABLE IF EXISTS active_session_issue_meta`);
+    }
+
+    // In-flight session state — survives process restart. Keyed by channel_id
+    // so two channels in the same guild can run concurrent standups (#61).
     this.db.run(`
       CREATE TABLE IF NOT EXISTS active_sessions (
-        guild_id                 TEXT PRIMARY KEY,
+        channel_id               TEXT PRIMARY KEY,
+        guild_id                 TEXT NOT NULL,
         type                     TEXT NOT NULL,
-        channel_id               TEXT NOT NULL,
         text_channel_id          TEXT NOT NULL,
         started_at               TEXT NOT NULL,
         issue_repo               TEXT,
@@ -213,12 +229,13 @@ export class StandupStore {
         focused_detail_issue     INTEGER,
         presenter                TEXT,
         active_participant_index INTEGER NOT NULL DEFAULT 0,
-        resumed_count            INTEGER NOT NULL DEFAULT 0
+        resumed_count            INTEGER NOT NULL DEFAULT 0,
+        standup_id               INTEGER
       );
       CREATE TABLE IF NOT EXISTS active_session_lines (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-        guild_id            TEXT NOT NULL,
-        session_started_at  TEXT,
+        channel_id          TEXT NOT NULL,
+        session_started_at  TEXT NOT NULL,
         speaker             TEXT NOT NULL,
         user_id             TEXT NOT NULL,
         text                TEXT NOT NULL,
@@ -226,24 +243,15 @@ export class StandupStore {
         issue_number        INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_active_lines_session
-        ON active_session_lines (guild_id, session_started_at, started_at);
+        ON active_session_lines (channel_id, session_started_at, started_at);
       CREATE TABLE IF NOT EXISTS active_session_issue_meta (
-        guild_id     TEXT NOT NULL,
+        channel_id   TEXT NOT NULL,
         issue_number INTEGER NOT NULL,
         title        TEXT,
         state        TEXT,
-        PRIMARY KEY (guild_id, issue_number)
+        PRIMARY KEY (channel_id, issue_number)
       );
     `);
-
-    // Migration: add session_started_at to active_session_lines for installs
-    // that predate #58. Old rows without a session_started_at are orphaned
-    // (no longer loadable on resume) and safe to drop.
-    try { this.db.run(`ALTER TABLE active_session_lines ADD COLUMN session_started_at TEXT`); } catch { /* already exists */ }
-    try { this.db.run(`DELETE FROM active_session_lines WHERE session_started_at IS NULL`); } catch { /* noop */ }
-
-    // Migration: standup_id on active_sessions for pre-insert + resume (#53).
-    try { this.db.run(`ALTER TABLE active_sessions ADD COLUMN standup_id INTEGER`); } catch { /* already exists */ }
 
     // Live proposals surfaced during the meeting (#53).
     this.db.run(`
@@ -279,13 +287,13 @@ export class StandupStore {
   saveActiveSession(row: ActiveSessionRow): void {
     this.db.prepare(`
       INSERT INTO active_sessions (
-        guild_id, type, channel_id, text_channel_id, started_at,
+        channel_id, guild_id, type, text_channel_id, started_at,
         issue_repo, focused_issue, focused_detail_issue, presenter,
         active_participant_index, resumed_count, standup_id
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(guild_id) DO UPDATE SET
+      ON CONFLICT(channel_id) DO UPDATE SET
+        guild_id = excluded.guild_id,
         type = excluded.type,
-        channel_id = excluded.channel_id,
         text_channel_id = excluded.text_channel_id,
         started_at = excluded.started_at,
         issue_repo = excluded.issue_repo,
@@ -296,14 +304,14 @@ export class StandupStore {
         resumed_count = excluded.resumed_count,
         standup_id = excluded.standup_id
     `).run(
-      row.guild_id, row.type, row.channel_id, row.text_channel_id, row.started_at,
+      row.channel_id, row.guild_id, row.type, row.text_channel_id, row.started_at,
       row.issue_repo, row.focused_issue, row.focused_detail_issue, row.presenter,
       row.active_participant_index, row.resumed_count, row.standup_id,
     );
   }
 
   updateActiveSessionState(
-    guildId: string,
+    channelId: string,
     patch: Partial<Pick<ActiveSessionRow,
       "issue_repo" | "focused_issue" | "focused_detail_issue" | "presenter" | "active_participant_index"
     >>,
@@ -315,24 +323,24 @@ export class StandupStore {
       values.push(v ?? null);
     }
     if (fields.length === 0) return;
-    values.push(guildId);
-    this.db.prepare(`UPDATE active_sessions SET ${fields.join(", ")} WHERE guild_id = ?`).run(...values);
+    values.push(channelId);
+    this.db.prepare(`UPDATE active_sessions SET ${fields.join(", ")} WHERE channel_id = ?`).run(...values);
   }
 
   /** Delete this session's row + its lines. Row delete is identity-scoped
-   *  (guild_id AND started_at), so a concurrent new session for the same
-   *  guild keeps its row. Issue meta is only cleared if we successfully
-   *  dropped our row — otherwise the newer session owns it. */
-  deleteActiveSession(guildId: string, sessionStartedAt: string): void {
+   *  (channel_id AND started_at), so a concurrent re-start in the same
+   *  channel keeps its row. Issue meta is cleared whenever the matching
+   *  session row goes away. */
+  deleteActiveSession(channelId: string, sessionStartedAt: string): void {
     const tx = this.db.transaction(() => {
       this.db.prepare(
-        `DELETE FROM active_session_lines WHERE guild_id = ? AND session_started_at = ?`
-      ).run(guildId, sessionStartedAt);
+        `DELETE FROM active_session_lines WHERE channel_id = ? AND session_started_at = ?`
+      ).run(channelId, sessionStartedAt);
       const { changes } = this.db.prepare(
-        `DELETE FROM active_sessions WHERE guild_id = ? AND started_at = ?`
-      ).run(guildId, sessionStartedAt);
+        `DELETE FROM active_sessions WHERE channel_id = ? AND started_at = ?`
+      ).run(channelId, sessionStartedAt);
       if (Number(changes) > 0) {
-        this.db.prepare(`DELETE FROM active_session_issue_meta WHERE guild_id = ?`).run(guildId);
+        this.db.prepare(`DELETE FROM active_session_issue_meta WHERE channel_id = ?`).run(channelId);
       }
     });
     tx();
@@ -342,38 +350,38 @@ export class StandupStore {
     return this.db.query(`SELECT * FROM active_sessions`).all() as ActiveSessionRow[];
   }
 
-  appendActiveSessionLine(guildId: string, sessionStartedAt: string, line: ActiveSessionLine): void {
+  appendActiveSessionLine(channelId: string, sessionStartedAt: string, line: ActiveSessionLine): void {
     this.db.prepare(`
-      INSERT INTO active_session_lines (guild_id, session_started_at, speaker, user_id, text, started_at, issue_number)
+      INSERT INTO active_session_lines (channel_id, session_started_at, speaker, user_id, text, started_at, issue_number)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(guildId, sessionStartedAt, line.speaker, line.user_id, line.text, line.started_at, line.issue_number);
+    `).run(channelId, sessionStartedAt, line.speaker, line.user_id, line.text, line.started_at, line.issue_number);
   }
 
-  getActiveSessionLines(guildId: string, sessionStartedAt: string): ActiveSessionLine[] {
+  getActiveSessionLines(channelId: string, sessionStartedAt: string): ActiveSessionLine[] {
     return this.db
       .query(
         `SELECT speaker, user_id, text, started_at, issue_number
          FROM active_session_lines
-         WHERE guild_id = ? AND session_started_at = ?
+         WHERE channel_id = ? AND session_started_at = ?
          ORDER BY started_at`
       )
-      .all(guildId, sessionStartedAt) as ActiveSessionLine[];
+      .all(channelId, sessionStartedAt) as ActiveSessionLine[];
   }
 
-  upsertActiveSessionIssueMeta(guildId: string, meta: ActiveSessionIssueMeta): void {
+  upsertActiveSessionIssueMeta(channelId: string, meta: ActiveSessionIssueMeta): void {
     this.db.prepare(`
-      INSERT INTO active_session_issue_meta (guild_id, issue_number, title, state)
+      INSERT INTO active_session_issue_meta (channel_id, issue_number, title, state)
       VALUES (?, ?, ?, ?)
-      ON CONFLICT(guild_id, issue_number) DO UPDATE SET
+      ON CONFLICT(channel_id, issue_number) DO UPDATE SET
         title = excluded.title,
         state = excluded.state
-    `).run(guildId, meta.issue_number, meta.title, meta.state);
+    `).run(channelId, meta.issue_number, meta.title, meta.state);
   }
 
-  getActiveSessionIssueMeta(guildId: string): ActiveSessionIssueMeta[] {
+  getActiveSessionIssueMeta(channelId: string): ActiveSessionIssueMeta[] {
     return this.db
-      .query(`SELECT issue_number, title, state FROM active_session_issue_meta WHERE guild_id = ?`)
-      .all(guildId) as ActiveSessionIssueMeta[];
+      .query(`SELECT issue_number, title, state FROM active_session_issue_meta WHERE channel_id = ?`)
+      .all(channelId) as ActiveSessionIssueMeta[];
   }
 
   /** Pre-insert a standup row at /standup start so live proposals (#53) can
