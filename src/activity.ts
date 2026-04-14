@@ -4,10 +4,11 @@
  * Routes (mounted at /activity):
  *   GET  /              → Activity HTML shell
  *   GET  /bundle.js     → Bundled client-side JS
- *   POST /api/token     → OAuth2 code→token exchange
- *   GET  /api/standups  → Available standup names
- *   GET  /api/issues    → GitHub issues grouped by participant
- *   GET  /ws            → WebSocket for real-time session state
+ *   POST /api/token           → OAuth2 code→token exchange
+ *   GET  /api/standups        → Available standups (key + displayName)
+ *   GET  /api/picker-context  → Suggested standup for the landing channel
+ *   GET  /api/issues          → GitHub issues grouped by participant
+ *   GET  /ws                  → WebSocket for real-time session state
  */
 
 import { Hono } from "hono";
@@ -17,6 +18,8 @@ import {
   STANDUP_NAMES,
   getStage,
   deriveSteps,
+  suggestStandupForChannelName,
+  standupKeyForRepo,
   type StandupConfig,
 } from "./review";
 import {
@@ -103,11 +106,22 @@ const ACTIVITY_CSS = `
   .error-text{color:#f87171}
 
   /* Standup Picker */
-  .picker{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:1rem}
+  .picker{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:1rem;padding:1rem}
   .picker h1{color:#818cf8;font-size:1.5rem}
-  .picker-subtitle{color:#64748b;font-size:.9rem}
+  .picker-subtitle{color:#64748b;font-size:.9rem;text-align:center;max-width:320px}
+  .picker-primary{display:flex;flex-direction:column;align-items:center;gap:.5rem}
+  .picker-others{display:flex;flex-direction:column;align-items:center;gap:.5rem;width:100%;max-width:280px}
+  .picker-others-toggle{background:none;border:none;color:#94a3b8;font-size:.85rem;cursor:pointer;padding:.25rem .5rem;display:flex;align-items:center;gap:.25rem}
+  .picker-others-toggle:hover{color:#e2e8f0}
+  .picker-others-toggle .caret{display:inline-block;transition:transform .15s}
+  .picker-others[data-open="true"] .picker-others-toggle .caret{transform:rotate(90deg)}
+  .picker-others-list{display:none;flex-direction:column;gap:.5rem;width:100%;align-items:center}
+  .picker-others[data-open="true"] .picker-others-list{display:flex}
   .standup-btn{background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:.75rem 2rem;border-radius:.5rem;cursor:pointer;font-size:1rem;min-width:200px;transition:all .15s}
   .standup-btn:hover{background:#334155;border-color:#818cf8}
+  .standup-btn-primary{background:#4338ca;border-color:#818cf8;color:#fff;font-size:1.1rem;font-weight:600;padding:1rem 2.5rem;min-width:240px;box-shadow:0 4px 12px rgba(129,140,248,.25)}
+  .standup-btn-primary:hover{background:#4f46e5;border-color:#a5b4fc}
+  .picker-reason{color:#64748b;font-size:.75rem;font-style:italic}
 
   /* Header */
   .header{display:flex;align-items:center;justify-content:space-between;padding:.75rem 1rem;background:#1e293b;border-bottom:1px solid #334155;flex-shrink:0}
@@ -511,9 +525,47 @@ export function createActivityApp(
     return c.json({ access_token: tokenData.access_token });
   });
 
-  // Available standup names
+  // Available standups (key + displayName). Clients render displayName
+  // but send key back on selection.
   app.get("/api/standups", (c) => {
-    return c.json(STANDUP_NAMES);
+    const out = STANDUP_NAMES.map((key) => ({
+      key,
+      displayName: STANDUPS[key].displayName,
+    }));
+    return c.json(out);
+  });
+
+  // Picker context: given the voice channel the Activity was launched in,
+  // return the suggested standup (active session > channel-name match > none)
+  // so the client can pre-highlight one project and collapse the others.
+  app.get("/api/picker-context", async (c) => {
+    const channelId = c.req.query("channelId") || null;
+    const session = bot.getFirstActiveSession();
+    const activeStandup = session ? standupKeyForRepo(session.meta.issueRepo) : null;
+    const activeSession = session && activeStandup
+      ? {
+          standupKey: activeStandup,
+          watcherCount: session.meta.connectedUsers.size,
+        }
+      : null;
+
+    let channelName: string | null = null;
+    if (channelId) {
+      channelName = await bot.getChannelName(channelId);
+    }
+    const channelSuggestion = suggestStandupForChannelName(channelName);
+
+    let suggestedStandup: string | null = null;
+    let reason: "active-session" | "channel-name" | null = null;
+    if (activeStandup) {
+      suggestedStandup = activeStandup;
+      reason = "active-session";
+    } else if (channelSuggestion) {
+      suggestedStandup = channelSuggestion;
+      reason = "channel-name";
+    }
+
+    return c.json({ suggestedStandup, reason, channelName, activeSession });
   });
 
   // GitHub issues grouped by participant

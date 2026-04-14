@@ -27,20 +27,55 @@ import { lookupUser, resolveDisplayName } from "./users";
 export interface StandupConfig {
   repo: string;
   backlogLabel: string;
+  displayName: string;
+  /** Case-insensitive substrings that, if found in a voice channel's name,
+   *  mark this standup as the context-suggested pick. Channels are renamed
+   *  faster than configs, so we match on the project word rather than ID. */
+  channelNameHints: string[];
 }
 
 export const STANDUPS: Record<string, StandupConfig> = {
   portable: {
     repo: "volter-ai/mobile-vgit",
     backlogLabel: "stage:backlogged",
+    displayName: "Portable",
+    channelNameHints: ["portable"],
   },
   runhuman: {
     repo: "volter-ai/runhuman",
     backlogLabel: "stage: Backlog",
+    displayName: "Runhuman",
+    channelNameHints: ["runhuman"],
+  },
+  "claude-yard": {
+    repo: "volter-ai/multi-claude",
+    backlogLabel: "stage:backlogged",
+    displayName: "Claude Yard",
+    channelNameHints: ["claude yard", "claude-yard", "multi-claude"],
   },
 };
 
 export const STANDUP_NAMES = Object.keys(STANDUPS);
+
+/** Return the standup key whose channelNameHints match the given voice
+ *  channel name, or null if none match. Case-insensitive substring. */
+export function suggestStandupForChannelName(channelName: string | null): string | null {
+  if (!channelName) return null;
+  const lc = channelName.toLowerCase();
+  for (const [key, cfg] of Object.entries(STANDUPS)) {
+    if (cfg.channelNameHints.some((h) => lc.includes(h))) return key;
+  }
+  return null;
+}
+
+/** Reverse lookup: given a repo string, find the matching standup key. */
+export function standupKeyForRepo(repo: string | null): string | null {
+  if (!repo) return null;
+  for (const [key, cfg] of Object.entries(STANDUPS)) {
+    if (cfg.repo === repo) return key;
+  }
+  return null;
+}
 
 // ── Derived participant steps ────────────────────────────────────────────────
 

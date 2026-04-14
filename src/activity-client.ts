@@ -285,8 +285,10 @@ async function init() {
     standupKey = params.get("standup") || "";
 
     if (!standupKey) {
-      // Show standup picker
-      renderStandupPicker();
+      // Show standup picker — pass the Discord channelId so the server can
+      // suggest a standup based on the voice channel the Activity launched in.
+      const launchChannelId = (sdk as any).channelId ?? null;
+      renderStandupPicker(launchChannelId);
       return;
     }
 
@@ -304,41 +306,114 @@ async function init() {
 
 // ── Standup Picker ──────────────────────────────────────────────────────────
 
-function renderStandupPicker() {
+interface StandupOption {
+  key: string;
+  displayName: string;
+}
+
+interface PickerContext {
+  suggestedStandup: string | null;
+  reason: "active-session" | "channel-name" | null;
+  channelName: string | null;
+  activeSession: { standupKey: string; watcherCount: number } | null;
+}
+
+function renderStandupPicker(channelId: string | null) {
   app.innerHTML = `
     <div class="picker">
       <h1>Standup Activity</h1>
-      <p class="picker-subtitle">Choose a standup to review</p>
+      <p class="picker-subtitle" id="picker-subtitle">Choose a standup to review</p>
       <div id="standup-buttons"></div>
     </div>
   `;
 
-  // Fetch available standups
-  fetch("/api/standups")
-    .then((r) => r.json())
-    .then((standups: string[]) => {
+  const pickerCtxUrl = channelId
+    ? `/api/picker-context?channelId=${encodeURIComponent(channelId)}`
+    : "/api/picker-context";
+
+  Promise.all([
+    fetch("/api/standups").then((r) => r.json()) as Promise<StandupOption[]>,
+    fetch(pickerCtxUrl)
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null) as Promise<PickerContext | null>,
+  ])
+    .then(([standups, ctx]) => {
       const container = document.getElementById("standup-buttons")!;
-      for (const name of standups) {
-        const btn = document.createElement("button");
-        btn.className = "standup-btn";
-        btn.textContent = name;
-        btn.onclick = () => {
-          standupKey = name;
-          loadStandup(name).catch((e: any) => {
-            app.innerHTML = `<div class="error">
-              <h2>Failed to load standup</h2>
-              <p>${escapeHtml(e.message)}</p>
-              <button onclick="location.reload()">Retry</button>
-            </div>`;
-          });
-        };
-        container.appendChild(btn);
+      const subtitle = document.getElementById("picker-subtitle")!;
+
+      const suggested = ctx?.suggestedStandup ?? null;
+      const options: StandupOption[] = Array.isArray(standups)
+        ? standups
+        : [];
+      const primary = suggested
+        ? options.find((o) => o.key === suggested) ?? null
+        : null;
+      const others = primary
+        ? options.filter((o) => o.key !== primary.key)
+        : options;
+
+      if (ctx?.reason === "active-session" && ctx.activeSession) {
+        const n = ctx.activeSession.watcherCount;
+        subtitle.textContent = n > 0
+          ? `${n} ${n === 1 ? "person is" : "people are"} already reviewing ${primary?.displayName ?? "this standup"} — jump in?`
+          : `A ${primary?.displayName ?? "standup"} session is active — jump in?`;
+      } else if (ctx?.reason === "channel-name" && ctx.channelName && primary) {
+        subtitle.textContent = `You're in #${ctx.channelName} — start the ${primary.displayName} standup?`;
+      }
+
+      if (primary) {
+        const primaryWrap = document.createElement("div");
+        primaryWrap.className = "picker-primary";
+        primaryWrap.appendChild(makeStandupButton(primary, true));
+        container.appendChild(primaryWrap);
+
+        if (others.length > 0) {
+          const othersWrap = document.createElement("div");
+          othersWrap.className = "picker-others";
+          othersWrap.dataset.open = "false";
+
+          const toggle = document.createElement("button");
+          toggle.className = "picker-others-toggle";
+          toggle.type = "button";
+          toggle.innerHTML = `<span class="caret">▸</span> Other projects`;
+          toggle.onclick = () => {
+            const open = othersWrap.dataset.open === "true";
+            othersWrap.dataset.open = open ? "false" : "true";
+          };
+          othersWrap.appendChild(toggle);
+
+          const list = document.createElement("div");
+          list.className = "picker-others-list";
+          for (const opt of others) list.appendChild(makeStandupButton(opt, false));
+          othersWrap.appendChild(list);
+          container.appendChild(othersWrap);
+        }
+      } else {
+        // No suggestion — equal-weight list.
+        for (const opt of options) container.appendChild(makeStandupButton(opt, false));
       }
     })
     .catch((e) => {
       document.getElementById("standup-buttons")!.innerHTML =
         `<p class="error-text">Failed to load standups: ${escapeHtml(e.message)}</p>`;
     });
+}
+
+function makeStandupButton(opt: StandupOption, primary: boolean): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.className = primary ? "standup-btn standup-btn-primary" : "standup-btn";
+  btn.textContent = opt.displayName;
+  btn.onclick = () => {
+    standupKey = opt.key;
+    loadStandup(opt.key).catch((e: any) => {
+      app.innerHTML = `<div class="error">
+        <h2>Failed to load standup</h2>
+        <p>${escapeHtml(e.message)}</p>
+        <button onclick="location.reload()">Retry</button>
+      </div>`;
+    });
+  };
+  return btn;
 }
 
 // ── Load Standup Data ───────────────────────────────────────────────────────

@@ -247,6 +247,20 @@ export class StandupBot {
     return null;
   }
 
+  /** Resolve a channel's display name via Discord API. Used by the Activity
+   *  picker to map voice channel → suggested standup. Returns null if the
+   *  channel can't be fetched (unknown ID, permissions, bot not ready). */
+  async getChannelName(channelId: string): Promise<string | null> {
+    try {
+      const channel = await this.client.channels.fetch(channelId).catch(() => null);
+      if (!channel) return null;
+      const name = (channel as any).name;
+      return typeof name === "string" ? name : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Summary of in-memory sessions that would be lost on restart. Review
    *  walkthroughs are state-free (encoded in Discord button customIds) and
    *  are not reported here. */
