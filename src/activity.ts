@@ -63,6 +63,11 @@ async function buildClientBundle(): Promise<void> {
 // Build immediately — store promise so /bundle.js can await it on cold start
 const bundleReady = buildClientBundle();
 
+// Per-process version stamp — appended to bundle.js in the HTML so each deploy
+// forces a fresh fetch even when caches (Discord's proxy, browser heuristic)
+// would otherwise serve a stale copy.
+const BUNDLE_VERSION = Date.now().toString(36);
+
 // ── Activity HTML shell ─────────────────────────────────────────────────────
 
 function activityHtml(): string {
@@ -77,7 +82,7 @@ function activityHtml(): string {
 </head>
 <body>
   <div id="app"><div class="loading">Loading...</div></div>
-  <script src="bundle.js"></script>
+  <script src="bundle.js?v=${BUNDLE_VERSION}"></script>
 </body>
 </html>`;
 }
@@ -410,7 +415,10 @@ export function createActivityApp(
     await bundleReady;
     console.log(`[activity] Serving bundle.js (${clientBundle.length} bytes)`);
     return new Response(clientBundle, {
-      headers: { "Content-Type": "application/javascript; charset=utf-8" },
+      headers: {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
     });
   });
 
