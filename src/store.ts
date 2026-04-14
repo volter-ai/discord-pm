@@ -33,6 +33,36 @@ export interface UtteranceSegment {
   started_at: number; // epoch ms
 }
 
+/** Snapshot of an in-flight session — written on start and mutated in place
+ *  during the meeting so a process restart can resume from disk. */
+export interface ActiveSessionRow {
+  guild_id: string;
+  type: "standup" | "meeting";
+  channel_id: string;         // voice channel
+  text_channel_id: string;    // where to post summary / banner
+  started_at: string;         // ISO
+  issue_repo: string | null;
+  focused_issue: number | null;
+  focused_detail_issue: number | null;
+  presenter: string | null;
+  active_participant_index: number;
+  resumed_count: number;
+}
+
+export interface ActiveSessionLine {
+  speaker: string;
+  user_id: string;
+  text: string;
+  started_at: number;
+  issue_number: number | null;
+}
+
+export interface ActiveSessionIssueMeta {
+  issue_number: number;
+  title: string;
+  state: string;
+}
+
 const TRANSCRIPTS_DIR = "./transcripts";
 const DB_PATH = "./data/standups.db";
 
@@ -81,6 +111,127 @@ export class StandupStore {
     for (const col of ["issue_title TEXT", "issue_state TEXT"]) {
       try { this.db.run(`ALTER TABLE utterance_segments ADD COLUMN ${col}`); } catch { /* already exists */ }
     }
+
+    // In-flight session state — survives process restart.
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS active_sessions (
+        guild_id                 TEXT PRIMARY KEY,
+        type                     TEXT NOT NULL,
+        channel_id               TEXT NOT NULL,
+        text_channel_id          TEXT NOT NULL,
+        started_at               TEXT NOT NULL,
+        issue_repo               TEXT,
+        focused_issue            INTEGER,
+        focused_detail_issue     INTEGER,
+        presenter                TEXT,
+        active_participant_index INTEGER NOT NULL DEFAULT 0,
+        resumed_count            INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS active_session_lines (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     TEXT NOT NULL,
+        speaker      TEXT NOT NULL,
+        user_id      TEXT NOT NULL,
+        text         TEXT NOT NULL,
+        started_at   INTEGER NOT NULL,
+        issue_number INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_active_lines_guild
+        ON active_session_lines (guild_id, started_at);
+      CREATE TABLE IF NOT EXISTS active_session_issue_meta (
+        guild_id     TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        title        TEXT,
+        state        TEXT,
+        PRIMARY KEY (guild_id, issue_number)
+      );
+    `);
+  }
+
+  // ── Active-session persistence ────────────────────────────────────────────
+
+  saveActiveSession(row: ActiveSessionRow): void {
+    this.db.prepare(`
+      INSERT INTO active_sessions (
+        guild_id, type, channel_id, text_channel_id, started_at,
+        issue_repo, focused_issue, focused_detail_issue, presenter,
+        active_participant_index, resumed_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        type = excluded.type,
+        channel_id = excluded.channel_id,
+        text_channel_id = excluded.text_channel_id,
+        started_at = excluded.started_at,
+        issue_repo = excluded.issue_repo,
+        focused_issue = excluded.focused_issue,
+        focused_detail_issue = excluded.focused_detail_issue,
+        presenter = excluded.presenter,
+        active_participant_index = excluded.active_participant_index,
+        resumed_count = excluded.resumed_count
+    `).run(
+      row.guild_id, row.type, row.channel_id, row.text_channel_id, row.started_at,
+      row.issue_repo, row.focused_issue, row.focused_detail_issue, row.presenter,
+      row.active_participant_index, row.resumed_count,
+    );
+  }
+
+  updateActiveSessionState(
+    guildId: string,
+    patch: Partial<Pick<ActiveSessionRow,
+      "issue_repo" | "focused_issue" | "focused_detail_issue" | "presenter" | "active_participant_index"
+    >>,
+  ): void {
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      fields.push(`${k} = ?`);
+      values.push(v ?? null);
+    }
+    if (fields.length === 0) return;
+    values.push(guildId);
+    this.db.prepare(`UPDATE active_sessions SET ${fields.join(", ")} WHERE guild_id = ?`).run(...values);
+  }
+
+  deleteActiveSession(guildId: string): void {
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM active_sessions WHERE guild_id = ?`).run(guildId);
+      this.db.prepare(`DELETE FROM active_session_lines WHERE guild_id = ?`).run(guildId);
+      this.db.prepare(`DELETE FROM active_session_issue_meta WHERE guild_id = ?`).run(guildId);
+    });
+    tx();
+  }
+
+  listActiveSessions(): ActiveSessionRow[] {
+    return this.db.query(`SELECT * FROM active_sessions`).all() as ActiveSessionRow[];
+  }
+
+  appendActiveSessionLine(guildId: string, line: ActiveSessionLine): void {
+    this.db.prepare(`
+      INSERT INTO active_session_lines (guild_id, speaker, user_id, text, started_at, issue_number)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(guildId, line.speaker, line.user_id, line.text, line.started_at, line.issue_number);
+  }
+
+  getActiveSessionLines(guildId: string): ActiveSessionLine[] {
+    return this.db
+      .query(`SELECT speaker, user_id, text, started_at, issue_number FROM active_session_lines WHERE guild_id = ? ORDER BY started_at`)
+      .all(guildId) as ActiveSessionLine[];
+  }
+
+  upsertActiveSessionIssueMeta(guildId: string, meta: ActiveSessionIssueMeta): void {
+    this.db.prepare(`
+      INSERT INTO active_session_issue_meta (guild_id, issue_number, title, state)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(guild_id, issue_number) DO UPDATE SET
+        title = excluded.title,
+        state = excluded.state
+    `).run(guildId, meta.issue_number, meta.title, meta.state);
+  }
+
+  getActiveSessionIssueMeta(guildId: string): ActiveSessionIssueMeta[] {
+    return this.db
+      .query(`SELECT issue_number, title, state FROM active_session_issue_meta WHERE guild_id = ?`)
+      .all(guildId) as ActiveSessionIssueMeta[];
   }
 
   save(record: StandupRecord): { id: number; transcriptPath: string } {

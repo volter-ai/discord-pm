@@ -112,6 +112,9 @@ export class StandupBot {
     this.client.once("clientReady", async () => {
       console.log(`[bot] Logged in as ${this.client.user?.tag}`);
       await this.registerCommands();
+      await this.resumeActiveSessions().catch((e) =>
+        console.error("[bot] resumeActiveSessions crashed:", e),
+      );
     });
 
     this.client.on("interactionCreate", (i) => this.handleInteraction(i));
@@ -223,6 +226,7 @@ export class StandupBot {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.focusedDetailIssue = issueNumber;
+      this.store.updateActiveSessionState(guildId, { focused_detail_issue: issueNumber });
       this.broadcastActivityState(guildId);
     }
   }
@@ -251,8 +255,11 @@ export class StandupBot {
     if (session) {
       session.focusedIssue = issueNumber;
       if (issueNumber && issueTitle) {
-        session.issueMeta.set(issueNumber, { title: issueTitle, state: issueState ?? "open" });
+        const state = issueState ?? "open";
+        session.issueMeta.set(issueNumber, { title: issueTitle, state });
+        this.store.upsertActiveSessionIssueMeta(guildId, { issue_number: issueNumber, title: issueTitle, state });
       }
+      this.store.updateActiveSessionState(guildId, { focused_issue: issueNumber });
       this.broadcastActivityState(guildId);
     }
   }
@@ -262,6 +269,7 @@ export class StandupBot {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.activeParticipantIndex = participantIndex;
+      this.store.updateActiveSessionState(guildId, { active_participant_index: participantIndex });
       this.broadcastActivityState(guildId);
     }
   }
@@ -271,6 +279,7 @@ export class StandupBot {
     const session = this.activeSessions.get(guildId);
     if (session && userId && session.presenter === userId) {
       session.presenter = null;
+      this.store.updateActiveSessionState(guildId, { presenter: null });
       this.broadcastActivityState(guildId);
       console.log(`[bot] Presenter ${userId} disconnected — presenter role cleared`);
     }
@@ -281,6 +290,7 @@ export class StandupBot {
     const session = this.activeSessions.get(guildId);
     if (session) {
       session.presenter = userId;
+      this.store.updateActiveSessionState(guildId, { presenter: userId });
       this.broadcastActivityState(guildId);
     }
   }
@@ -458,6 +468,148 @@ export class StandupBot {
     }
   }
 
+  // ── Resume after restart ───────────────────────────────────────────────
+
+  /** Rehydrate in-memory sessions that were persisted before the last
+   *  process restart. Rejoins the voice channel and continues recording
+   *  into the same DB row (resumed_count is bumped). Stale rows whose
+   *  voice channel is gone or empty are deleted. */
+  private async resumeActiveSessions() {
+    const rows = this.store.listActiveSessions();
+    if (rows.length === 0) return;
+    console.log(`[bot] Resuming ${rows.length} active session(s) from disk…`);
+
+    for (const row of rows) {
+      try {
+        const guild = await this.client.guilds.fetch(row.guild_id).catch(() => null);
+        if (!guild) {
+          console.warn(`[bot] Resume: guild ${row.guild_id} not accessible — dropping row.`);
+          this.store.deleteActiveSession(row.guild_id);
+          continue;
+        }
+
+        const channel = await guild.channels.fetch(row.channel_id).catch(() => null);
+        const voiceChannel = channel && "members" in channel ? (channel as VoiceChannel) : null;
+        if (!voiceChannel) {
+          console.warn(`[bot] Resume: voice channel ${row.channel_id} gone — dropping row.`);
+          this.store.deleteActiveSession(row.guild_id);
+          continue;
+        }
+
+        const humans = [...voiceChannel.members.values()].filter((m) => !m.user.bot);
+        if (humans.length === 0) {
+          console.log(`[bot] Resume: voice channel is empty — session ended while down. Dropping row.`);
+          this.store.deleteActiveSession(row.guild_id);
+          continue;
+        }
+
+        const textChannel = await this.client.channels
+          .fetch(row.text_channel_id)
+          .catch(() => null);
+
+        const session: SessionMeta = {
+          type: row.type,
+          startedAt: new Date(row.started_at),
+          channelId: row.channel_id,
+          textChannelId: row.text_channel_id,
+          lines: [],
+          inflight: 0,
+          queue: [],
+          drainPromise: null,
+          drainResolve: null,
+          focusedIssue: row.focused_issue,
+          presenter: row.presenter,
+          activeParticipantIndex: row.active_participant_index,
+          activityClients: new Set(),
+          connectedUsers: new Map(),
+          voiceMembers: new Map(),
+          focusedDetailIssue: row.focused_detail_issue,
+          issueRepo: row.issue_repo,
+          hadActivity: false,
+          issueMeta: new Map(),
+        };
+        for (const l of this.store.getActiveSessionLines(row.guild_id)) {
+          session.lines.push({
+            speaker: l.speaker,
+            userId: l.user_id,
+            text: l.text,
+            startedAt: l.started_at,
+            issueNumber: l.issue_number,
+          });
+        }
+        for (const m of this.store.getActiveSessionIssueMeta(row.guild_id)) {
+          session.issueMeta.set(m.issue_number, { title: m.title, state: m.state });
+        }
+        this.activeSessions.set(row.guild_id, session);
+        this.snapshotVoiceMembers(session, voiceChannel);
+
+        // Synthetic interaction used by auto-stop paths — no followUp, just
+        // a channel reference so summary/banner messages can fall through
+        // to textChannelId-based posting.
+        const resumedShim: any = {
+          guildId: row.guild_id,
+          channelId: row.text_channel_id,
+          channel: textChannel,
+        };
+
+        await this.recorder.start(voiceChannel, {
+          onUtterance: (u) => this.enqueueUtterance(row.guild_id, u),
+          onTimeout: () => {
+            console.warn("[bot] Auto-stop triggered by timeout (resumed session).");
+            this.autoStop(resumedShim, row.guild_id);
+          },
+          onDisconnect: (reason) => {
+            console.error(`[bot] Voice disconnected (resumed session): ${reason}`);
+            this.autoStop(resumedShim, row.guild_id);
+          },
+          onSpeakingChange: (userId, displayName, speaking) => {
+            this.broadcastToActivity(row.guild_id, {
+              type: "speaker",
+              userId,
+              name: displayName,
+              speaking,
+            });
+          },
+        });
+
+        this.store.saveActiveSession({ ...row, resumed_count: row.resumed_count + 1 });
+
+        const elapsedMin = Math.round((Date.now() - session.startedAt.getTime()) / 60_000);
+        const kind = row.type === "meeting" ? "meeting" : "standup";
+        const banner =
+          `🔄 Recording resumed in **${voiceChannel.name}** after restart ` +
+          `(${elapsedMin}m elapsed, ${session.lines.length} lines preserved). ` +
+          `A few seconds of audio may have been lost. Use \`/${kind} stop\` when done.`;
+        if (textChannel && "send" in textChannel) {
+          try { await (textChannel as any).send(banner); } catch { /* best-effort */ }
+        }
+        console.log(`[bot] Resumed ${row.type} session for guild ${row.guild_id}.`);
+      } catch (e: any) {
+        console.error(`[bot] Resume failed for guild ${row.guild_id}:`, e.message);
+        this.activeSessions.delete(row.guild_id);
+        this.store.deleteActiveSession(row.guild_id);
+      }
+    }
+  }
+
+  // ── Session persistence helpers ────────────────────────────────────────
+
+  private persistSessionStart(guildId: string, session: SessionMeta) {
+    this.store.saveActiveSession({
+      guild_id: guildId,
+      type: session.type,
+      channel_id: session.channelId,
+      text_channel_id: session.textChannelId,
+      started_at: session.startedAt.toISOString(),
+      issue_repo: session.issueRepo,
+      focused_issue: session.focusedIssue,
+      focused_detail_issue: session.focusedDetailIssue,
+      presenter: session.presenter,
+      active_participant_index: session.activeParticipantIndex,
+      resumed_count: 0,
+    });
+  }
+
   // ── Concurrency-limited transcription queue ────────────────────────────
 
   private enqueueUtterance(guildId: string, utterance: Utterance) {
@@ -512,6 +664,13 @@ export class StandupBot {
           issueNumber: issueAtTime,
         };
         session.lines.push(line);
+        this.store.appendActiveSessionLine(guildId, {
+          speaker: line.speaker,
+          user_id: line.userId,
+          text: line.text,
+          started_at: line.startedAt,
+          issue_number: line.issueNumber,
+        });
 
         // Broadcast to Activity clients
         this.broadcastToActivity(guildId, {
@@ -582,6 +741,7 @@ export class StandupBot {
     };
     this.activeSessions.set(guildId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
+    this.persistSessionStart(guildId, session);
 
     try {
       await this.recorder.start(voiceChannel, {
@@ -632,6 +792,7 @@ export class StandupBot {
       });
     } catch (e: any) {
       this.activeSessions.delete(guildId);
+      this.store.deleteActiveSession(guildId);
       await interaction.followUp(`Failed to start recording: ${e.message}`);
     }
   }
@@ -707,6 +868,7 @@ export class StandupBot {
     };
     this.activeSessions.set(guildId, session);
     this.snapshotVoiceMembers(session, voiceChannel);
+    this.persistSessionStart(guildId, session);
 
     try {
       await this.recorder.start(voiceChannel, {
@@ -736,6 +898,7 @@ export class StandupBot {
       );
     } catch (e: any) {
       this.activeSessions.delete(guildId);
+      this.store.deleteActiveSession(guildId);
       await interaction.followUp(`Failed to start recording: ${e.message}`);
     }
   }
@@ -811,6 +974,7 @@ export class StandupBot {
     }
 
     this.activeSessions.delete(guildId);
+    this.store.deleteActiveSession(guildId);
 
     if (!session || session.lines.length === 0) {
       try {
