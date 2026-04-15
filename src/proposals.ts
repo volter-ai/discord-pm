@@ -28,6 +28,9 @@ export interface GenerateInput {
     startedAtMs: number;
   }>;
   knownProposals: Proposal[];
+  /** Issues the session has already looked at — used so Claude can avoid
+   *  proposing a create_issue that duplicates an existing one. */
+  knownIssues: Array<{ number: number; title: string; state: string }>;
   repo: string;
   /** GitHub logins the bot may assign issues to. */
   assignableUsers: string[];
@@ -53,14 +56,13 @@ Return ONLY valid JSON matching this schema (no markdown fences, no prose):
 {
   "proposals": [
     {
-      "action_type": "close_issue" | "reopen_issue" | "comment" | "reassign" | "set_labels" | "create_issue",
+      "action_type": "close_issue" | "reopen_issue" | "comment" | "reassign" | "create_issue",
       "target_issue": 142 | null,
       "payload": {
         // close_issue: { "reason": "completed" | "not_planned" }
         // reopen_issue: {}
         // comment: { "body": "string" }
         // reassign: { "assignees": ["login"] }
-        // set_labels: { "addLabels": ["label"], "removeLabels": ["label"] }
         // create_issue: { "title": "string", "newBody": "string", "newAssignees": ["login"] }
         // Optionally include "reasoning": "string (<=160 chars)"
       },
@@ -74,11 +76,12 @@ Rules:
 - Max 3 proposals per call. Prefer zero if the conversation doesn't clearly warrant an action.
 - Only propose actions directly grounded in the transcript segments.
 - target_issue must be the focused issue's number, or null for create_issue (never invent unrelated issue numbers).
-- When you see a prior proposal already covers the same action with the same payload, do not emit it again.
+- When a known_proposal already covers the same action with the same payload, do not emit it again — the server will reject duplicates anyway.
 - When your new proposal refines or corrects a prior one, set "supersedes" to that proposal's id and emit the improved version.
+- Before emitting create_issue, check known_issues: if an existing open issue already covers the same work, propose a comment on that issue instead of creating a duplicate.
 - Comment bodies should be 1-3 sentences, factual, starting like "Standup ${todayIso()}: …".
 - create_issue bodies must include enough context for an engineer to pick up the work blind.
-- Be conservative with reassign and set_labels — only propose when the speaker clearly asks for it.
+- Be conservative with reassign — only propose when the speaker clearly asks for it.
 - Never propose destructive actions beyond what the schema allows (no deleting, no merging PRs).`;
 
 function todayIso(): string {
@@ -116,7 +119,16 @@ export class ProposalGenerator {
     const knownIds = new Set(input.knownProposals.map((p) => p.id));
     const segIds = new Set(input.recentSegments.map((s) => s.id));
 
-    return (parsed.proposals as any[])
+    // Dedup signature for pending/edited known proposals: same action_type,
+    // same target_issue, same canonical payload JSON. Affirmed/executed/dismissed
+    // proposals are not included — those are resolved and a new suggestion is fair.
+    const dupSignatures = new Set(
+      input.knownProposals
+        .filter((p) => p.state === "pending" || p.state === "edited")
+        .map(proposalSignature),
+    );
+
+    const generated = (parsed.proposals as any[])
       .filter((p) => typeof p === "object" && p && isValidActionType(p.action_type))
       .map<GeneratedProposal>((p) => ({
         action_type: p.action_type as ProposalActionType,
@@ -137,16 +149,39 @@ export class ProposalGenerator {
         if (p.action_type !== "create_issue" && p.target_issue == null) return false;
         return true;
       });
+
+    const kept: GeneratedProposal[] = [];
+    for (const g of generated) {
+      const sig = proposalSignature(g);
+      if (dupSignatures.has(sig)) {
+        console.log(`[proposals] Dropped dup of existing pending proposal: ${sig}`);
+        continue;
+      }
+      dupSignatures.add(sig);
+      kept.push(g);
+    }
+    return kept;
   }
 }
 
+/** Signature for dedup: action_type + target_issue + payload (ignoring the
+ *  reasoning field, which is cosmetic and phrased differently each call). */
+function proposalSignature(p: {
+  action_type: ProposalActionType;
+  target_issue: number | null;
+  payload: ProposalPayload;
+}): string {
+  const { reasoning: _r, ...meaningful } = p.payload;
+  return `${p.action_type}|${p.target_issue ?? "null"}|${JSON.stringify(meaningful)}`;
+}
+
 function isValidActionType(x: any): x is ProposalActionType {
+  // set_labels is intentionally excluded — re-labeling power is disabled (#66).
   return (
     x === "close_issue" ||
     x === "reopen_issue" ||
     x === "comment" ||
     x === "reassign" ||
-    x === "set_labels" ||
     x === "create_issue"
   );
 }
@@ -168,14 +203,6 @@ function normalizePayload(t: ProposalActionType, raw: any): ProposalPayload {
         ? raw.assignees.filter((a: any) => typeof a === "string")
         : [];
       break;
-    case "set_labels":
-      out.addLabels = Array.isArray(raw?.addLabels)
-        ? raw.addLabels.filter((l: any) => typeof l === "string")
-        : [];
-      out.removeLabels = Array.isArray(raw?.removeLabels)
-        ? raw.removeLabels.filter((l: any) => typeof l === "string")
-        : [];
-      break;
     case "create_issue":
       out.title = typeof raw?.title === "string" ? raw.title : "";
       out.newBody = typeof raw?.newBody === "string" ? raw.newBody : "";
@@ -195,6 +222,7 @@ function buildUserPayload(input: GenerateInput): string {
       repo: input.repo,
       trigger: input.trigger,
       focused_issue: input.focusedIssue,
+      known_issues: input.knownIssues,
       assignable_users: input.assignableUsers,
       transcript_segments: clipped.map((s) => ({
         id: s.id,

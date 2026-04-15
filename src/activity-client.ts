@@ -1739,8 +1739,12 @@ function getActionBarRoot(): HTMLElement {
 }
 
 function liveProposals(): ProposalWire[] {
+  // set_labels is disabled (#66); filter stale historical rows out of the UI.
   return proposals.filter(
-    (p) => p.state !== "dismissed" && p.supersededBy == null,
+    (p) =>
+      p.state !== "dismissed" &&
+      p.supersededBy == null &&
+      p.actionType !== "set_labels",
   );
 }
 
@@ -1822,11 +1826,17 @@ function renderProposalCard(p: ProposalWire): string {
     ? ""
     : `<button class="proposal-dismiss" data-action="dismiss" title="Dismiss">×</button>`;
 
+  const targetLink =
+    p.targetIssue != null
+      ? `<a class="proposal-target-link" href="https://github.com/${escapeHtml(p.repo)}/issues/${p.targetIssue}" target="_blank" rel="noopener">#${p.targetIssue}</a>`
+      : "";
+
   return `
     <div class="proposal-card state-${p.state}" data-proposal-id="${p.id}" data-version="${p.version}" data-locked="${locked ? 1 : 0}" data-expanded="${expanded ? 1 : 0}">
       <div class="proposal-summary" data-action="toggle">
         <span class="proposal-chevron">${chevron}</span>
         <span class="proposal-type">${escapeHtml(actionTypeLabel(p.actionType))}</span>
+        ${targetLink}
         <span class="proposal-summary-text">${escapeHtml(summary)}</span>
         <span class="proposal-summary-spacer"></span>
         ${status}
@@ -1841,29 +1851,28 @@ function renderProposalCard(p: ProposalWire): string {
   `;
 }
 
-/** One-line human-readable preview of a proposal's current payload. */
+/** One-line human-readable preview of a proposal's payload. The target issue
+ *  number is rendered separately as a link in renderProposalCard — don't
+ *  prefix it here. */
 function proposalSummary(p: ProposalWire): string {
-  const target = p.targetIssue != null ? `#${p.targetIssue}` : "";
   const pay = p.payload;
   switch (p.actionType) {
     case "close_issue":
-      return `Close ${target}${pay.reason === "not_planned" ? " (not planned)" : ""}`.trim();
+      return pay.reason === "not_planned" ? "(not planned)" : "";
     case "reopen_issue":
-      return `Reopen ${target}`.trim();
+      return "";
     case "comment": {
       const body = (pay.body ?? "").replace(/\s+/g, " ").trim();
-      const preview = body.length > 90 ? body.slice(0, 90) + "…" : body;
-      return preview ? `${target}: ${preview}` : target || "Comment";
+      return body.length > 90 ? body.slice(0, 90) + "…" : body;
     }
     case "reassign": {
       const who = (pay.assignees ?? []).map((a) => "@" + a).join(", ");
-      return `${target} → ${who || "(none)"}`.trim();
+      return `→ ${who || "(none)"}`;
     }
     case "set_labels": {
       const adds = (pay.addLabels ?? []).map((l) => "+" + l);
       const removes = (pay.removeLabels ?? []).map((l) => "−" + l);
-      const parts = [...adds, ...removes].join(", ");
-      return `${target}: ${parts || "(no changes)"}`.trim();
+      return [...adds, ...removes].join(", ") || "(no changes)";
     }
     case "create_issue":
       return pay.title ? pay.title : "(untitled)";

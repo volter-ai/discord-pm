@@ -343,6 +343,8 @@ const ACTIVITY_CSS = `
   .proposal-target{color:#94a3b8;font-family:monospace}
   .proposal-target a{color:#c7d2fe;text-decoration:none}
   .proposal-target a:hover{text-decoration:underline}
+  .proposal-target-link{color:#c7d2fe;font-family:monospace;text-decoration:none;flex-shrink:0}
+  .proposal-target-link:hover{text-decoration:underline}
   .proposal-summary-text{color:#cbd5e1;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .proposal-summary-spacer{flex-shrink:0}
   .proposal-reasoning{color:#94a3b8;font-size:.75rem;font-style:italic;padding:0 .65rem .35rem}

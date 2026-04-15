@@ -40,7 +40,6 @@ import {
   createComment,
   createIssue,
   assignIssue,
-  setLabels,
 } from "./github";
 import { USERS } from "./users";
 
@@ -144,12 +143,28 @@ interface SessionMeta {
 /** Drain timeout: 5 minutes max wait for transcriptions after stop. */
 const DRAIN_TIMEOUT_MS = 300_000;
 
-/** Min gap between proposal evaluations for the same issue. Prevents rapid-fire
- *  calls when users browse the board. */
-const PROPOSAL_MIN_DEBOUNCE_MS = 8_000;
-/** Fallback eval cadence: re-evaluate any focused issue whose eval is older than
- *  this threshold (handles long monologues on one issue). */
-const PROPOSAL_FALLBACK_STALE_MS = 60_000;
+/**
+ * Minimum gap between proposal evaluations for the same bucket (focused issue
+ * or general discussion). A focus_change or speaker_change event arriving sooner
+ * than this after the prior eval is silently dropped. Prevents rapid-fire calls
+ * when users browse the board or speakers trade off quickly. (30 seconds)
+ */
+const PROPOSAL_MIN_DEBOUNCE_MS = 30_000;
+/**
+ * Idle threshold that triggers a forced re-evaluation. If no focus_change or
+ * speaker_change has fired an eval for this bucket in this long, the fallback
+ * timer (see PROPOSAL_FALLBACK_TIMER_MS) forces one so long monologues on a
+ * single issue still surface proposals. Distinct from the debounce: that one
+ * caps how often we may eval; this one guarantees we eventually do. (3 minutes)
+ */
+const PROPOSAL_FALLBACK_STALE_MS = 180_000;
+/**
+ * How often the background fallback timer wakes to check whether the stale
+ * threshold above has been crossed. Must be meaningfully smaller than
+ * PROPOSAL_FALLBACK_STALE_MS so we catch staleness promptly without burning
+ * cycles between meaningful checks. (15 seconds)
+ */
+const PROPOSAL_FALLBACK_TIMER_MS = 15_000;
 /** Chris's always-affirm admin Discord ID (from src/users.ts USERS.careid). */
 const ADMIN_DISCORD_ID = "913513159329980447";
 /** Map sentinel for the "general discussion" proposal bucket (focusedIssue=null). */
@@ -1495,7 +1510,7 @@ export class StandupBot {
     return this.store.listActiveProposalsForStandup(session.standupId);
   }
 
-  /** Start the 10s fallback scanner that re-evaluates long-monologue issues.
+  /** Start the fallback scanner that re-evaluates long-monologue issues.
    *  Also fires on the "general discussion" bucket (focusedIssue null) so
    *  create_issue proposals surface even when nobody clicked a card. */
   private startProposalFallbackTimer(session: SessionMeta) {
@@ -1508,7 +1523,7 @@ export class StandupBot {
       if (Date.now() - lastEval >= PROPOSAL_FALLBACK_STALE_MS) {
         this.maybeEvaluateProposals(session, bucket, "fallback_60s");
       }
-    }, 10_000);
+    }, PROPOSAL_FALLBACK_TIMER_MS);
   }
 
   private stopProposalFallbackTimer(session: SessionMeta) {
@@ -1593,6 +1608,13 @@ export class StandupBot {
       .listActiveProposalsForStandup(session.standupId)
       .filter((p) => p.focused_issue === bucket);
 
+    // Dedup context for create_issue: any issue this session has ever loaded
+    // metadata for. Not exhaustive of the repo, but covers anything the
+    // standup has touched.
+    const knownIssues = Array.from(session.issueMeta.entries()).map(
+      ([number, m]) => ({ number, title: m.title, state: m.state }),
+    );
+
     const assignableUsers = Object.keys(USERS);
 
     let generated;
@@ -1605,6 +1627,7 @@ export class StandupBot {
           : null,
         recentSegments,
         knownProposals: known,
+        knownIssues,
         repo,
         assignableUsers,
         trigger,
@@ -1774,9 +1797,9 @@ export class StandupBot {
         return { url: `https://github.com/${repo}/issues/${p.target_issue}` };
       }
       case "set_labels": {
-        if (p.target_issue == null) throw new Error("set_labels: missing target_issue");
-        await setLabels(repo, p.target_issue, { add: p.payload.addLabels ?? [], remove: p.payload.removeLabels ?? [] });
-        return { url: `https://github.com/${repo}/issues/${p.target_issue}` };
+        // Re-labeling power is disabled (#66). Any stored set_labels proposal
+        // is a historical row — reject rather than execute.
+        throw new Error("set_labels is disabled");
       }
       case "create_issue": {
         const title = (p.payload.title ?? "").trim();
