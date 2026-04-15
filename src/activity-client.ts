@@ -219,8 +219,13 @@ function cacheDetail(key: string, value: any) {
 }
 
 // ── Sync / Freestyle state ──────────────────────────────────────────────────
-/** Whether this client is following the presenter (synced mode). Default true. */
-let syncMode = true;
+/** Whether this client is following the presenter (synced mode). Defaults to
+ *  freestyle (#63) — sync only engages when a presenter actually exists, and
+ *  is auto-applied the first time we observe one. */
+let syncMode = false;
+/** Set true once we've observed a presenter at least once, so we don't
+ *  re-auto-engage sync after the user manually enters freestyle. */
+let presenterObserved = false;
 /** Discord user ID of the current presenter, or null if nobody has controls. */
 let presenterUserId: string | null = null;
 /** Display name of the current presenter. */
@@ -595,9 +600,17 @@ function handleServerMessage(msg: ServerMessage) {
 
     case "state": {
       // Track who the presenter is — needed for sync badge + permission checks
+      const prevPresenterUserId = presenterUserId;
       presenterUserId = msg.presenter;
       presenterName = msg.presenterName ?? null;
       watcherNames = msg.watcherNames ?? [];
+      // Freestyle default (#63): auto-engage sync the first time a presenter
+      // appears for non-presenter clients. After that, the user is in charge —
+      // entering freestyle (clicking around, etc.) sticks.
+      if (presenterUserId && !prevPresenterUserId && !presenterObserved && !isPresenter()) {
+        syncMode = true;
+      }
+      if (presenterUserId) presenterObserved = true;
       if (Array.isArray((msg as any).proposals)) {
         proposals = (msg as any).proposals as ProposalWire[];
         renderActionBar();

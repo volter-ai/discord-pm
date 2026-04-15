@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m discord_pm 2>&1)",
+      "Bash(python3 -m discord_pm 2>&1)",
+      "Bash(which python3 && python3 --version && which python3.11 2>/dev/null && python3.11 --version 2>/dev/null)"
+    ]
+  }
+}

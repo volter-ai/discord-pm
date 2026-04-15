@@ -880,11 +880,16 @@ export function createActivityApp(
 
               function registerClient(ws: any) {
                 // Bind to the session running in the Activity's voice channel
-                // (per-channel keying, #61). Falls back to the first active
-                // session if the client didn't send a channelId — preserves
-                // the legacy single-standup case.
+                // (per-channel keying, #61). No fallback: if the client doesn't
+                // send a recognised channelId we leave them unbound rather than
+                // risk attaching them to the wrong session (#62).
                 const requestedChannelId = typeof msg.channelId === "string" ? msg.channelId : null;
                 const session = bot.getSessionForChannel(requestedChannelId);
+                console.log(
+                  `[activity] WS bind: requestedChannelId=${requestedChannelId ?? "null"} ` +
+                  `→ ${session ? `session.channelId=${session.channelId} guild=${session.meta.guildId} type=${session.meta.type}` : "no session"} ` +
+                  `userId=${clientUserId ?? "null"}`,
+                );
                 if (session) {
                   channelId = session.channelId;
                   bot.addActivityClient(channelId, ws, clientUserId, clientUsername);
@@ -939,15 +944,26 @@ export function createActivityApp(
 
             if (!authenticated) return;
 
-            if (msg.type === "focus" && channelId) {
+            // Freestyle mode (#63): navigation messages (focus/tab/detail/
+            // scroll/detailScroll) only relay when the sender is the current
+            // presenter. With no presenter, every participant's view is
+            // independent. Take-control ("controls") is the exception — it
+            // promotes the sender into the presenter role.
+            const isPresenter = (() => {
+              if (!channelId || !clientUserId) return false;
+              const s = bot.getSessionForChannel(channelId);
+              return !!s && s.meta.presenter === clientUserId;
+            })();
+
+            if (msg.type === "focus" && channelId && isPresenter) {
               bot.setFocusedIssue(channelId, msg.issueNumber ?? null, msg.issueTitle, msg.issueState);
             }
 
-            if (msg.type === "tab" && channelId && typeof msg.participantIndex === "number") {
+            if (msg.type === "tab" && channelId && isPresenter && typeof msg.participantIndex === "number") {
               bot.setActiveTab(channelId, msg.participantIndex);
             }
 
-            if (msg.type === "detail" && channelId) {
+            if (msg.type === "detail" && channelId && isPresenter) {
               bot.setDetailPanel(channelId, msg.issueNumber ?? null);
             }
 
@@ -956,11 +972,11 @@ export function createActivityApp(
               bot.setPresenter(channelId, clientUserId);
             }
 
-            if (msg.type === "scroll" && channelId && typeof msg.scrollY === "number") {
+            if (msg.type === "scroll" && channelId && isPresenter && typeof msg.scrollY === "number") {
               bot.relayScroll(channelId, msg.scrollY);
             }
 
-            if (msg.type === "detailScroll" && channelId && typeof msg.scrollTop === "number") {
+            if (msg.type === "detailScroll" && channelId && isPresenter && typeof msg.scrollTop === "number") {
               bot.relayDetailScroll(channelId, msg.scrollTop);
             }
 
