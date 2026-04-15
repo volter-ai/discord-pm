@@ -39,3 +39,6 @@ htmlcov/
 .DS_Store
 node_modules/
 models/
+
+# Claude Code local settings
+.claude/
