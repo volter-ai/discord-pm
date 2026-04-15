@@ -257,6 +257,16 @@ export class StandupBot {
     return meta ? { channelId, meta } : null;
   }
 
+  /** First active session in this guild, or null. Used by the start-path
+   *  guard: a Discord bot can only be in one voice channel per guild at a
+   *  time, so only one session can record at a time per guild (#62). */
+  private findActiveSessionInGuild(guildId: string): { channelId: string; meta: SessionMeta } | null {
+    for (const [channelId, meta] of this.activeSessions) {
+      if (meta.guildId === guildId) return { channelId, meta };
+    }
+    return null;
+  }
+
   /** Resolve a channel's display name via Discord API. Used by the Activity
    *  picker to map voice channel → suggested standup. Returns null if the
    *  channel can't be fetched (unknown ID, permissions, bot not ready). */
@@ -839,8 +849,14 @@ export class StandupBot {
 
     const guildId = interaction.guildId!;
     const channelId = voiceChannel.id;
-    if (this.activeSessions.has(channelId)) {
-      return interaction.followUp(`A recording is already in progress in **${voiceChannel.name}**. Stop it first.`);
+    const existing = this.findActiveSessionInGuild(guildId);
+    if (existing) {
+      const existingChannel = this.client.channels.cache.get(existing.channelId);
+      const existingName = (existingChannel as any)?.name ?? `channel ${existing.channelId}`;
+      return interaction.followUp(
+        `A recording is already in progress in **${existingName}**. ` +
+        `One standup at a time per server — Discord only lets the bot be in one voice channel at a time. Stop the other one first.`,
+      );
     }
 
     const startedAt = new Date();
@@ -1025,8 +1041,14 @@ export class StandupBot {
 
     const guildId = interaction.guildId!;
     const channelId = voiceChannel.id;
-    if (this.activeSessions.has(channelId)) {
-      return interaction.followUp(`A recording is already in progress in **${voiceChannel.name}**. Stop it first.`);
+    const existing = this.findActiveSessionInGuild(guildId);
+    if (existing) {
+      const existingChannel = this.client.channels.cache.get(existing.channelId);
+      const existingName = (existingChannel as any)?.name ?? `channel ${existing.channelId}`;
+      return interaction.followUp(
+        `A recording is already in progress in **${existingName}**. ` +
+        `One recording at a time per server — Discord only lets the bot be in one voice channel at a time. Stop the other one first.`,
+      );
     }
 
     const session: SessionMeta = {
