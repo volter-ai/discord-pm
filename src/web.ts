@@ -309,6 +309,11 @@ const CSS = `
   .issue-section{background:#0f172a;border:1px solid #1e293b;border-radius:.5rem;padding:1rem;margin-bottom:.75rem}
   .issue-section h3{color:#c7d2fe;margin-bottom:.25rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
   .issue-section h3 a{color:#818cf8}
+  details.issue-section > summary{cursor:pointer;list-style-position:outside;padding:.1rem 0;color:#c7d2fe}
+  details.issue-section > summary::-webkit-details-marker{color:#64748b}
+  details.issue-section > summary > .issue-summary-content{display:inline-flex;align-items:center;gap:.5rem;flex-wrap:wrap;vertical-align:middle}
+  details.issue-section > summary .issue-num{color:#818cf8;font-weight:600}
+  details.issue-section[open] > summary{margin-bottom:.5rem}
   .issue-title-text{color:#e2e8f0;font-size:.9rem;font-weight:400;margin-bottom:.4rem}
   .issue-meta-row{display:flex;align-items:center;gap:.75rem;margin-bottom:.5rem;flex-wrap:wrap}
   .status-badge{display:inline-block;padding:.1rem .45rem;border-radius:.75rem;font-size:.72rem;font-weight:600;letter-spacing:.02em}
@@ -655,27 +660,31 @@ function detailPage(r: Row, segments: SegmentRow[], briefs: BriefRow[]) {
         const ghUrl = `https://github.com/${segRepo}/issues/${issueNum}`;
         const stateCls = issueState === "closed" ? "status-closed" : "status-open";
         const stateLabel = issueState === "closed" ? "closed" : "open";
-        const titleLine = issueTitle
-          ? `<div class="issue-title-text">${esc(issueTitle)}</div>`
+        const titleSpan = issueTitle
+          ? `<span class="issue-title-text">${esc(issueTitle)}</span>`
           : "";
-        const metaRow = `<div class="issue-meta-row">
-          <span class="status-badge ${stateCls}">${stateLabel}</span>
-          ${timeBadge}
-          <a class="issue-gh-link" href="${esc(ghUrl)}" target="_blank">View on GitHub ↗</a>
-        </div>`;
-        issueSections.push(`<div class="issue-section" id="${anchorId}">
-          <h3><a href="${esc(ghUrl)}" target="_blank">#${issueNum}</a></h3>
-          ${titleLine}
-          ${metaRow}
+        issueSections.push(`<details class="issue-section" id="${anchorId}">
+          <summary><span class="issue-summary-content">
+            <span class="issue-num">#${issueNum}</span>
+            ${titleSpan}
+            <span class="status-badge ${stateCls}">${stateLabel}</span>
+            ${timeBadge}
+          </span></summary>
+          <div class="issue-meta-row">
+            <a class="issue-gh-link" href="${esc(ghUrl)}" target="_blank">View on GitHub ↗</a>
+          </div>
           <div class="issue-speakers">${esc(speakers)}</div>
           ${snippets}
-        </div>`);
+        </details>`);
       } else {
-        issueSections.unshift(`<div class="issue-section" id="general-discussion">
-          <h3>General Discussion ${timeBadge}</h3>
+        issueSections.unshift(`<details class="issue-section" id="general-discussion">
+          <summary><span class="issue-summary-content">
+            <span class="issue-num">General Discussion</span>
+            ${timeBadge}
+          </span></summary>
           <div class="issue-speakers">${esc(speakers)}</div>
           ${snippets}
-        </div>`);
+        </details>`);
       }
     }
 
@@ -725,6 +734,20 @@ function detailPage(r: Row, segments: SegmentRow[], briefs: BriefRow[]) {
     <h2 id="full-transcript">Full Transcript <button class="copy-btn" id="copy-transcript" type="button">Copy</button></h2>
     <pre id="transcript-text">${esc(r.transcript)}</pre>
     <script>
+(function() {
+  function openHashTarget() {
+    if (!location.hash) return;
+    try {
+      var el = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+      if (el && el.tagName === 'DETAILS' && !el.open) {
+        el.open = true;
+        el.scrollIntoView({ block: 'start' });
+      }
+    } catch (e) {}
+  }
+  window.addEventListener('hashchange', openHashTarget);
+  openHashTarget();
+})();
 (function() {
   var btn = document.getElementById('copy-transcript');
   var pre = document.getElementById('transcript-text');
