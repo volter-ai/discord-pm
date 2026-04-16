@@ -56,13 +56,14 @@ Return ONLY valid JSON matching this schema (no markdown fences, no prose):
 {
   "proposals": [
     {
-      "action_type": "close_issue" | "reopen_issue" | "comment" | "reassign" | "create_issue",
+      "action_type": "close_issue" | "reopen_issue" | "comment" | "reassign" | "backlog" | "create_issue",
       "target_issue": 142 | null,
       "payload": {
         // close_issue: { "reason": "completed" | "not_planned" }
         // reopen_issue: {}
         // comment: { "body": "string" }
         // reassign: { "assignees": ["login"] }
+        // backlog: {} — the server resolves which "backlog*" label to apply
         // create_issue: { "title": "string", "newBody": "string", "newAssignees": ["login"] }
         // Optionally include "reasoning": "string (<=160 chars)"
       },
@@ -82,6 +83,7 @@ Rules:
 - Comment bodies should be 1-3 sentences, factual, starting like "Standup ${todayIso()}: …".
 - create_issue bodies must include enough context for an engineer to pick up the work blind.
 - Be conservative with reassign — only propose when the speaker clearly asks for it.
+- Propose "backlog" only when the speaker clearly defers the issue (e.g., "put that on the backlog", "not this sprint", "backlog it"). The server resolves the actual label name — you do not pick it.
 - Never propose destructive actions beyond what the schema allows (no deleting, no merging PRs).`;
 
 function todayIso(): string {
@@ -177,11 +179,14 @@ function proposalSignature(p: {
 
 function isValidActionType(x: any): x is ProposalActionType {
   // set_labels is intentionally excluded — re-labeling power is disabled (#66).
+  // The narrow "backlog" action (#75) is allowed: the server resolves which
+  // backlog* label to apply rather than letting the model pick freely.
   return (
     x === "close_issue" ||
     x === "reopen_issue" ||
     x === "comment" ||
     x === "reassign" ||
+    x === "backlog" ||
     x === "create_issue"
   );
 }
@@ -202,6 +207,9 @@ function normalizePayload(t: ProposalActionType, raw: any): ProposalPayload {
       out.assignees = Array.isArray(raw?.assignees)
         ? raw.assignees.filter((a: any) => typeof a === "string")
         : [];
+      break;
+    case "backlog":
+      // No payload fields — the server resolves the label.
       break;
     case "create_issue":
       out.title = typeof raw?.title === "string" ? raw.title : "";

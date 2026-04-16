@@ -40,6 +40,8 @@ import {
   createComment,
   createIssue,
   assignIssue,
+  listRepoLabels,
+  setLabels,
 } from "./github";
 import { USERS } from "./users";
 
@@ -1800,6 +1802,20 @@ export class StandupBot {
         // Re-labeling power is disabled (#66). Any stored set_labels proposal
         // is a historical row — reject rather than execute.
         throw new Error("set_labels is disabled");
+      }
+      case "backlog": {
+        if (p.target_issue == null) throw new Error("backlog: missing target_issue");
+        const labels = await listRepoLabels(repo);
+        // Prefer an exact "backlog" match; otherwise take the first substring match.
+        const lower = labels.map((l) => l.toLowerCase());
+        const exactIdx = lower.indexOf("backlog");
+        const substrIdx = lower.findIndex((l) => l.includes("backlog"));
+        const idx = exactIdx !== -1 ? exactIdx : substrIdx;
+        if (idx === -1) {
+          throw new Error(`No label containing "backlog" found in ${repo}`);
+        }
+        await setLabels(repo, p.target_issue, { add: [labels[idx]!] });
+        return { url: `https://github.com/${repo}/issues/${p.target_issue}` };
       }
       case "create_issue": {
         const title = (p.payload.title ?? "").trim();

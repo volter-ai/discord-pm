@@ -329,6 +329,20 @@ export async function reopenIssue(repo: string, issueNumber: number): Promise<{ 
   return { url: data.html_url ?? `https://github.com/${repo}/issues/${issueNumber}` };
 }
 
+/** List all label names defined on a repo. One page of 100 covers every repo
+ *  we care about — if this ever needs to paginate, add it then. */
+export async function listRepoLabels(repo: string): Promise<string[]> {
+  return withRetry("listRepoLabels", async () => {
+    const res = await fetch(`${GITHUB_API}/repos/${repo}/labels?per_page=100`, {
+      headers: headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`GitHub listRepoLabels ${res.status}: ${await res.text()}`);
+    const raw = await res.json();
+    return (raw ?? []).map((l: any) => l.name as string);
+  });
+}
+
 /** Add and/or remove labels on an existing issue. Uses GitHub's idempotent
  *  add-labels + delete-label-by-name endpoints; order is additions then
  *  removals so the final label set is deterministic. */

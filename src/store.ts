@@ -58,6 +58,7 @@ export type ProposalActionType =
   | "comment"
   | "reassign"
   | "set_labels"
+  | "backlog"
   | "create_issue";
 
 export type ProposalState =
