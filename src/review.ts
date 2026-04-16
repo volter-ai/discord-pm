@@ -53,6 +53,12 @@ export const STANDUPS: Record<string, StandupConfig> = {
     displayName: "Claude Yard",
     channelNameHints: ["claude yard", "claude-yard", "multi-claude"],
   },
+  "amp-discord-pm": {
+    repo: "volter-ai/discord-pm",
+    backlogLabel: "stage:backlogged",
+    displayName: "Amp - Discord PM",
+    channelNameHints: ["amp", "discord-pm", "discord pm"],
+  },
 };
 
 export const STANDUP_NAMES = Object.keys(STANDUPS);
