@@ -298,6 +298,34 @@ export class StandupBot {
     }
   }
 
+  /** Persist an Activity-generated assignee brief against any active standup
+   *  whose issueRepo matches. Called from /api/assignee-brief. No-ops when
+   *  there's no matching active session (e.g. brief loaded pre-start, or in a
+   *  channel that isn't currently running a standup). */
+  saveAssigneeBriefForRepo(
+    repo: string,
+    githubUser: string,
+    displayName: string | null,
+    brief: { headline: string; bullets: Array<{ text: string; issueRefs?: number[] }> },
+  ): void {
+    for (const meta of this.activeSessions.values()) {
+      if (meta.issueRepo === repo && meta.standupId != null) {
+        try {
+          this.store.saveBrief({
+            standup_id: meta.standupId,
+            github_user: githubUser,
+            display_name: displayName,
+            headline: brief.headline,
+            bullets: brief.bullets,
+          });
+        } catch (e: any) {
+          console.error("[bot] saveAssigneeBriefForRepo error:", e.message);
+        }
+        return;
+      }
+    }
+  }
+
   /** Summary of in-memory sessions that would be lost on restart. Review
    *  walkthroughs are state-free (encoded in Discord button customIds) and
    *  are not reported here. */

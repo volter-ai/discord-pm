@@ -38,6 +38,7 @@ import {
   type GitHubPR,
 } from "./github";
 import { Summarizer, type AssigneeBrief } from "./summarizer";
+import { resolveDisplayName } from "./users";
 import type { StandupBot } from "./bot";
 import { serializeProposal } from "./bot";
 
@@ -641,9 +642,15 @@ export function createActivityApp(
     const windowStart = sinceLastBusinessDayStart();
     const cacheKey = `${standupKey}:${assignee}:${windowStart}`;
 
+    const persistBrief = (brief: AssigneeBrief | null) => {
+      if (!brief) return;
+      bot.saveAssigneeBriefForRepo(config.repo, assignee, resolveDisplayName(assignee), brief);
+    };
+
     if (!refresh) {
       const cached = briefCache.get(cacheKey);
       if (cached && Date.now() < cached.expiresAt) {
+        persistBrief(cached.brief);
         return c.json({ brief: cached.brief, cached: true });
       }
     } else {
@@ -655,6 +662,7 @@ export function createActivityApp(
     if (inflight) {
       try {
         const brief = await inflight;
+        persistBrief(brief);
         return c.json({ brief, cached: true });
       } catch (e: any) {
         return c.json({ error: e.message || "Brief generation failed" }, 500);
@@ -675,6 +683,7 @@ export function createActivityApp(
     try {
       const brief = await promise;
       briefCache.set(cacheKey, { brief, expiresAt: Date.now() + BRIEF_CACHE_TTL_MS });
+      persistBrief(brief);
       return c.json({ brief });
     } catch (e: any) {
       console.error("[activity] Brief error:", e.message);

@@ -254,6 +254,23 @@ export class StandupStore {
       );
     `);
 
+    // Per-participant briefs generated in the Activity (headline + bullets).
+    // Written on /api/assignee-brief when an active standup matches the repo,
+    // so each transcript keeps a frozen copy of what the Activity showed.
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS standup_briefs (
+        standup_id   INTEGER NOT NULL,
+        github_user  TEXT NOT NULL,
+        display_name TEXT,
+        headline     TEXT NOT NULL,
+        bullets_json TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        PRIMARY KEY (standup_id, github_user),
+        FOREIGN KEY (standup_id) REFERENCES standups(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_standup_briefs_standup ON standup_briefs (standup_id);
+    `);
+
     // Live proposals surfaced during the meeting (#53).
     this.db.run(`
       CREATE TABLE IF NOT EXISTS proposals (
@@ -349,6 +366,50 @@ export class StandupStore {
 
   listActiveSessions(): ActiveSessionRow[] {
     return this.db.query(`SELECT * FROM active_sessions`).all() as ActiveSessionRow[];
+  }
+
+  // ── Per-standup assignee briefs ───────────────────────────────────────────
+
+  saveBrief(args: {
+    standup_id: number;
+    github_user: string;
+    display_name: string | null;
+    headline: string;
+    bullets: unknown;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO standup_briefs (standup_id, github_user, display_name, headline, bullets_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(standup_id, github_user) DO UPDATE SET
+        display_name = excluded.display_name,
+        headline     = excluded.headline,
+        bullets_json = excluded.bullets_json,
+        created_at   = excluded.created_at
+    `).run(
+      args.standup_id,
+      args.github_user.toLowerCase(),
+      args.display_name,
+      args.headline,
+      JSON.stringify(args.bullets ?? []),
+      new Date().toISOString(),
+    );
+  }
+
+  getBriefsForStandup(standupId: number): Array<{
+    github_user: string;
+    display_name: string | null;
+    headline: string;
+    bullets: Array<{ text: string; issueRefs?: number[] }>;
+  }> {
+    const rows = this.db
+      .query(`SELECT github_user, display_name, headline, bullets_json FROM standup_briefs WHERE standup_id = ?`)
+      .all(standupId) as Array<{ github_user: string; display_name: string | null; headline: string; bullets_json: string }>;
+    return rows.map((r) => ({
+      github_user: r.github_user,
+      display_name: r.display_name,
+      headline: r.headline,
+      bullets: safeParse(r.bullets_json, []) as Array<{ text: string; issueRefs?: number[] }>,
+    }));
   }
 
   appendActiveSessionLine(channelId: string, sessionStartedAt: string, line: ActiveSessionLine): void {

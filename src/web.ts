@@ -182,6 +182,33 @@ function getSegments(standupId: number): SegmentRow[] {
   }
 }
 
+interface BriefRow {
+  github_user: string;
+  display_name: string | null;
+  headline: string;
+  bullets: Array<{ text: string; issueRefs?: number[] }>;
+}
+
+function getBriefsForStandup(standupId: number): BriefRow[] {
+  const db = openDb();
+  if (!db) return [];
+  try {
+    const rows = db
+      .query(`SELECT github_user, display_name, headline, bullets_json FROM standup_briefs WHERE standup_id = ?`)
+      .all(standupId) as Array<{ github_user: string; display_name: string | null; headline: string; bullets_json: string }>;
+    return rows.map((r) => {
+      let bullets: BriefRow["bullets"] = [];
+      try { bullets = JSON.parse(r.bullets_json); } catch {}
+      return { github_user: r.github_user, display_name: r.display_name, headline: r.headline, bullets };
+    });
+  } catch {
+    // Table may not exist on older databases — treat as empty.
+    return [];
+  } finally {
+    db.close();
+  }
+}
+
 function parseParticipants(json: string) {
   try {
     return JSON.parse(json) as Array<{
@@ -292,6 +319,15 @@ const CSS = `
   .issue-speakers{color:#64748b;font-size:.82rem;margin-bottom:.5rem}
   .issue-snippet{font-size:.88rem;line-height:1.6;color:#cbd5e1}
   .toc{background:#1e293b;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:1rem;font-size:.875rem}
+  .page-toc{background:#1e293b;border-radius:.5rem;padding:.75rem 1rem;margin:1rem 0 1.25rem;font-size:.875rem}
+  .page-toc ol{list-style:decimal;padding-left:1.4rem;line-height:1.8;color:#94a3b8}
+  .page-toc ol li a{color:#a5b4fc}
+  .copy-btn{background:#1e293b;color:#a5b4fc;border:1px solid #334155;padding:.2rem .65rem;border-radius:.3rem;cursor:pointer;font-size:.72rem;font-weight:500;letter-spacing:.03em;text-transform:none;margin-left:.6rem;vertical-align:.08em}
+  .copy-btn:hover{background:#334155;color:#e2e8f0}
+  .brief-block{margin-bottom:.6rem}
+  .brief-headline{color:#c7d2fe;font-size:.88rem;font-weight:500;margin-bottom:.25rem}
+  .brief-label{color:#64748b;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.15rem}
+  .brief-refs{color:#64748b;font-size:.78rem;margin-left:.25rem}
   .toc-title{color:#94a3b8;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.4rem}
   .toc-table{width:100%;border-collapse:collapse;font-size:.83rem}
   .toc-table th{color:#64748b;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;padding:.3rem .5rem;text-align:left;border-bottom:1px solid #334155}
@@ -477,10 +513,31 @@ function suggestionsSection(id: number): string {
   `;
 }
 
-function detailPage(r: Row, segments: SegmentRow[]) {
+function detailPage(r: Row, segments: SegmentRow[], briefs: BriefRow[]) {
   const parts = parseParticipants(r.participants);
 
+  const briefByName = new Map<string, BriefRow>();
+  for (const b of briefs) {
+    if (b.display_name) briefByName.set(b.display_name.toLowerCase(), b);
+    briefByName.set(b.github_user.toLowerCase(), b);
+  }
+
   const participantBlocks = parts.map((p) => {
+    const brief = briefByName.get(p.name.toLowerCase());
+    const briefBlock = brief
+      ? `<div class="brief-block">
+           <p class="brief-label">Activity brief</p>
+           <p class="brief-headline">${esc(brief.headline)}</p>
+           ${brief.bullets?.length
+             ? `<ul>${brief.bullets.map((b) => {
+                 const refs = b.issueRefs?.length
+                   ? ` <span class="brief-refs">(${b.issueRefs.map((n) => `#${n}`).join(", ")})</span>`
+                   : "";
+                 return `<li>${esc(b.text)}${refs}</li>`;
+               }).join("")}</ul>`
+             : ""}
+         </div>`
+      : "";
     const did = p.did?.length
       ? `<p style="color:#64748b;font-size:.78rem;margin-bottom:.25rem">DID</p><ul>${p.did.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>`
       : "";
@@ -490,7 +547,7 @@ function detailPage(r: Row, segments: SegmentRow[]) {
     const blockers = p.blockers?.length
       ? `<p style="color:#fca5a5;font-size:.78rem;margin:0.5rem 0 .25rem">BLOCKERS</p><ul style="color:#fca5a5">${p.blockers.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>`
       : "";
-    return `<div class="participant"><h3>${esc(p.name)}</h3>${did}${willDo}${blockers}</div>`;
+    return `<div class="participant"><h3>${esc(p.name)}</h3>${briefBlock}${did}${willDo}${blockers}</div>`;
   }).join("\n");
 
   // Issue-aware transcript sections (if segments exist)
@@ -623,7 +680,7 @@ function detailPage(r: Row, segments: SegmentRow[]) {
     }
 
     issueTranscriptHtml = `
-      <h2>By Issue</h2>
+      <h2 id="by-issue">By Issue</h2>
       ${top3Html ? `<div class="top-issues">${top3Html}</div>` : ""}
       ${toc}
       ${issueSections.join("\n")}
@@ -632,6 +689,17 @@ function detailPage(r: Row, segments: SegmentRow[]) {
 
   const suggestionsHtml = suggestionsSection(r.id);
   const proposalsHtml = renderProposalsPane(r.id);
+
+  const pageTocItems: string[] = [
+    `<li><a href="#per-participant">Per Participant</a></li>`,
+  ];
+  if (proposalsHtml) pageTocItems.push(`<li><a href="#proposed-actions">Proposed Actions</a></li>`);
+  if (issueTranscriptHtml) pageTocItems.push(`<li><a href="#by-issue">Transcript by Section</a></li>`);
+  pageTocItems.push(`<li><a href="#full-transcript">Full Transcript</a></li>`);
+  const pageToc = `<div class="page-toc">
+    <div class="toc-title">On this page</div>
+    <ol>${pageTocItems.join("")}</ol>
+  </div>`;
 
   return page(`#${r.id}`, `
     <a class="back" href="/">← All transcripts</a>
@@ -643,7 +711,9 @@ function detailPage(r: Row, segments: SegmentRow[]) {
 
     ${speakerChartHtml}
 
-    <h2>Per Participant</h2>
+    ${pageToc}
+
+    <h2 id="per-participant">Per Participant</h2>
     ${participantBlocks || '<p class="empty">No participant data.</p>'}
 
     ${proposalsHtml}
@@ -652,8 +722,36 @@ function detailPage(r: Row, segments: SegmentRow[]) {
 
     ${suggestionsHtml}
 
-    <h2>Full Transcript</h2>
-    <pre>${esc(r.transcript)}</pre>
+    <h2 id="full-transcript">Full Transcript <button class="copy-btn" id="copy-transcript" type="button">Copy</button></h2>
+    <pre id="transcript-text">${esc(r.transcript)}</pre>
+    <script>
+(function() {
+  var btn = document.getElementById('copy-transcript');
+  var pre = document.getElementById('transcript-text');
+  if (!btn || !pre) return;
+  btn.addEventListener('click', function() {
+    var text = pre.innerText;
+    var done = function() {
+      btn.textContent = 'Copied!';
+      setTimeout(function() { btn.textContent = 'Copy'; }, 1800);
+    };
+    var fail = function() {
+      btn.textContent = 'Copy failed';
+      setTimeout(function() { btn.textContent = 'Copy'; }, 1800);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(fail);
+    } else {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';
+        document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); document.body.removeChild(ta); done();
+      } catch (e) { fail(); }
+    }
+  });
+})();
+    </script>
   `);
 }
 
@@ -684,7 +782,7 @@ function renderProposalsPane(standupId: number): string {
     return `<h3 style="color:#94a3b8;font-size:.85rem;margin-top:1rem">${label[state] ?? state} (${list.length})</h3>${cards}`;
   }).join("");
 
-  return `<h2>Proposed Actions</h2>${sections}`;
+  return `<h2 id="proposed-actions">Proposed Actions</h2>${sections}`;
 }
 
 function renderProposalDbCard(p: ProposalDbRow): string {
@@ -703,12 +801,14 @@ function renderProposalDbCard(p: ProposalDbRow): string {
     ? `<div style="color:#64748b;font-size:.8rem;font-style:italic;margin-bottom:.4rem">${esc(String(payload.reasoning))}</div>`
     : "";
   const payloadBlock = edited
-    ? `<details><summary style="cursor:pointer;color:#a5b4fc;font-size:.82rem">Edited from original</summary>
+    ? `<details><summary style="cursor:pointer;color:#a5b4fc;font-size:.82rem">Show payload (edited from original)</summary>
          <pre style="font-size:.75rem">${esc(JSON.stringify(original, null, 2))}</pre>
          <div style="color:#fbbf24;font-size:.75rem">→ Edited to:</div>
          <pre style="font-size:.75rem">${esc(JSON.stringify(payload, null, 2))}</pre>
        </details>`
-    : `<pre style="font-size:.75rem">${esc(JSON.stringify(payload, null, 2))}</pre>`;
+    : `<details><summary style="cursor:pointer;color:#a5b4fc;font-size:.82rem">Show payload</summary>
+         <pre style="font-size:.75rem">${esc(JSON.stringify(payload, null, 2))}</pre>
+       </details>`;
   const resultBlock = result?.url
     ? `<div style="font-size:.82rem;margin-top:.35rem">Result: <a href="${esc(String(result.url))}" target="_blank">${esc(String(result.url))}</a></div>`
     : result?.error
@@ -760,7 +860,8 @@ export function createWebApp(bot?: StandupBot): Hono {
     const row = getStandup(id);
     if (!row) return c.notFound();
     const segments = getSegments(id);
-    return c.html(detailPage(row, segments));
+    const briefs = getBriefsForStandup(id);
+    return c.html(detailPage(row, segments, briefs));
   });
 
   // Deploy-safety check: list in-memory sessions a restart would drop.
