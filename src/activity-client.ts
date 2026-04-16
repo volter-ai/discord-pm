@@ -56,7 +56,7 @@ interface IssuesResponse {
 // Live proposal types (#53) — mirror the server's serializeProposal shape.
 type ProposalActionType =
   | "close_issue" | "reopen_issue" | "comment"
-  | "reassign" | "set_labels" | "create_issue";
+  | "reassign" | "set_labels" | "backlog" | "create_issue";
 type ProposalState =
   | "pending" | "edited" | "affirmed"
   | "dismissed" | "executed" | "failed";
@@ -1102,20 +1102,23 @@ document.addEventListener("click", (e) => {
     const assignRepo = (target as HTMLElement).dataset.repo!;
     const assignIssueNum = (target as HTMLElement).dataset.issue!;
     const select = document.getElementById("assign-select") as HTMLSelectElement | null;
-    const assignee = select?.value;
-    if (!assignee) return;
+    const value = select?.value;
+    // "__none__" is the placeholder; empty string means unassign.
+    if (value === undefined || value === "__none__") return;
+    const isUnassign = value === "";
+    const originalLabel = isUnassign ? "Unassign" : "Assign";
 
     const btn = target as HTMLButtonElement;
-    btn.textContent = "Assigning...";
+    btn.textContent = isUnassign ? "Unassigning..." : "Assigning...";
     btn.disabled = true;
 
     fetch(`/api/issues/${encodeURIComponent(assignRepo)}/${assignIssueNum}/assign`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ assignee }),
+      body: JSON.stringify({ assignee: value }),
     }).then(async (res) => {
       if (res.ok) {
-        btn.textContent = "✓ Assigned";
+        btn.textContent = isUnassign ? "✓ Unassigned" : "✓ Assigned";
         // Invalidate cached detail so next open shows fresh assignees
         detailCache.delete(`${assignRepo}/${assignIssueNum}`);
       } else {
@@ -1124,7 +1127,7 @@ document.addEventListener("click", (e) => {
         btn.style.color = "#f87171";
         console.error("[assign] Error:", data.error);
         setTimeout(() => {
-          btn.textContent = "Assign";
+          btn.textContent = originalLabel;
           btn.style.color = "";
           btn.disabled = false;
         }, 3000);
@@ -1134,7 +1137,52 @@ document.addEventListener("click", (e) => {
       btn.textContent = "Failed";
       btn.style.color = "#f87171";
       setTimeout(() => {
-        btn.textContent = "Assign";
+        btn.textContent = originalLabel;
+        btn.style.color = "";
+        btn.disabled = false;
+      }, 3000);
+    });
+    return;
+  }
+
+  if (target.id === "btn-close-issue" || target.id === "btn-reopen-issue") {
+    const isReopen = target.id === "btn-reopen-issue";
+    const actionRepo = (target as HTMLElement).dataset.repo!;
+    const actionIssueNum = (target as HTMLElement).dataset.issue!;
+    const reasonSelect = document.getElementById("close-reason-select") as HTMLSelectElement | null;
+    const reason = reasonSelect?.value === "not_planned" ? "not_planned" : "completed";
+
+    const btn = target as HTMLButtonElement;
+    const originalLabel = isReopen ? "Reopen issue" : "Close issue";
+    btn.textContent = isReopen ? "Reopening..." : "Closing...";
+    btn.disabled = true;
+
+    const path = isReopen ? "reopen" : "close";
+    fetch(`/api/issues/${encodeURIComponent(actionRepo)}/${actionIssueNum}/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(isReopen ? {} : { reason }),
+    }).then(async (res) => {
+      if (res.ok) {
+        btn.textContent = isReopen ? "✓ Reopened" : "✓ Closed";
+        detailCache.delete(`${actionRepo}/${actionIssueNum}`);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        btn.textContent = "Failed";
+        btn.style.color = "#f87171";
+        console.error("[close] Error:", data.error);
+        setTimeout(() => {
+          btn.textContent = originalLabel;
+          btn.style.color = "";
+          btn.disabled = false;
+        }, 3000);
+      }
+    }).catch((err) => {
+      console.error("[close] Fetch error:", err);
+      btn.textContent = "Failed";
+      btn.style.color = "#f87171";
+      setTimeout(() => {
+        btn.textContent = originalLabel;
         btn.style.color = "";
         btn.disabled = false;
       }, 3000);
@@ -1510,12 +1558,29 @@ function renderDetailOverlay(detail: any) {
     <div class="detail-reassign">
       <span class="detail-reassign-label">Reassign to:</span>
       <select id="assign-select" class="assign-select">
-        <option value="">Select contributor...</option>
+        <option value="__none__">Select contributor...</option>
+        <option value="">— Unassign —</option>
         ${assignable.map(p => `<option value="${escapeHtml(p.githubUser!)}">${escapeHtml(p.name)} (@${escapeHtml(p.githubUser!)})</option>`).join("")}
       </select>
       <button class="btn-assign" id="btn-assign" data-repo="${escapeHtml(repo)}" data-issue="${detail.number}">Assign</button>
     </div>
   ` : "";
+
+  const closeActionHtml = `
+    <div class="detail-close-action">
+      ${detail.state === "open" ? `
+        <span class="detail-reassign-label">Close as:</span>
+        <select id="close-reason-select" class="assign-select">
+          <option value="completed">Completed</option>
+          <option value="not_planned">Not planned</option>
+        </select>
+        <button class="btn-close-issue" id="btn-close-issue" data-repo="${escapeHtml(repo)}" data-issue="${detail.number}">Close issue</button>
+      ` : `
+        <span class="detail-reassign-label">This issue is closed.</span>
+        <button class="btn-reopen-issue" id="btn-reopen-issue" data-repo="${escapeHtml(repo)}" data-issue="${detail.number}">Reopen issue</button>
+      `}
+    </div>
+  `;
 
   const overlay = document.createElement("div");
   overlay.className = "detail-overlay";
@@ -1532,6 +1597,7 @@ function renderDetailOverlay(detail: any) {
       ${commentsHtml ? `<div class="detail-comments-header">Comments (${detail.comments?.length ?? 0})</div>${commentsHtml}` : ""}
       <a class="detail-link" href="${escapeHtml(detail.url)}" target="_blank">View on GitHub</a>
       ${reassignHtml}
+      ${closeActionHtml}
     </div>
   `;
   document.body.appendChild(overlay);
@@ -1761,6 +1827,7 @@ function renderActionBar() {
   const handle = root.querySelector("#action-bar-handle") as HTMLButtonElement;
   const badge = root.querySelector("#action-bar-badge") as HTMLElement;
   const chevron = root.querySelector("#action-bar-chevron") as HTMLElement;
+  const label = root.querySelector(".action-bar-label") as HTMLElement;
 
   const live = liveProposals();
   const pend = pendingCount();
@@ -1771,6 +1838,13 @@ function renderActionBar() {
   handle.setAttribute("aria-expanded", actionBarOpen ? "true" : "false");
   drawer.classList.toggle("open", actionBarOpen);
   drawer.setAttribute("aria-hidden", actionBarOpen ? "false" : "true");
+
+  // Collapsed → bottom-right pill showing just the count; Expanded → full-width drawer (#71).
+  root.classList.toggle("expanded", actionBarOpen);
+  root.classList.toggle("collapsed", !actionBarOpen);
+  if (label) label.textContent = actionBarOpen ? "Action Bar" : "⚡";
+  const pillTitle = `${pend} pending proposal${pend === 1 ? "" : "s"} — click to open Action Bar`;
+  handle.setAttribute("title", actionBarOpen ? "Collapse Action Bar" : pillTitle);
 
   if (!actionBarOpen) return;
 
@@ -1790,6 +1864,7 @@ function actionTypeLabel(t: ProposalActionType): string {
     case "comment": return "Comment";
     case "reassign": return "Reassign";
     case "set_labels": return "Labels";
+    case "backlog": return "Backlog";
     case "create_issue": return "Create issue";
   }
 }
@@ -1830,6 +1905,13 @@ function renderProposalCard(p: ProposalWire): string {
     p.targetIssue != null
       ? `<a class="proposal-target-link" href="https://github.com/${escapeHtml(p.repo)}/issues/${p.targetIssue}" target="_blank" rel="noopener">#${p.targetIssue}</a>`
       : "";
+  const targetTitle =
+    p.targetIssue != null
+      ? (findIssue(p.targetIssue)?.title ?? "")
+      : "";
+  const targetTitleSpan = targetTitle
+    ? `<span class="proposal-target-title" title="${escapeHtml(targetTitle)}">${escapeHtml(targetTitle)}</span>`
+    : "";
 
   return `
     <div class="proposal-card state-${p.state}" data-proposal-id="${p.id}" data-version="${p.version}" data-locked="${locked ? 1 : 0}" data-expanded="${expanded ? 1 : 0}">
@@ -1837,6 +1919,7 @@ function renderProposalCard(p: ProposalWire): string {
         <span class="proposal-chevron">${chevron}</span>
         <span class="proposal-type">${escapeHtml(actionTypeLabel(p.actionType))}</span>
         ${targetLink}
+        ${targetTitleSpan}
         <span class="proposal-summary-text">${escapeHtml(summary)}</span>
         <span class="proposal-summary-spacer"></span>
         ${status}
@@ -1874,6 +1957,8 @@ function proposalSummary(p: ProposalWire): string {
       const removes = (pay.removeLabels ?? []).map((l) => "−" + l);
       return [...adds, ...removes].join(", ") || "(no changes)";
     }
+    case "backlog":
+      return "";
     case "create_issue":
       return pay.title ? pay.title : "(untitled)";
   }
@@ -1915,6 +2000,8 @@ function renderProposalBody(p: ProposalWire): string {
           <label>Remove labels (comma-separated)</label>
           <input type="text" data-field="removeLabels" value="${escapeHtml((pay.removeLabels ?? []).join(", "))}">
         </div>`;
+    case "backlog":
+      return "";
     case "create_issue":
       return `
         <div class="proposal-field">

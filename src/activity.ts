@@ -28,6 +28,8 @@ import {
   fetchUserAvatar,
   fetchIssueDetail,
   assignIssue,
+  closeIssue,
+  reopenIssue,
   fetchOpenPRsByAuthor,
   fetchPRDetail,
   fetchAssigneeUpdates,
@@ -270,6 +272,13 @@ const ACTIVITY_CSS = `
   .btn-assign{background:#4f46e5;color:white;border:none;padding:.35rem .75rem;border-radius:.375rem;cursor:pointer;font-size:.82rem;flex-shrink:0;transition:background .15s}
   .btn-assign:hover:not(:disabled){background:#4338ca}
   .btn-assign:disabled{opacity:.5;cursor:not-allowed}
+  .detail-close-action{display:flex;gap:.5rem;align-items:center;margin-top:.5rem;padding-top:.5rem}
+  .btn-close-issue{background:#7f1d1d;color:white;border:none;padding:.35rem .75rem;border-radius:.375rem;cursor:pointer;font-size:.82rem;flex-shrink:0;transition:background .15s}
+  .btn-close-issue:hover:not(:disabled){background:#991b1b}
+  .btn-close-issue:disabled{opacity:.5;cursor:not-allowed}
+  .btn-reopen-issue{background:#166534;color:white;border:none;padding:.35rem .75rem;border-radius:.375rem;cursor:pointer;font-size:.82rem;flex-shrink:0;transition:background .15s}
+  .btn-reopen-issue:hover:not(:disabled){background:#15803d}
+  .btn-reopen-issue:disabled{opacity:.5;cursor:not-allowed}
 
   /* Sync / Freestyle badge */
   .sync-badge{font-size:.72rem;padding:.15rem .45rem;border-radius:.25rem;font-weight:600;margin-left:.5rem}
@@ -317,18 +326,29 @@ const ACTIVITY_CSS = `
   .pr-file-diff{flex-shrink:0;font-family:monospace;font-size:.72rem}
   .detail-meta-state-merged{color:#a78bfa}
 
-  /* Live Action Bar (#53) — default-collapsed, slides up from bottom */
-  .action-bar{position:fixed;left:0;right:0;bottom:0;z-index:20;pointer-events:none;display:flex;flex-direction:column;align-items:stretch}
-  .action-bar .action-bar-inner{pointer-events:auto;background:rgba(15,23,42,.98);border-top:1px solid #312e81;box-shadow:0 -6px 24px rgba(0,0,0,.45)}
-  .action-bar-handle{display:flex;align-items:center;gap:.5rem;width:100%;padding:.45rem .75rem;background:#1e1b4b;color:#c7d2fe;border:none;border-top:1px solid #312e81;cursor:pointer;font-size:.82rem;font-weight:600;letter-spacing:.02em}
+  /* Live Action Bar (#53, #71) — collapsed = bottom-right pill; expanded = bottom drawer */
+  .action-bar{position:fixed;z-index:20;pointer-events:none;display:flex;flex-direction:column;align-items:stretch}
+  /* Expanded: full-width drawer pinned to bottom */
+  .action-bar.expanded{left:0;right:0;bottom:0}
+  /* Collapsed: small pill in bottom-right corner */
+  .action-bar.collapsed{right:.75rem;bottom:.75rem;left:auto;align-items:flex-end}
+  .action-bar .action-bar-inner{pointer-events:auto;background:rgba(15,23,42,.98)}
+  .action-bar.expanded .action-bar-inner{border-top:1px solid #312e81;box-shadow:0 -6px 24px rgba(0,0,0,.45)}
+  .action-bar.collapsed .action-bar-inner{background:transparent;box-shadow:none}
+  .action-bar-handle{display:flex;align-items:center;gap:.5rem;padding:.45rem .75rem;background:#1e1b4b;color:#c7d2fe;border:none;cursor:pointer;font-size:.82rem;font-weight:600;letter-spacing:.02em}
   .action-bar-handle:hover{background:#2e27a0}
   .action-bar-handle.has-pending{background:#312e81;color:#e0e7ff}
+  .action-bar.expanded .action-bar-handle{width:100%;border-top:1px solid #312e81}
+  .action-bar.collapsed .action-bar-handle{border-radius:999px;border:1px solid #312e81;box-shadow:0 4px 12px rgba(0,0,0,.35);padding:.4rem .85rem}
   .action-bar-badge{min-width:1.1rem;padding:.05rem .35rem;background:#4f46e5;color:white;border-radius:999px;font-size:.72rem;text-align:center;display:inline-block}
-  .action-bar-badge[data-count="0"]{display:none}
+  .action-bar.expanded .action-bar-badge[data-count="0"]{display:none}
+  .action-bar.collapsed .action-bar-badge{background:#334155}
   .action-bar-label{flex:1;text-align:left}
   .action-bar-chevron{font-size:.7rem;color:#a5b4fc}
+  .action-bar.collapsed .action-bar-chevron{display:none}
   .action-bar-drawer{max-height:0;overflow:hidden;transition:max-height .18s ease}
   .action-bar-drawer.open{max-height:60vh;overflow-y:auto}
+  .action-bar.collapsed .action-bar-drawer{display:none}
   .action-bar-drawer-inner{padding:.6rem .75rem .9rem;display:flex;flex-direction:column;gap:.5rem}
   .action-bar-empty{color:#64748b;font-size:.82rem;text-align:center;padding:.75rem}
   .proposal-card{background:#1e293b;border:1px solid #334155;border-radius:.4rem;display:flex;flex-direction:column}
@@ -345,7 +365,8 @@ const ACTIVITY_CSS = `
   .proposal-target a:hover{text-decoration:underline}
   .proposal-target-link{color:#c7d2fe;font-family:monospace;text-decoration:none;flex-shrink:0}
   .proposal-target-link:hover{text-decoration:underline}
-  .proposal-summary-text{color:#cbd5e1;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .proposal-target-title{color:#e2e8f0;flex:2 1 0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .proposal-summary-text{color:#94a3b8;flex:1 1 0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .proposal-summary-spacer{flex-shrink:0}
   .proposal-reasoning{color:#94a3b8;font-size:.75rem;font-style:italic;padding:0 .65rem .35rem}
   .proposal-reasoning:empty{display:none}
@@ -816,13 +837,58 @@ export function createActivityApp(
     if (!validRepos.has(repo)) return c.json({ error: "Unknown repository" }, 403);
 
     const { assignee } = await c.req.json();
-    if (!assignee || typeof assignee !== "string") return c.json({ error: "Missing assignee" }, 400);
+    if (typeof assignee !== "string") return c.json({ error: "Missing assignee" }, 400);
+    // Empty string = unassign (clear all assignees).
+    const assignees = assignee === "" ? [] : [assignee];
 
     try {
-      await assignIssue(repo, number, [assignee]);
+      await assignIssue(repo, number, assignees);
       return c.json({ ok: true });
     } catch (e: any) {
       console.error("[activity] Assign issue error:", e.message);
+      return c.json({ error: "Internal server error" }, 500);
+    }
+  });
+
+  // Close an issue directly from the detail panel (#70).
+  app.post("/api/issues/:repo/:number/close", async (c) => {
+    if (!csrfOk(c)) return c.json({ error: "Forbidden" }, 403);
+
+    const repo = decodeURIComponent(c.req.param("repo"));
+    const number = parseInt(c.req.param("number"));
+    if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
+
+    const validRepos = new Set(Object.values(STANDUPS).map(s => s.repo));
+    if (!validRepos.has(repo)) return c.json({ error: "Unknown repository" }, 403);
+
+    const body = await c.req.json().catch(() => ({} as any));
+    const reason = body.reason === "not_planned" ? "not_planned" : "completed";
+
+    try {
+      const result = await closeIssue(repo, number, reason);
+      return c.json({ ok: true, url: result.url });
+    } catch (e: any) {
+      console.error("[activity] Close issue error:", e.message);
+      return c.json({ error: "Internal server error" }, 500);
+    }
+  });
+
+  // Reopen a closed issue from the detail panel (#70).
+  app.post("/api/issues/:repo/:number/reopen", async (c) => {
+    if (!csrfOk(c)) return c.json({ error: "Forbidden" }, 403);
+
+    const repo = decodeURIComponent(c.req.param("repo"));
+    const number = parseInt(c.req.param("number"));
+    if (!repo || isNaN(number)) return c.json({ error: "Invalid params" }, 400);
+
+    const validRepos = new Set(Object.values(STANDUPS).map(s => s.repo));
+    if (!validRepos.has(repo)) return c.json({ error: "Unknown repository" }, 403);
+
+    try {
+      const result = await reopenIssue(repo, number);
+      return c.json({ ok: true, url: result.url });
+    } catch (e: any) {
+      console.error("[activity] Reopen issue error:", e.message);
       return c.json({ error: "Internal server error" }, 500);
     }
   });
