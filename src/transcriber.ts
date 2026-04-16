@@ -2,12 +2,13 @@
  * Transcription service with API backends.
  *
  * Priority:
- *   1. OpenAI Whisper API  (if OPENAI_API_KEY set)
- *   2. Replicate Whisper   (if REPLICATE_API_TOKEN set)
+ *   1. Deepgram Nova-3 (batch) (if DEEPGRAM_API_KEY set) — fastest, cheapest
+ *   2. OpenAI Whisper API      (if OPENAI_API_KEY set)
+ *   3. Replicate Whisper       (if REPLICATE_API_TOKEN set)
  *
  * Local Whisper was removed — the ONNX fp32 model uses ~300-500MB of RAM,
  * which OOM-kills the process on a 1GB VM when combined with audio recording.
- * If both API backends are unavailable, the utterance is silently skipped
+ * If all API backends are unavailable, the utterance is silently skipped
  * rather than crashing the entire meeting.
  *
  * Input: mono 16kHz Float32Array PCM from Recorder.toMono16k()
@@ -37,6 +38,15 @@ export class Transcriber {
 
   private async doTranscribe(mono16k: Float32Array): Promise<string> {
 
+    // --- Deepgram backend (preferred: sub-second latency, Nova-3) ---
+    if (process.env.DEEPGRAM_API_KEY) {
+      try {
+        return await this.transcribeDeepgram(mono16k);
+      } catch (e) {
+        console.warn("[transcriber] Deepgram failed, falling back:", e);
+      }
+    }
+
     // --- OpenAI backend ---
     if (process.env.OPENAI_API_KEY) {
       try {
@@ -58,6 +68,33 @@ export class Transcriber {
     // No backends available — skip this utterance rather than OOM with local model
     console.warn("[transcriber] All backends unavailable — skipping utterance");
     return "";
+  }
+
+  private async transcribeDeepgram(mono16k: Float32Array): Promise<string> {
+    const wavBytes = float32ToWav(mono16k, 16000);
+
+    // Deepgram pre-recorded (batch) endpoint. Nova-3 is their current top model.
+    // smart_format gives punctuation + capitalization; filler_words=false drops um/uh.
+    const params = new URLSearchParams({
+      model: "nova-3",
+      language: "en",
+      smart_format: "true",
+      punctuate: "true",
+      filler_words: "false",
+    });
+    const res = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+        "Content-Type": "audio/wav",
+      },
+      body: wavBytes,
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const json = (await res.json()) as any;
+    const transcript: string =
+      json?.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? "";
+    return transcript.trim();
   }
 
   private async transcribeOpenAI(mono16k: Float32Array): Promise<string> {

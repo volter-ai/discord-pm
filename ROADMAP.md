@@ -9,7 +9,7 @@ Transform Discord-PM from a passive standup recorder into an **active project ma
 | Capability | How |
 |---|---|
 | Voice standup recording | `/standup start/stop` — per-speaker utterance detection via @discordjs/voice |
-| Speech-to-text | OpenAI Whisper (primary), Replicate Whisper (fallback) |
+| Speech-to-text | Deepgram Nova-3 batch (primary), OpenAI Whisper (fallback), Replicate Whisper (fallback) |
 | AI summarization | Claude extracts did / will-do / blockers per participant |
 | GitHub issue review | `/review` — kanban-style navigator grouped by SDLC stage |
 | Transcript persistence | SQLite + markdown export + password-protected web UI (Hono) |

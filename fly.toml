@@ -15,8 +15,9 @@ primary_region = "iad"
 #   DISCORD_BOT_TOKEN=...
 #   ANTHROPIC_API_KEY=...
 #   WEB_PASSWORD=...
-#   REPLICATE_API_TOKEN=...   (optional — falls back to local Whisper)
-#   OPENAI_API_KEY=...        (optional — preferred Whisper backend if set)
+#   DEEPGRAM_API_KEY=...      (preferred transcription backend — Nova-3 batch)
+#   OPENAI_API_KEY=...        (fallback: Whisper-1)
+#   REPLICATE_API_TOKEN=...   (fallback: Replicate Whisper)
 
 [http_service]
   internal_port = 8080
