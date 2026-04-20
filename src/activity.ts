@@ -126,6 +126,11 @@ const ACTIVITY_CSS = `
   .standup-btn-primary:hover{background:#4f46e5;border-color:#a5b4fc}
   .picker-reason{color:#64748b;font-size:.75rem;font-style:italic}
 
+  /* No-session banner: shown when Activity is open but no /standup start has run */
+  .no-session-banner{display:flex;align-items:center;gap:.5rem;padding:.6rem 1rem;background:#422006;border-bottom:1px solid #854d0e;color:#fde68a;font-size:.85rem;flex-shrink:0;line-height:1.4}
+  .no-session-banner-icon{font-size:1rem;flex-shrink:0}
+  .no-session-banner code{background:rgba(0,0,0,.35);padding:.1rem .35rem;border-radius:.25rem;color:#fef3c7;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem}
+
   /* Header */
   .header{display:flex;align-items:center;justify-content:space-between;padding:.75rem 1rem;background:#1e293b;border-bottom:1px solid #334155;flex-shrink:0}
   .header-left{display:flex;align-items:center;gap:.5rem}

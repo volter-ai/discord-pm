@@ -696,6 +696,7 @@ function handleServerMessage(msg: ServerMessage) {
 // ── Rendering ───────────────────────────────────────────────────────────────
 
 function render() {
+  const bannerHtml = renderNoSessionBanner();
   const headerHtml = renderHeader();
   const tabsHtml = renderTabs();
   const boardHtml = renderBoard();
@@ -705,6 +706,7 @@ function render() {
   const liveHtml = `<div id="live-feed" class="${feedClass}"><button id="live-feed-toggle" class="live-feed-toggle" title="Collapse/expand transcript">${toggleIcon}</button></div>`;
 
   app.innerHTML = `
+    ${bannerHtml}
     ${headerHtml}
     ${tabsHtml}
     ${boardHtml}
@@ -714,6 +716,16 @@ function render() {
   setupLiveFeedToggle();
   wireBriefCard();
   maybeLoadBrief();
+}
+
+function renderNoSessionBanner(): string {
+  if (isRecording) return "";
+  return `
+    <div class="no-session-banner" id="no-session-banner">
+      <span class="no-session-banner-icon">⚠️</span>
+      <span>No standup is recording in this channel — run <code>/standup start</code> in Discord to begin.</span>
+    </div>
+  `;
 }
 
 function renderHeader(): string {
