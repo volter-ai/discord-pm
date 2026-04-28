@@ -8,6 +8,7 @@
  */
 
 import { DiscordSDK } from "@discord/embedded-app-sdk";
+import { USERS } from "./users";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -2014,7 +2015,16 @@ function renderProposalBody(p: ProposalWire): string {
         </div>`;
     case "backlog":
       return "";
-    case "create_issue":
+    case "create_issue": {
+      const selected = new Set((pay.newAssignees ?? []).map((s) => s.toLowerCase()));
+      const options = listAssignableUsers();
+      const checkboxes = options.length > 0
+        ? options.map((u) => `
+          <label class="assignee-option">
+            <input type="checkbox" data-assignee-checkbox value="${escapeHtml(u.login)}" ${selected.has(u.login.toLowerCase()) ? "checked" : ""}>
+            <span>${escapeHtml(u.displayName)} <span class="assignee-login">@${escapeHtml(u.login)}</span></span>
+          </label>`).join("")
+        : `<div class="assignee-empty">No known contributors in registry.</div>`;
       return `
         <div class="proposal-field">
           <label>Title</label>
@@ -2025,10 +2035,24 @@ function renderProposalBody(p: ProposalWire): string {
           <textarea data-field="newBody">${escapeHtml(pay.newBody ?? "")}</textarea>
         </div>
         <div class="proposal-field">
-          <label>Assignees (comma-separated GitHub logins)</label>
-          <input type="text" data-field="newAssignees" value="${escapeHtml((pay.newAssignees ?? []).join(", "))}">
+          <label>Assignees</label>
+          <div class="assignee-picker">${checkboxes}</div>
         </div>`;
+    }
   }
+}
+
+function listAssignableUsers(): { login: string; displayName: string }[] {
+  const seen = new Map<string, string>();
+  for (const p of participants) {
+    if (p.githubUser) seen.set(p.githubUser.toLowerCase(), p.name);
+  }
+  for (const [login, mapping] of Object.entries(USERS)) {
+    if (!seen.has(login.toLowerCase())) seen.set(login.toLowerCase(), mapping.displayName);
+  }
+  return Array.from(seen.entries())
+    .map(([login, displayName]) => ({ login, displayName }))
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
 function readProposalPayloadFromCard(card: HTMLElement, p: ProposalWire): ProposalPayload {
@@ -2066,10 +2090,14 @@ function readProposalPayloadFromCard(card: HTMLElement, p: ProposalWire): Propos
     case "create_issue": {
       const t = field("title");
       const b = field("newBody");
-      const a = field("newAssignees");
       if (t !== null) out.title = t;
       if (b !== null) out.newBody = b;
-      if (a !== null) out.newAssignees = csv(a);
+      const checks = card.querySelectorAll<HTMLInputElement>("[data-assignee-checkbox]");
+      if (checks.length > 0) {
+        out.newAssignees = Array.from(checks)
+          .filter((el) => el.checked)
+          .map((el) => el.value);
+      }
       break;
     }
   }
@@ -2105,6 +2133,16 @@ function wireProposalCards(container: HTMLElement) {
     // Inline edits fire on blur — avoid thrashing WS on each keystroke.
     card.querySelectorAll("[data-field]").forEach((el) => {
       el.addEventListener("blur", () => {
+        const fresh = readProposalPayloadFromCard(card, p);
+        if (!payloadEqual(fresh, p.payload)) {
+          sendWs({ type: "proposal-edit", id, version: p.version, payload: fresh });
+        }
+      });
+    });
+
+    // Checkboxes don't blur — sync on change instead.
+    card.querySelectorAll("[data-assignee-checkbox]").forEach((el) => {
+      el.addEventListener("change", () => {
         const fresh = readProposalPayloadFromCard(card, p);
         if (!payloadEqual(fresh, p.payload)) {
           sendWs({ type: "proposal-edit", id, version: p.version, payload: fresh });

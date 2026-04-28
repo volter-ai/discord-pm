@@ -400,6 +400,13 @@ const ACTIVITY_CSS = `
   .proposal-card[data-locked="1"] .proposal-field input,
   .proposal-card[data-locked="1"] .proposal-field textarea,
   .proposal-card[data-locked="1"] .proposal-field select{pointer-events:none;opacity:.7}
+  .assignee-picker{display:flex;flex-wrap:wrap;gap:.25rem .5rem;background:#0f172a;border:1px solid #334155;border-radius:.3rem;padding:.4rem .5rem}
+  .assignee-option{display:inline-flex;align-items:center;gap:.3rem;font-size:.78rem;color:#e2e8f0;cursor:pointer;padding:.1rem .3rem;border-radius:.25rem}
+  .assignee-option:hover{background:#1e293b}
+  .assignee-option input[type="checkbox"]{margin:0;cursor:pointer}
+  .assignee-login{color:#94a3b8;font-size:.72rem}
+  .assignee-empty{font-size:.78rem;color:#94a3b8;font-style:italic}
+  .proposal-card[data-locked="1"] .assignee-picker{pointer-events:none;opacity:.7}
 
   /* Extra (unlisted) participant badge on board header */
   .board-extra-badge{font-size:.7rem;padding:.15rem .4rem;background:#292524;color:#a8a29e;border-radius:.25rem;margin-left:.5rem}
